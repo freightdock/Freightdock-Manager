@@ -73,6 +73,11 @@ While nothing is published the crates point at each other by path (`../Freightdo
 12. **One node is a whole cluster, and that is how a cluster starts.** A single host runs manager, worker (and, once
     G8 is there, the UI) by itself, with nothing outside it; more nodes join it later. Nothing may assume more than one
     node, and each goal is checked on a single node too. `Freightdock-Manager/deploy/install-node.sh first <host>` is that start.
+13. **One command per role** (owner's requirement, 2026-11-11): when done, a single command run on the node sets up a
+    whole stack (`first`), a manager that joins (`join`) or a worker (`worker`), with everything that role needs:
+    manager, worker, network-agent, and the UI on the first node. The agents run on the host under systemd (they
+    manage Docker and the host's network, so they must not depend on Docker); what the cluster runs, the UI included,
+    runs as containers. Today's `install-node.sh` works over ssh from another machine; it becomes that command.
 
 ## G1: Manager and worker talk (done, 2026-11-11)
 
