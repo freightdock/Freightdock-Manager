@@ -1,0 +1,22 @@
+[Unit]
+Description=Freightdock manager-agent (cluster control plane)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Settings in /etc/freightdock/manager.env, e.g.
+#   FREIGHTDOCK_MANAGER_ADVERTISE=10.0.0.11:7450
+EnvironmentFile=-/etc/freightdock/manager.env
+Environment=FREIGHTDOCK_MANAGER_DATA=/var/lib/freightdock-manager
+ExecStart=/usr/local/bin/freightdock-manager serve
+Restart=always
+RestartSec=2
+StateDirectory=freightdock-manager
+StateDirectoryMode=0700
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
