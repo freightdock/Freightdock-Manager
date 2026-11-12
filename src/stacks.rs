@@ -54,7 +54,7 @@ fn fits(n: &Node, held: &Resources, need: &Resources) -> bool {
 
 /// Places the workloads of `stack` that need a node: new ones, ones whose node is gone, and ones whose node no longer
 /// meets their service's constraints (moved). Candidates are the nodes in `eligible` that meet every constraint, have
-/// none of the host ports taken and room for the reservation; of those, the one that meets the most preferences, then
+/// none of the host ports taken (only off the overlay: on it the mesh publishes them, G10.2) and room for the reservation; of those, the one that meets the most preferences, then
 /// holds the fewest of the service's replicas in its spread groups and on itself, then the fewest workloads, then the
 /// lowest id. An error names the first workload with nowhere to go, and why.
 pub fn place(s: &ClusterState, stack: &str, services: &BTreeMap<String, ServiceSpec>, eligible: &[String]) -> Result<BTreeMap<String, String>, String> {
@@ -73,7 +73,10 @@ pub fn place(s: &ClusterState, stack: &str, services: &BTreeMap<String, ServiceS
         let node = w.node_id.as_deref().expect("stays");
         let h = held.entry(node).or_default();
         h.load += 1;
-        h.ports.extend(host_ports(&w.spec));
+        // Only a workload off the overlay has Docker bind its ports on the node (G10.2).
+        if s.address(&w.id).is_none() {
+            h.ports.extend(host_ports(&w.spec));
+        }
         if let Some(sp) = spec_of(w) {
             h.reserved.cpu_millis += sp.placement.reserve.cpu_millis;
             h.reserved.memory_bytes += sp.placement.reserve.memory_bytes;
@@ -83,6 +86,8 @@ pub fn place(s: &ClusterState, stack: &str, services: &BTreeMap<String, ServiceS
         }
     }
     let nodes: Vec<&Node> = eligible.iter().filter_map(|id| s.nodes.get(id)).collect();
+    // On the overlay (it has, or will get, a /24) the mesh answers its ports and Docker binds none on the node.
+    let on_overlay = s.stacks.get(stack).and_then(|st| st.net).is_some() || s.stacks.values().filter(|st| st.net.is_some()).count() < 254;
     let mut out = BTreeMap::new();
     for (id, svc, _) in &wanted {
         if s.workloads.get(id).is_some_and(stays) {
@@ -90,7 +95,7 @@ pub fn place(s: &ClusterState, stack: &str, services: &BTreeMap<String, ServiceS
         }
         let spec = &services[svc];
         let p = &spec.placement;
-        let needs = host_ports(spec);
+        let needs = if on_overlay { BTreeSet::new() } else { host_ports(spec) };
         let meets: Vec<&Node> = nodes.iter().copied().filter(|n| p.constraints.iter().all(|c| c.holds(n))).collect();
         let free: Vec<&Node> = meets.iter().copied().filter(|n| held.get(n.id.as_str()).is_none_or(|h| h.ports.is_disjoint(&needs))).collect();
         let room: Vec<&Node> = free.iter().copied().filter(|n| fits(n, &held.get(n.id.as_str()).map(|h| h.reserved).unwrap_or_default(), &p.reserve)).collect();
@@ -331,8 +336,16 @@ mod tests {
     }
 
     #[test]
-    fn two_workloads_publishing_one_host_port_never_share_a_node() {
-        let s = state_with(&["a", "b"]);
+    fn a_published_port_holds_a_node_only_off_the_overlay() {
+        let mut s = state_with(&["a", "b"]);
+        // On the overlay the mesh answers the port and Docker binds nothing (G10.2): replicas may share a node.
+        let p = place(&s, "web", &svc(&[("x", published("nginx", 3, 8080))]), &eligible(&["a"])).unwrap();
+        assert_eq!(p.values().filter(|n| *n == "a").count(), 3, "{p:?}");
+        // Off it (the range full) Docker publishes the port on the node, once.
+        for n in 1..=254u8 {
+            let name = format!("s{n}");
+            s.stacks.insert(name.clone(), crate::state::Stack { name, compose: String::new(), services: BTreeMap::new(), stopped: false, created_at: 0, updated_at: 0, net: Some(n) });
+        }
         let p = place(&s, "web", &svc(&[("x", published("nginx", 2, 8080))]), &eligible(&["a", "b"])).unwrap();
         assert_ne!(p["web.x.1"], p["web.x.2"]);
         let e = place(&s, "web", &svc(&[("x", published("nginx", 3, 8080))]), &eligible(&["a", "b"])).unwrap_err();

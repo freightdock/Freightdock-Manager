@@ -280,6 +280,10 @@ impl Manager {
                     // the endpoint goes to other nodes, for which 127.0.0.1 is themselves.
                     let l = self.sessions.liveness(other);
                     ui::target(l.peer.as_deref()?, l.via.as_deref().or(self.advertise.first().map(String::as_str)), network::WG_PORT)
+                }, |w| {
+                    // Down only when its node's last report has it and not running; no report says nothing.
+                    let Some(n) = w.node_id.as_deref() else { return false };
+                    self.sessions.reported(n).is_some_and(|r| r.iter().find(|a| a.workload_id == w.id).is_none_or(|a| a.state != "running"))
                 })
             });
             self.sessions.send_network(&node, state);
@@ -290,7 +294,9 @@ impl Manager {
     pub fn ui_target(&self, port: u32) -> Option<String> {
         let node = self.store.read(|s| s.workloads.get(ui::WORKLOAD).and_then(|w| w.node_id.clone()))?;
         let l = self.sessions.liveness(&node);
-        ui::target(l.peer.as_deref()?, l.via.as_deref(), port)
+        // Its worker heard over loopback, on this manager's host: reached at this manager's own address, which the
+        // node's mesh answers (G10.2: Docker no longer publishes the port, so loopback has nothing behind it).
+        ui::target(l.peer.as_deref()?, l.via.as_deref().or(self.advertise.first().map(String::as_str)), port)
     }
 
     /// A command as it goes to its worker: the UI's placeholders filled here, never in the state (`ui::fill`).
