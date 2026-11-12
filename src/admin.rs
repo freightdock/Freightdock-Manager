@@ -84,6 +84,9 @@ pub fn router(m: Arc<Manager>) -> Router {
     Router::new()
         .route("/v1/health", get(|| async { Json(json!({ "ok": true })) }))
         .route("/v1/ca", get(ca_pem))
+        .route("/v1/ui-db", get(ui_db))
+        .route("/v1/ui-db/changes", post(ui_db_change))
+        .route("/v1/ui-db/snapshot", axum::routing::put(ui_db_snapshot))
         .route("/v1/api-tokens", get(api_tokens).post(create_api_token))
         .route("/v1/api-tokens/{id}", axum::routing::delete(revoke_api_token))
         .route("/v1/cluster", get(cluster))
@@ -102,6 +105,8 @@ pub fn router(m: Arc<Manager>) -> Router {
         .route("/v1/stacks/{name}", get(stack).delete(remove_stack))
         .route("/v1/stacks/{name}/{action}", post(stack_action))
         .layer(axum::middleware::from_fn_with_state(m.clone(), guard))
+        // A snapshot of the UI's database is the whole of it.
+        .layer(axum::extract::DefaultBodyLimit::max(UI_DB_MAX))
         .with_state(m)
 }
 
@@ -202,6 +207,55 @@ async fn join_token(State(m): State<Arc<Manager>>, h: HeaderMap, body: Option<Js
     let expires_at = now_ms() + ttl * 1000;
     m.store.propose(Entry::JoinTokenIssued { secret_hash: token.secret_hash(), expires_at, at: now_ms(), for_manager: false }).await?;
     Ok(Json(json!({ "token": token.to_string(), "expires_at": expires_at, "managers": m.managers() })))
+}
+
+/// The largest UI database snapshot (or change) the managers take, as sent (base64 in JSON).
+pub const UI_DB_MAX: usize = 48 << 20;
+
+fn admin_only(role: ApiRole) -> R<()> {
+    if role == ApiRole::Admin { Ok(()) } else { Err(ApiError(StatusCode::FORBIDDEN, "this needs an admin token".into())) }
+}
+
+#[derive(Deserialize)]
+struct UiDbQuery {
+    after: Option<u64>,
+}
+
+/// The UI's database (G8.1): from `after` on, the changes after it when the managers still hold them all; else the
+/// snapshot and every change after it. Admin only: it holds the UI's users and secrets.
+async fn ui_db(State(m): State<Arc<Manager>>, h: HeaderMap, Query(q): Query<UiDbQuery>) -> R<Json<Value>> {
+    admin_only(authed(&m, &h)?)?;
+    Ok(Json(m.store.read(|s| {
+        let d = &s.ui_db;
+        match q.after {
+            Some(a) if a >= d.snapshot_head && a <= d.head && d.snapshot.is_some() => json!({ "head": d.head, "changes": d.changes.iter().filter(|c| c.seq > a).collect::<Vec<_>>() }),
+            _ => json!({ "head": d.head, "snapshot_head": d.snapshot_head, "snapshot": d.snapshot, "changes": d.changes }),
+        }
+    })))
+}
+
+#[derive(Deserialize)]
+struct UiDbChangeBody {
+    seq: u64,
+    data: String,
+}
+
+async fn ui_db_change(State(m): State<Arc<Manager>>, h: HeaderMap, Json(b): Json<UiDbChangeBody>) -> R<StatusCode> {
+    admin_only(authed(&m, &h)?)?;
+    m.store.propose(Entry::UiDbChange { seq: b.seq, data: b.data.into(), at: now_ms() }).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+struct UiDbSnapshotBody {
+    head: u64,
+    data: String,
+}
+
+async fn ui_db_snapshot(State(m): State<Arc<Manager>>, h: HeaderMap, Json(b): Json<UiDbSnapshotBody>) -> R<StatusCode> {
+    admin_only(authed(&m, &h)?)?;
+    m.store.propose(Entry::UiDbSnapshot { head: b.head, data: b.data.into(), at: now_ms() }).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// The cluster CA's certificate (public), for a client of the API over TLS to trust. Check its fingerprint against

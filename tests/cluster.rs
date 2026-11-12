@@ -271,6 +271,10 @@ async fn a_stack_deployed_on_one_manager_is_reconciled_by_the_worker_s_manager()
 
 /// One HTTP/1.1 request over TLS, checked against the cluster CA for the managers' name: (status, body).
 async fn https(m: &Manager, addr: &str, method: &str, path: &str, token: Option<&str>) -> (u16, String) {
+    https_with(m, addr, method, path, token, "{}").await
+}
+
+async fn https_with(m: &Manager, addr: &str, method: &str, path: &str, token: Option<&str>, body: &str) -> (u16, String) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut roots = rustls::RootCertStore::empty();
     roots.add(m.ca.cert_der.clone()).unwrap();
@@ -280,7 +284,7 @@ async fn https(m: &Manager, addr: &str, method: &str, path: &str, token: Option<
     let name = rustls::pki_types::ServerName::try_from(freightdock_proto::MANAGER_SERVER_NAME).unwrap();
     let mut tls = tokio_rustls::TlsConnector::from(Arc::new(cfg)).connect(name, tcp).await.unwrap();
     let auth = token.map(|t| format!("Authorization: Bearer {t}\r\n")).unwrap_or_default();
-    tls.write_all(format!("{method} {path} HTTP/1.1\r\nHost: m\r\n{auth}Content-Length: 2\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{{}}").as_bytes()).await.unwrap();
+    tls.write_all(format!("{method} {path} HTTP/1.1\r\nHost: m\r\n{auth}Content-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
     let mut out = String::new();
     let _ = tls.read_to_string(&mut out).await;
     let status = out.split(' ').nth(1).and_then(|s| s.parse().ok()).unwrap_or(0);
@@ -306,5 +310,19 @@ async fn the_api_over_tls_takes_api_tokens_by_role() {
     assert_eq!(https(&a.m, &addr, "POST", "/v1/join-tokens", Some(&read)).await.0, 403, "a read token only reads");
     let (s, b) = https(&a.m, &addr, "POST", "/v1/api-tokens", Some(&a.m.admin_token)).await;
     assert_eq!(s, 422, "a name is needed: {b}");
+
+    // The UI's database: admin only, one writer, a big snapshot taken.
+    let admin = Some(a.m.admin_token.as_str());
+    assert_eq!(https(&a.m, &addr, "GET", "/v1/ui-db", Some(&read)).await.0, 403, "it holds the UI's users and secrets");
+    let big = "x".repeat(5 << 20);
+    assert_eq!(https_with(&a.m, &addr, "PUT", "/v1/ui-db/snapshot", admin, &format!(r#"{{"head":0,"data":"{big}"}}"#)).await.0, 204);
+    assert_eq!(https_with(&a.m, &addr, "POST", "/v1/ui-db/changes", admin, r#"{"seq":1,"data":"c1"}"#).await.0, 204);
+    assert_eq!(https_with(&a.m, &addr, "POST", "/v1/ui-db/changes", admin, r#"{"seq":1,"data":"other"}"#).await.0, 409);
+    let (s, b) = https(&a.m, &addr, "GET", "/v1/ui-db?after=0", admin).await;
+    let v: serde_json::Value = serde_json::from_str(&b).unwrap();
+    assert_eq!((s, v["head"].as_u64(), v["changes"][0]["data"].as_str(), v.get("snapshot")), (200, Some(1), Some("c1"), None));
+    let (_, b) = https(&a.m, &addr, "GET", "/v1/ui-db", admin).await;
+    let v: serde_json::Value = serde_json::from_str(&b).unwrap();
+    assert_eq!(v["snapshot"].as_str().map(str::len), Some(5 << 20));
     a.server.abort();
 }

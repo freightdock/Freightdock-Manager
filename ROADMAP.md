@@ -34,8 +34,9 @@ left for later.
 ## Repositories
 
 Every core part is a repository of its own, named `Freightdock-<part>` (the owner's rules, 2026-11-11). The new
-ones were renamed so locally; the UI (today `Freightdock`) becomes `Freightdock-UI` when it is trimmed to the UI (G8.3),
-a rename the owner does on GitHub.
+ones were renamed so locally. The UI is **Freightdock-UI**, a new repository (owner's decision, 2026-11-12) started
+from Freightdock's `feat/cluster-ui` work without its history; Freightdock itself stays as it is (the standalone
+product, archived later), its `feat/cluster-ui` branch local and never pushed.
 
 | Repository | Crate(s) | Role | State |
 |---|---|---|---|
@@ -43,7 +44,8 @@ a rename the owner does on GitHub.
 | **Freightdock-Manager** | `freightdock-manager` | manager-agent and the cluster's database: replicated state (Raft), enrolment, sessions, commands; later scheduler, IPAM, fencing coordination, users. Holds this roadmap and the install script. | new, local |
 | **Freightdock-Worker** | `freightdock-worker` | worker-agent: runs what the managers place on its host. | new, local (moved out of Agent) |
 | **Freightdock-Network** | none yet | network-agent (G9). | placeholder |
-| **Freightdock** (to be **Freightdock-UI**) | `freightdock` | The UI only, its own image, which the managers run as a workload (G8). Untouched so far. | untouched |
+| **Freightdock-UI** | `freightdock` | The UI only, its own image, which the managers run as a workload (G8). Database replicated by the managers (G8.1). | new, local |
+| **Freightdock** | `freightdock` | The standalone product, left as it is; the Portainer import comes back from here later. Its local branch `feat/cluster-ui` holds the UI work up to G8.2 (G8.1 in a stash), now in Freightdock-UI. | kept, unchanged |
 | **Agent** | `freightdock-agent`, `freightdock-tunnel` | The single-host tunnel agent of today's Freightdock (remote Docker hosts over a tunnel). Not part of the cluster: **deprecated**, its job is the worker's. Today's Freightdock still depends on it (git tag v1.0.0) until G8.3 removes that; then it is archived. Branch `feat/cluster-worker` holds nothing now. | deprecated |
 
 While nothing is published the crates point at each other by path (`../Freightdock-Contracts`), so the checkouts sit side by side.
@@ -78,6 +80,15 @@ While nothing is published the crates point at each other by path (`../Freightdo
     manager, worker, network-agent, and the UI on the first node. The agents run on the host under systemd (they
     manage Docker and the host's network, so they must not depend on Docker); what the cluster runs, the UI included,
     runs as containers. Today's `install-node.sh` works over ssh from another machine; it becomes that command.
+14. **No standalone Freightdock** (owner's decision, 2026-11-12): the single-host product (Freightdock managing Docker
+    hosts directly: local socket, tunnel agent, environments) goes; a one-node cluster does that job. Freightdock keeps
+    its sign-in, including SSO (OIDC) and LDAP. The Portainer import is set aside until everything else is done.
+15. **External integrations last** (owner's decision, 2026-11-12): the Proxmox fencing provider stays in the code but
+    is not tried or extended until then; the same for other outside systems.
+16. **The UI's database is replicated by the managers** (owner's choice, 2026-11-12): Freightdock keeps its SQLite
+    and its SQL. Every write's change set (SQLite's session extension) is committed to the managers through Raft
+    before the write counts, numbered so only one UI instance can write (a stale one is refused and reloads); a UI
+    starting on any node rebuilds its database from the managers' snapshot and change sets. Reads stay local.
 
 ## G1: Manager and worker talk (done, 2026-11-11)
 
@@ -172,8 +183,9 @@ First slice, pulled forward and done 2026-11-11 (Freightdock branch `feat/cluste
 nodes, health, events, commands, join tokens) through Freightdock's own sign-in, against the manager's admin API on the
 same host. Each later goal adds its pages there (stacks with G4, and so on).
 
-1. [ ] Users, sessions and settings in the manager's replicated state; login and roles on the manager API (the
-       admin token stays for the CLI on the manager's host).
+1. [x] Users, sessions and settings in the manager's replicated state: Freightdock's whole database, replicated row
+       by row through Raft (decision 16), one writer at a time. Signing in stays Freightdock's (with SSO and LDAP);
+       the manager API takes tokens (G8.2).
 2. [x] The manager API reachable from the UI: a second port (7452), TLS with the cluster CA for the managers' fixed
        name, API tokens (read or admin) in the replicated state; Freightdock takes several `https://` managers and goes
        on to the next when one cannot be reached. The users of item 1 come in front of it later.
@@ -195,3 +207,8 @@ ports, shared storage with leases and capabilities, then the advanced items, in 
 3. ~~Worker in Agent or its own repository~~ Answered 2026-11-11: its own (decision 10); done.
 4. For G3: two more manager LXCs, or managers on the worker containers too? For now every test LXC runs a manager
    and a worker (decision 12 makes that the normal shape anyway).
+5. ~~G8.1: how Freightdock's data gets into the managers' state~~ Answered 2026-11-12: Freightdock keeps its SQLite
+   and SQL; each write's change set is committed to the managers through Raft, and a UI starting anywhere rebuilds its
+   database from them (decision 16).
+6. ~~Per-node Docker pages~~ Answered 2026-11-12: kept, rebuilt to go through the workers (after G8.1 and G8.3);
+   the direct-Docker code goes with the standalone mode.

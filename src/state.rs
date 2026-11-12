@@ -10,6 +10,7 @@
 //! (`sessions.rs`), and only transitions that matter (a node marked down, fenced, authorized) become entries.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
@@ -60,6 +61,11 @@ pub enum Entry {
     /// A token for the API (G8.2), kept only as the SHA-256 of its secret, so any manager can check it.
     ApiTokenIssued { id: String, name: String, role: ApiRole, secret_hash: String, at: Ms },
     ApiTokenRevoked { id: String, at: Ms },
+    /// The UI's database as a whole (G8.1), taken at change `head`: the changes up to it are dropped. Refused unless
+    /// `head` is the latest change the managers hold, so a UI behind them cannot overwrite what another wrote.
+    UiDbSnapshot { head: u64, data: Arc<str>, at: Ms },
+    /// One write of the UI's database: refused unless `seq` is the next number, so only one UI writes at a time.
+    UiDbChange { seq: u64, data: Arc<str>, at: Ms },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -87,6 +93,8 @@ pub enum Rejected {
     NotRecoverable,
     /// An API token with that id or secret exists.
     TokenExists,
+    /// A UI database write or snapshot that is not the next: another UI wrote since (or none was made yet).
+    UiDbStale,
 }
 
 impl std::fmt::Display for Rejected {
@@ -106,6 +114,7 @@ impl std::fmt::Display for Rejected {
             Rejected::WorkloadBusy => "the workload has a command open already",
             Rejected::FenceStep => "the node's fencing is not at a point where that step can be taken",
             Rejected::NotRecoverable => "the workload is not on that node any more, or may not be moved by itself",
+            Rejected::UiDbStale => "the UI's database has moved on since: load it again",
             Rejected::TokenExists => "an API token with that id exists",
             Rejected::BadName => "a stack or service name must be 1 to 40 of a-z, 0-9 and - (services may have _), starting with a letter or digit",
         })
@@ -474,6 +483,27 @@ pub struct ClusterState {
     /// API tokens by id (G8.2).
     #[serde(default)]
     pub api_tokens: BTreeMap<String, ApiToken>,
+    /// The UI's database (G8.1): opaque to the managers.
+    #[serde(default)]
+    pub ui_db: UiDb,
+}
+
+/// The UI's database as the managers keep it: a snapshot and the changes after it, both as the UI wrote them.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct UiDb {
+    /// The latest change's number (0: none yet).
+    pub head: u64,
+    /// The change the snapshot includes everything up to.
+    pub snapshot_head: u64,
+    pub snapshot: Option<Arc<str>>,
+    pub changes: Vec<UiDbChange>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UiDbChange {
+    pub seq: u64,
+    pub data: Arc<str>,
+    pub at: Ms,
 }
 
 /// What an API token may do.
@@ -773,6 +803,21 @@ impl ClusterState {
             Entry::ApiTokenRevoked { id, .. } => {
                 self.api_tokens.remove(id).ok_or(Rejected::TokenUnknown)?;
             }
+            Entry::UiDbSnapshot { head, data, .. } => {
+                if *head != self.ui_db.head {
+                    return Err(Rejected::UiDbStale);
+                }
+                self.ui_db.snapshot = Some(data.clone());
+                self.ui_db.snapshot_head = *head;
+                self.ui_db.changes.retain(|c| c.seq > *head);
+            }
+            Entry::UiDbChange { seq, data, at } => {
+                if *seq != self.ui_db.head + 1 || self.ui_db.snapshot.is_none() {
+                    return Err(Rejected::UiDbStale);
+                }
+                self.ui_db.head = *seq;
+                self.ui_db.changes.push(UiDbChange { seq: *seq, data: data.clone(), at: *at });
+            }
             Entry::StackRemoved { name, .. } => {
                 self.stacks.remove(name).ok_or(Rejected::StackUnknown)?;
                 self.workloads.retain(|_, w| w.stack != *name);
@@ -1058,6 +1103,25 @@ pub(crate) mod tests {
 
     fn fence(s: &mut ClusterState, to: FenceState) -> Result<(), Rejected> {
         next(s, &Entry::NodeFencing { node_id: "n1".into(), state: to, provider: "self".into(), message: String::new(), at: 9 })
+    }
+
+    #[test]
+    fn the_ui_database_takes_only_the_next_change_and_a_snapshot_at_the_head() {
+        let mut s = cluster();
+        let change = |seq| Entry::UiDbChange { seq, data: "c".into(), at: 1 };
+        let snap = |head, d: &str| Entry::UiDbSnapshot { head, data: d.into(), at: 1 };
+        assert_eq!(next(&mut s, &change(1)), Err(Rejected::UiDbStale), "nothing to change before the first snapshot");
+        next(&mut s, &snap(0, "s0")).unwrap();
+        next(&mut s, &change(1)).unwrap();
+        assert_eq!(next(&mut s, &change(1)), Err(Rejected::UiDbStale), "a second UI with the same number loses");
+        assert_eq!(next(&mut s, &change(3)), Err(Rejected::UiDbStale));
+        next(&mut s, &change(2)).unwrap();
+        assert_eq!(next(&mut s, &snap(1, "old")), Err(Rejected::UiDbStale), "a UI behind cannot overwrite");
+        next(&mut s, &change(3)).unwrap();
+        next(&mut s, &snap(3, "s3")).unwrap();
+        assert_eq!((s.ui_db.head, s.ui_db.snapshot_head, s.ui_db.changes.len(), s.ui_db.snapshot.as_deref()), (3, 3, 0, Some("s3")));
+        next(&mut s, &change(4)).unwrap();
+        assert_eq!(s.ui_db.changes.iter().map(|c| c.seq).collect::<Vec<_>>(), [4]);
     }
 
     #[test]
