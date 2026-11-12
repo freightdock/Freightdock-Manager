@@ -2,11 +2,15 @@
 
 pub mod admin;
 pub mod ca;
+pub mod compose;
 pub mod events;
+pub mod fencing;
 pub mod grpc;
 pub mod peer;
+pub mod proxmox;
 pub mod raft;
 pub mod sessions;
+pub mod stacks;
 pub mod state;
 pub mod store;
 pub mod tls;
@@ -46,6 +50,7 @@ pub struct Config {
     /// Where to leave a worker join token for the worker on this same node (`FREIGHTDOCK_JOIN_TOKEN_FILE` there), so a
     /// single node runs the whole cluster without a token copied by hand. Made again whenever the file is missing.
     pub local_worker_token: Option<PathBuf>,
+    pub fencing: fencing::FenceConfig,
 }
 
 #[derive(Debug, Clone)]
@@ -86,7 +91,7 @@ impl Config {
             (Err(_), Err(_)) => None,
             _ => anyhow::bail!("FREIGHTDOCK_MANAGER_JOIN and FREIGHTDOCK_MANAGER_JOIN_TOKEN go together"),
         };
-        Ok(Config { data_dir: get("FREIGHTDOCK_MANAGER_DATA", "/var/lib/freightdock-manager").into(), bind, api_bind, advertise, thresholds, bootstrap: join.is_none(), join, local_worker_token: std::env::var("FREIGHTDOCK_MANAGER_LOCAL_WORKER_TOKEN").ok().filter(|p| !p.trim().is_empty()).map(PathBuf::from) })
+        Ok(Config { data_dir: get("FREIGHTDOCK_MANAGER_DATA", "/var/lib/freightdock-manager").into(), bind, api_bind, advertise, thresholds, bootstrap: join.is_none(), join, local_worker_token: std::env::var("FREIGHTDOCK_MANAGER_LOCAL_WORKER_TOKEN").ok().filter(|p| !p.trim().is_empty()).map(PathBuf::from), fencing: fencing::FenceConfig::from_env()? })
     }
 }
 
@@ -104,7 +109,19 @@ pub struct Manager {
     /// A channel per other manager, made once (it reconnects by itself).
     peer_channels: std::sync::Mutex<std::collections::HashMap<String, tonic::transport::Channel>>,
     local_worker_token: Option<PathBuf>,
+    /// The reconcile's pace per workload.
+    paced: stacks::Paced,
+    pub fencing: fencing::FenceConfig,
+    /// When this manager started: the fencing waits a while after it, until it has heard from the workers.
+    pub started: std::time::Instant,
+    /// Since when this manager has been cut off from a majority of managers, if it is.
+    cut_off_since: std::sync::Mutex<Option<std::time::Instant>>,
+    /// Nodes a fencing provider is working on here.
+    fence_tasks: std::sync::Mutex<std::collections::HashSet<String>>,
 }
+
+/// How long a manager may be cut off from the majority before it sends its workers away.
+pub const CUT_OFF_GRACE: Duration = Duration::from_secs(5);
 
 /// A file's contents, made with `make` first if it is not there (0600).
 fn kept(path: &std::path::Path, make: impl FnOnce() -> String) -> Result<String> {
@@ -138,7 +155,7 @@ impl Manager {
         let manager_id = kept(&config.data_dir.join("manager.id"), || uuid::Uuid::new_v4().to_string())?;
         let admin_token = kept(&config.data_dir.join("admin.token"), || hex::encode(rand::random::<[u8; 32]>()))?;
         let commands = store.commands();
-        let m = Arc::new(Manager { store, events: Default::default(), sessions: Sessions::new(config.thresholds), ca, manager_id, advertise: config.advertise.clone(), admin_token, peer_tls, peer_channels: Default::default(), local_worker_token: config.local_worker_token.clone() });
+        let m = Arc::new(Manager { store, events: Default::default(), sessions: Sessions::new(config.thresholds), ca, manager_id, advertise: config.advertise.clone(), admin_token, peer_tls, peer_channels: Default::default(), local_worker_token: config.local_worker_token.clone(), paced: Default::default(), fencing: config.fencing.clone(), started: std::time::Instant::now(), cut_off_since: Default::default(), fence_tasks: Default::default() });
         tokio::spawn(deliver_applied(Arc::downgrade(&m), commands));
         Ok(m)
     }
@@ -248,6 +265,35 @@ impl Manager {
     }
 }
 
+impl Manager {
+    /// Whether this manager has been out of the majority for longer than `CUT_OFF_GRACE`. Such a manager takes no
+    /// worker streams and ends those it has: a worker that hears only it is, for the cluster, cut off too, and must
+    /// count down to fencing instead of believing it is heard (G6).
+    pub fn cut_off(&self) -> bool {
+        self.cut_off_since.lock().expect("cut off lock").is_some_and(|at| at.elapsed() >= CUT_OFF_GRACE)
+    }
+
+    /// Notes whether this manager is with a majority now, and sends its workers away once it has not been for long.
+    pub fn quorum_guard(&self) {
+        let ok = self.store.in_quorum();
+        {
+            let mut g = self.cut_off_since.lock().expect("cut off lock");
+            match (ok, g.is_some()) {
+                (true, true) => {
+                    *g = None;
+                    tracing::info!("back with a majority of managers: workers may connect here again");
+                }
+                (false, false) => *g = Some(std::time::Instant::now()),
+                _ => {}
+            }
+        }
+        if self.cut_off() && !self.sessions.connected().is_empty() {
+            tracing::warn!("cut off from a majority of managers: sending this manager's workers away");
+            self.sessions.kick_all();
+        }
+    }
+}
+
 /// How long past its deadline a pending command is given before the manager calls it expired.
 pub const EXPIRY_GRACE_MS: i64 = 5_000;
 
@@ -308,8 +354,12 @@ pub async fn housekeeping(m: Arc<Manager>) {
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tick.tick().await;
+        m.quorum_guard();
         m.gather_heard().await;
         m.expire_overdue().await;
+        m.fence_local().await;
+        m.fence_round().await;
+        m.reconcile().await;
         m.local_worker_token().await;
         let health: Vec<_> = m.store.read(|s| s.nodes.keys().cloned().collect::<Vec<_>>()).into_iter().map(|id| {
             let h = m.sessions.liveness(&id).health;

@@ -11,6 +11,12 @@ freightdock-manager nodes                   list the nodes and their health
 freightdock-manager events [-f]             recent events; -f keeps following
 freightdock-manager command <node> <json>   send a command, e.g. '{\"op\":\"ping\"}', and wait for its end
 freightdock-manager remove <node>           forget a node; its certificate opens nothing more
+freightdock-manager authorize <node>        let a node that came back fenced run workloads again
+freightdock-manager label <node> [k=v ...]  set the node's labels (all of them; none clears them)
+freightdock-manager stack deploy <name> <compose file>   make or change a stack (- reads the file from stdin)
+freightdock-manager stack ls                list the stacks
+freightdock-manager stack ps <name>         a stack's workloads: where they run and how they are
+freightdock-manager stack start|stop|restart|rm <name>
 
 A manager joins a cluster on its first start with FREIGHTDOCK_MANAGER_JOIN=<a manager's host:port> and
 FREIGHTDOCK_MANAGER_JOIN_TOKEN=<a manager-token>.
@@ -114,6 +120,24 @@ async fn main() -> Result<()> {
             call(&config, reqwest::Method::DELETE, &format!("/v1/nodes/{node}"), None).await?;
             Ok(())
         }
+        Some("authorize") => {
+            let Some(node) = args.get(1) else { bail!("{USAGE}") };
+            let n = call(&config, reqwest::Method::POST, &format!("/v1/nodes/{node}/authorize"), None).await?;
+            println!("{}", n["fencing"]["message"].as_str().unwrap_or(""));
+            Ok(())
+        }
+        Some("label") => {
+            let Some(node) = args.get(1) else { bail!("{USAGE}") };
+            let mut labels = serde_json::Map::new();
+            for kv in &args[2..] {
+                let (k, v) = kv.split_once('=').with_context(|| format!("{kv}: a label is key=value"))?;
+                labels.insert(k.to_string(), Value::String(v.to_string()));
+            }
+            let n = call(&config, reqwest::Method::PUT, &format!("/v1/nodes/{node}/labels"), Some(serde_json::json!({ "labels": labels }))).await?;
+            println!("{}", n["all_labels"]);
+            Ok(())
+        }
+        Some("stack") => stack(&config, &args[1..]).await,
         _ => {
             eprintln!("{USAGE}");
             std::process::exit(2)
@@ -121,13 +145,77 @@ async fn main() -> Result<()> {
     }
 }
 
+async fn stack(config: &Config, args: &[String]) -> Result<()> {
+    use reqwest::Method;
+    let name = args.get(1).map(String::as_str);
+    match (args.first().map(String::as_str), name) {
+        (Some("deploy"), Some(name)) => {
+            let Some(file) = args.get(2) else { bail!("{USAGE}") };
+            let compose = if file == "-" {
+                std::io::read_to_string(std::io::stdin())?
+            } else {
+                std::fs::read_to_string(file).with_context(|| format!("reading {file}"))?
+            };
+            let v = call(config, Method::POST, "/v1/stacks", Some(serde_json::json!({ "name": name, "compose": compose }))).await?;
+            for w in v["warnings"].as_array().into_iter().flatten() {
+                eprintln!("warning: {}", w.as_str().unwrap_or(""));
+            }
+            print_workloads(&v["stack"]);
+            Ok(())
+        }
+        (Some("ls"), _) => {
+            let v = call(config, Method::GET, "/v1/stacks", None).await?;
+            println!("{:<24} {:<8} {:>9}  SERVICES", "STACK", "STATE", "RUNNING");
+            for s in v.as_array().into_iter().flatten() {
+                let w = s["workloads"].as_array().cloned().unwrap_or_default();
+                let up = w.iter().filter(|w| w["status"] == "running").count();
+                let services = s["services"].as_object().map(|m| m.keys().cloned().collect::<Vec<_>>().join(",")).unwrap_or_default();
+                println!("{:<24} {:<8} {:>9}  {services}", s["name"].as_str().unwrap_or(""), if s["stopped"] == true { "stopped" } else { "running" }, format!("{up}/{}", w.len()));
+            }
+            Ok(())
+        }
+        (Some("ps"), Some(name)) => {
+            print_workloads(&call(config, Method::GET, &format!("/v1/stacks/{name}"), None).await?);
+            Ok(())
+        }
+        (Some(a @ ("start" | "stop" | "restart")), Some(name)) => {
+            let v = call(config, Method::POST, &format!("/v1/stacks/{name}/{a}"), None).await?;
+            if a == "restart" {
+                eprintln!("restarting {} workload(s); {} busy, left as they are", v["restarting"], v["busy"]);
+            }
+            Ok(())
+        }
+        (Some("rm"), Some(name)) => {
+            call(config, Method::DELETE, &format!("/v1/stacks/{name}"), None).await?;
+            Ok(())
+        }
+        _ => bail!("{USAGE}"),
+    }
+}
+
+fn print_workloads(s: &Value) {
+    println!("{:<32} {:<16} {:<10} {:<10} LAST", "WORKLOAD", "NODE", "WANTED", "STATUS");
+    for w in s["workloads"].as_array().into_iter().flatten() {
+        let last = &w["last_command"];
+        let last = if last.is_null() { String::new() } else { format!("{} {} {}", last["op"]["op"].as_str().unwrap_or(""), last["status"].as_str().unwrap_or(""), last["message"].as_str().unwrap_or("")) };
+        println!(
+            "{:<32} {:<16} {:<10} {:<10} {}",
+            w["id"].as_str().unwrap_or(""),
+            w["hostname"].as_str().unwrap_or("-"),
+            w["desired"].as_str().unwrap_or(""),
+            w["status"].as_str().unwrap_or(""),
+            last.trim()
+        );
+    }
+}
+
 fn print_nodes(v: &Value) {
-    println!("{:<38} {:<16} {:<12} {:>8}  {:<22} {:<8} LABELS", "NODE", "HOSTNAME", "HEALTH", "HEARD", "VIA", "DOCKER");
+    println!("{:<38} {:<16} {:<12} {:>8}  {:<22} {:<8} {:<24} LABELS", "NODE", "HOSTNAME", "HEALTH", "HEARD", "VIA", "DOCKER", "FENCING");
     for n in v.as_array().into_iter().flatten() {
         let heard = n["liveness"]["last_heard_ms_ago"].as_u64().map(|ms| format!("{:.1}s", ms as f64 / 1000.0)).unwrap_or_else(|| "-".into());
-        let labels = n["report"]["labels"].as_object().map(|m| m.iter().map(|(k, v)| format!("{k}={}", v.as_str().unwrap_or(""))).collect::<Vec<_>>().join(",")).unwrap_or_default();
+        let labels = n["all_labels"].as_object().map(|m| m.iter().map(|(k, v)| format!("{k}={}", v.as_str().unwrap_or(""))).collect::<Vec<_>>().join(",")).unwrap_or_default();
         println!(
-            "{:<38} {:<16} {:<12} {:>8}  {:<22} {:<8} {labels}",
+            "{:<38} {:<16} {:<12} {:>8}  {:<22} {:<8} {:<24} {labels}",
             n["id"].as_str().unwrap_or(""),
             n["hostname"].as_str().unwrap_or(""),
             n["liveness"]["health"].as_str().unwrap_or(""),
@@ -138,7 +226,8 @@ fn print_nodes(v: &Value) {
                 (None, false) => "this manager",
                 (None, true) => "-",
             },
-            n["report"]["docker_version"].as_str().unwrap_or("-")
+            n["report"]["docker_version"].as_str().unwrap_or("-"),
+            n["fencing"]["state"].as_str().unwrap_or("-")
         );
     }
 }

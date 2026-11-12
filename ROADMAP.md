@@ -13,11 +13,11 @@ Status marks: **[x]** done, **[~]** in progress, **[ ]** not started.
 | 1 | G1 Manager and worker talk | Everything else rides on this link | | **done** |
 | 2 | G2 The link is hardened and observable | Cheap now, expensive to retrofit; the test cluster must tell us what happens | G1 | **done** but CI (blocked) and cert renewal (deferred) |
 | 3 | G3 Manager high availability (Raft) | Success criteria 1 and 2 of the first release; changes how every write works, so before anything writes much | G2 | **done** |
-| 4 | G4 Workloads and Compose stacks | The point of the product: deploy and manage stacks across workers | G3 | **next** |
+| 4 | G4 Workloads and Compose stacks | The point of the product: deploy and manage stacks across workers | G3 | **done** (first slice; see G4) |
 | 4a | G8 first slice: a Cluster page in Freightdock | Pulled forward (2026-11-11) so every goal from here is seen in the browser as it is built | G3 | **done** |
-| 5 | G5 Scheduling and labels | Workloads need placing once there is more than one worker | G4 | not started |
-| 6 | G6 Fencing | A worker must be able to fence itself before anything is recovered elsewhere (plan rule 10, 11) | G4 | not started |
-| 7 | G7 Failure detection and stateless recovery | Success criteria 4 and 5; safe only with G6 | G5, G6 | not started |
+| 5 | G5 Scheduling and labels | Workloads need placing once there is more than one worker | G4 | **done** |
+| 6 | G6 Fencing | A worker must be able to fence itself before anything is recovered elsewhere (plan rule 10, 11) | G4 | done |
+| 7 | G7 Failure detection and stateless recovery | Success criteria 4 and 5; safe only with G6 | G5, G6 | **next** |
 | 8 | G8 UI: Freightdock as the cluster's UI | Usable by people, not just the CLI; can start in parallel once G4's API settles | G4 | not started |
 | 9 | G9 Internal networking (Network repo) | Stable workload IPs across workers; postponed by the plan's first release | G7 | not started |
 | 10 | G10 External networking | Exposing services without per-deploy setup | G9 | not started |
@@ -121,26 +121,40 @@ Ranked inside the goal:
 
 ## G4: Workloads and Compose stacks
 
-1. [ ] Stack, service and workload identities in the state; desired versus actual state per workload.
-2. [ ] Workers report actual state per workload; the manager reconciles desired against actual.
-3. [ ] Compose parsing on the manager (the subset mapping to RunContainer: image, command, env, labels, then ports,
-       volumes and resources as the contract grows).
-4. [ ] Deploy, start, stop, restart, update, remove a stack through the admin API and CLI.
+1. [x] Stack, service and workload identities in the state; desired versus actual state per workload.
+2. [x] Workers report actual state per workload; the manager reconciles desired against actual.
+3. [x] Compose parsing on the manager (the subset mapping to RunContainer: image, command, env, labels, ports,
+       volumes, deploy.replicas). Resources (limits) wait for G5.
+4. [x] Deploy, start, stop, restart, update, remove a stack through the admin API and CLI, and the UI's Cluster
+       stacks page.
+5. [ ] Left for later: `${VAR}` interpolation and an env file; networks between a stack's services (G9); port
+       ranges; `container_name`; old finished commands are never pruned from the state (they should be, past an age);
+       the restart policy of a crashing workload is a fixed backoff, not configurable.
 
 ## G5: Scheduling and labels
 
-1. [ ] Node labels editable through the API (today only from the worker's environment).
-2. [ ] Placement: required, preferred and excluded labels; resources reported against requests.
-3. [ ] HA flag and replica count as separate settings (plan 5.3); pinned / non-HA workloads.
+1. [x] Node labels editable through the API, CLI and UI (`NodeLabelsSet`; they go over the worker's own).
+2. [x] Placement: required and excluded labels (`deploy.placement.constraints`, `==` / `!=` on node.id, hostname,
+       platform and labels), preferred labels (`preferences: - prefer: ...`), spread over a label, replicas of a
+       service kept apart, host ports, reservations against the node's CPUs and memory; limits on the container.
+       A deploy moves a workload whose node no longer meets its constraints.
+3. [x] HA flag (`x-freightdock: {ha: false}` pins) beside the replica count, kept in the state; G7 acts on it.
+4. [ ] Left for later: re-placing by itself when labels change (today at the next deploy); anti-affinity between
+       different services; a move starts the new copy without waiting for the old to stop (fine for stateless; G6/G7
+       and G11 make it safe for the rest).
 
 ## G6: Fencing
 
-1. [ ] The node fencing state machine on the manager (suspect, unreachable, fencing requested, in progress, fenced,
-       failed, awaiting authorization).
-2. [ ] Worker self-fencing timers (N, N+X, N+X+Y), configurable; stop managed workloads at N.
-3. [ ] A local watchdog so a frozen worker-agent still fences.
-4. [ ] After a reboot: no managed workload starts until the managers authorize it (the hello's fencing state).
-5. [ ] External fencing provider interface; Proxmox as the first provider.
+1. [x] The node fencing state machine on the manager (suspect, unreachable, fencing requested, in progress, fenced,
+       failed, awaiting authorization, authorized), in the replicated state; the leader drives it.
+2. [x] Worker self-fencing timers (N, N+X, N+X+Y), configurable; stop managed workloads at N. X (storage) does
+       nothing yet: there are no storage leases until G11.
+3. [x] A local watchdog so a frozen worker-agent still fences: systemd's (`Type=notify`, `WatchdogSec=30`). Its limit:
+       a restarted worker starts fenced, but a host frozen as a whole (kernel, not the agent) is only covered by
+       the reboot step or an external provider.
+4. [x] After a reboot: no managed workload starts until the managers authorize it (the hello's fencing state).
+5. [x] External fencing provider; Proxmox as the first (per node labels, pinned certificate, token from a file).
+       Checked on the cluster only up to "no settings"; a real power-off waits for a Proxmox API token.
 
 ## G7: Failure detection and stateless recovery
 

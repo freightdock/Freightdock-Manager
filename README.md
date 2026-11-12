@@ -15,6 +15,8 @@ src/ca.rs         the cluster CA: manager server and client certificates, worker
 src/tls.rs        the listener (client certificate optional at the handshake), TLS to the other managers
 src/grpc.rs       Enrollment and WorkerSession, from freightdock-proto (the Contracts repository)
 src/sessions.rs   connected workers and their liveness, merged with what the other managers hear
+src/compose.rs    Compose files read into a stack's services (the part a worker can run)
+src/stacks.rs     placement of a stack's workloads, and the reconcile of each worker against the state
 src/admin.rs      the HTTP/JSON admin API the CLI and the UI use
 deploy/           static build, install over ssh, systemd unit
 ```
@@ -81,13 +83,60 @@ All under `http://127.0.0.1:7451`, with `Authorization: Bearer <data>/admin.toke
 | | |
 |---|---|
 | `GET /v1/cluster` | cluster id, manager id, managers, Raft members (voter, leader), applied index, CA fingerprint |
-| `GET /v1/nodes`, `GET /v1/nodes/{id}` | nodes with their last report and live health (from any manager that hears them) |
+| `GET /v1/nodes`, `GET /v1/nodes/{id}` | nodes with their last report, labels (`labels` set here, `all_labels` merged) and live health (from any manager that hears them) |
+| `PUT /v1/nodes/{id}/labels` | `{"labels": {...}}`: the node's labels, all of them |
+| `POST /v1/nodes/{id}/authorize` | lets a node that came back fenced run workloads again |
 | `DELETE /v1/nodes/{id}` | forget a node: its certificate opens nothing more, its stream is cut |
 | `POST /v1/join-tokens` | `{"ttl_s": 86400}` gives `{"token": "FDCT1-..."}`, for a worker |
 | `POST /v1/manager-tokens` | `{"ttl_s": 3600}` gives `{"token": "FDMT1-..."}`, for a manager |
 | `GET /v1/events?after=&node=` | recent node events |
 | `POST /v1/nodes/{id}/commands` | `{"op": "ping"}` and the other ops; answers the command (202) |
 | `GET /v1/commands?node=`, `GET /v1/commands/{id}` | commands and their status |
+| `GET /v1/stacks`, `GET /v1/stacks/{name}` | stacks with each workload's node, status, container and last command; one with its Compose file |
+| `POST /v1/stacks` | `{"name", "compose"}`: make or change a stack; answers it and the file's warnings |
+| `POST /v1/stacks/{name}/start`, `/stop`, `/restart`; `DELETE /v1/stacks/{name}` | run, stop, restart (stop, and the reconcile starts it) or remove |
+
+### Stacks
+
+A stack is a Compose file. Its services become workloads, one per replica, with the id `<stack>.<service>.<n>`; the
+manager that takes the deploy places each new one on a healthy node with Docker that meets its constraints, has its
+host ports free and room for its reservation, preferring nodes that meet its preferences, then spread over a label,
+then away from its other replicas, then the least loaded. From then on the manager each worker is connected to
+compares what the worker reports in every heartbeat with what the state says and sends a command for the difference:
+run (a missing or exited container, or one made for an older spec), stop (a stopped stack), remove (a stack
+container the state no longer holds). One command per workload at a time; one that keeps failing is tried again
+after 5 s, doubling to 5 minutes. Supported Compose: `image`, `command`, `environment`, `labels`, `ports`, `volumes`
+(named or absolute), `deploy.replicas`, `deploy.placement` (`constraints` such as `node.labels.ssd==true` or
+`node.hostname!=old`; `preferences` with `spread: node.labels.<key>` or `prefer: <constraint>`),
+`deploy.resources` (`limits` on the container, `reservations` for placement) and `x-freightdock: {ha: false}` (pinned); `restart`, `depends_on` and `healthcheck` are set aside with a warning, and any
+other key is refused by name. The CLI: `freightdock-manager stack deploy|ls|ps|start|stop|restart|rm`.
+
+### Fencing
+
+A node the cluster no longer hears is fenced before anything it ran is trusted to be gone. The worker fences itself:
+with no manager contact for N seconds it stops its managed containers and refuses new ones; after N+X+Y it reboots the
+host (`FREIGHTDOCK_FENCE_REBOOT=if-needed`, the default, only when a container would not stop; `always`; `never`).
+systemd's watchdog (`WatchdogSec=30` in the unit) restarts a worker that hangs, and a restarted or rebooted worker
+starts fenced. The leader manager follows each unreachable node: fencing requested, in progress, then fenced, either
+presumed (its timers have run out, plus 10 s) or proven by a provider. A node that comes back fenced waits for
+authorization (`freightdock-manager authorize <node>`, the UI, or by itself when `FREIGHTDOCK_FENCE_AUTO_AUTHORIZE` is
+on); a node heard again before it fenced is simply at rest again. Managers cut off from the quorum drop their workers'
+sessions, so those workers fence.
+
+A node labelled `fence.provider=proxmox`, `proxmox.node=<pve node>`, `proxmox.vmid=<id>` (and `proxmox.type=lxc`, the
+default, or `qemu`) is powered off through the Proxmox API instead, and is fenced once Proxmox says the guest is
+stopped; a failure is tried again after a minute. The API token needs `VM.PowerMgmt` and `VM.Audit` on the guest and is read from a
+file; the server's certificate is pinned by its SHA-256 fingerprint.
+
+| Variable | Default | |
+|---|---|---|
+| `FREIGHTDOCK_FENCE` | `on` | Managers: follow and fence unreachable nodes. Workers: fence themselves |
+| `FREIGHTDOCK_FENCE_STOP_S`, `_STORAGE_S`, `_REBOOT_S` | `30`, `15`, `15` | N, X and Y; the managers send theirs to each worker |
+| `FREIGHTDOCK_FENCE_AUTO_AUTHORIZE` | `on` | Authorize a node that came back fenced by itself |
+| `FREIGHTDOCK_FENCE_REBOOT` | `if-needed` | Worker: `if-needed`, `always` or `never` |
+| `FREIGHTDOCK_FENCE_PROXMOX_URL` | none | e.g. `https://pve:8006` |
+| `FREIGHTDOCK_FENCE_PROXMOX_TOKEN_FILE` | none | A file holding `user@realm!name=secret` |
+| `FREIGHTDOCK_FENCE_PROXMOX_FINGERPRINT` | none | The server certificate's SHA-256, `AA:BB:...` |
 
 ## Build
 

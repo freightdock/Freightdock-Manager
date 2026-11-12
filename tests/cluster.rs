@@ -26,7 +26,7 @@ async fn start(join: Option<(&str, String)>) -> Running {
     let port = free_port();
     let addr = format!("127.0.0.1:{port}");
     let join = join.map(|(a, token)| Join { addr: a.to_string(), token });
-    let config = Config { data_dir: dir.path().into(), bind: addr.parse().unwrap(), api_bind: None, advertise: vec![addr.clone()], thresholds: Default::default(), bootstrap: join.is_none(), join: join.clone(), local_worker_token: None };
+    let config = Config { data_dir: dir.path().into(), bind: addr.parse().unwrap(), api_bind: None, advertise: vec![addr.clone()], thresholds: Default::default(), bootstrap: join.is_none(), join: join.clone(), local_worker_token: None, fencing: Default::default() };
     let m = Manager::open(&config).await.unwrap();
     let l = tokio::net::TcpListener::bind(config.bind).await.unwrap();
     let server = tokio::spawn({
@@ -148,6 +148,7 @@ async fn without_a_quorum_changes_fail_fast_and_reads_still_answer() {
     let a = start(None).await;
     let b = start(Some((&a.addr, issue(&a.m, true).await))).await;
     until("b a voter", || a.m.store.voters().len() == 2).await;
+    until("both with the majority", || a.m.store.in_quorum() && b.m.store.in_quorum()).await;
     a.m.store.propose(token("before")).await.unwrap();
     until("the change on b", || b.m.store.read(|s| s.join_tokens.contains_key("before"))).await;
 
@@ -159,6 +160,7 @@ async fn without_a_quorum_changes_fail_fast_and_reads_still_answer() {
     assert!(matches!(r, Err(freightdock_manager::store::ProposeError::Unavailable(_))), "{r:?}");
     assert!(started.elapsed() < Duration::from_secs(12), "failed in {:?}", started.elapsed());
     assert!(a.m.store.read(|s| s.join_tokens.contains_key("before")), "reads still answer");
+    until("a out of the majority", || !a.m.store.in_quorum()).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -173,7 +175,7 @@ async fn a_command_made_on_one_manager_reaches_its_worker_on_another() {
 
     // The worker is connected to b; the command is made through a.
     let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-    b.m.sessions.open("n1", tx, "test".into());
+    b.m.sessions.open("n1", tx, "test".into(), None);
     let now = now_ms();
     let c = CommandRecord { id: "c1".into(), node_id: "n1".into(), op: Op::Ping, config_version: 0, created_at: now, deadline: now + 60_000, status: CommandStatus::Pending, message: String::new(), result_json: String::new(), updated_at: now };
     a.m.store.propose(Entry::CommandCreated { command: c }).await.unwrap();
@@ -190,7 +192,7 @@ async fn a_worker_heard_by_one_manager_is_healthy_on_all() {
     assert_eq!(a.m.sessions.liveness("n1").health, Health::Unreachable);
 
     let (tx, _rx) = tokio::sync::mpsc::channel(8);
-    b.m.sessions.open("n1", tx, "10.0.0.5:4000".into());
+    b.m.sessions.open("n1", tx, "10.0.0.5:4000".into(), None);
     a.m.gather_heard().await;
     let l = a.m.sessions.liveness("n1");
     assert_eq!(l.health, Health::Healthy, "{l:?}");
@@ -203,7 +205,7 @@ async fn a_manager_leaves_a_token_for_the_worker_on_its_own_node() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("local-worker.token");
     let addr = format!("127.0.0.1:{}", free_port());
-    let config = Config { data_dir: dir.path().join("data"), bind: addr.parse().unwrap(), api_bind: None, advertise: vec![addr], thresholds: Default::default(), bootstrap: true, join: None, local_worker_token: Some(path.clone()) };
+    let config = Config { data_dir: dir.path().join("data"), bind: addr.parse().unwrap(), api_bind: None, advertise: vec![addr], thresholds: Default::default(), bootstrap: true, join: None, local_worker_token: Some(path.clone()), fencing: Default::default() };
     let m = Manager::open(&config).await.unwrap();
     m.local_worker_token().await;
     let t = JoinToken::parse(&std::fs::read_to_string(&path).unwrap()).expect("a worker's join token");
@@ -218,4 +220,51 @@ async fn a_manager_leaves_a_token_for_the_worker_on_its_own_node() {
     // Once there, it is left alone.
     m.local_worker_token().await;
     assert_eq!(JoinToken::parse(&std::fs::read_to_string(&path).unwrap()), Some(t));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stack_deployed_on_one_manager_is_reconciled_by_the_worker_s_manager() {
+    use freightdock_manager::state::CommandStatus;
+    use freightdock_proto::v1::manager_message::Body;
+    use freightdock_proto::v1::{WorkloadReport, WorkloadState};
+    let a = start(None).await;
+    let b = start(Some((&a.addr, issue(&a.m, true).await))).await;
+    until("b a voter", || a.m.store.voters().len() == 2).await;
+    let t = JoinToken::parse(&issue(&a.m, false).await).unwrap();
+    a.m.store.propose(Entry::NodeEnrolled { node_id: "n1".into(), hostname: "h".into(), secret_hash: t.secret_hash(), cert_sha256: "c".into(), at: now_ms() }).await.unwrap();
+
+    // n1 is connected to b and runs nothing yet.
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+    let g = b.m.sessions.open("n1", tx, "test".into(), Some(WorkloadReport::default()));
+    let parsed = freightdock_manager::compose::parse("services:\n  web:\n    image: nginx:alpine\n").unwrap();
+    let placements = [("app.web.1".to_string(), "n1".to_string())].into();
+    a.m.store.propose(Entry::StackDeployed { name: "app".into(), compose: String::new(), services: parsed.services, placements, at: now_ms() }).await.unwrap();
+    until("the stack on b", || b.m.store.read(|s| s.workloads.contains_key("app.web.1"))).await;
+
+    a.m.reconcile().await;
+    assert!(tokio::time::timeout(Duration::from_millis(300), rx.recv()).await.is_err(), "a does not reconcile a worker it does not hold");
+    b.m.reconcile().await;
+    let got = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await.expect("a run").unwrap().unwrap();
+    let Some(Body::Command(c)) = got.body else { panic!("{got:?}") };
+    let Some(freightdock_proto::v1::command::Op::RunContainer(r)) = &c.op else { panic!("{c:?}") };
+    assert_eq!((r.workload_id.as_str(), r.image.as_str()), ("app.web.1", "nginx:alpine"));
+
+    // While it runs, nothing more; once done and reported running, still nothing.
+    b.m.reconcile().await;
+    assert!(tokio::time::timeout(Duration::from_millis(300), rx.recv()).await.is_err(), "one command at a time");
+    let done = Entry::CommandStatus { command_id: c.command_id.clone(), status: CommandStatus::Succeeded, message: "running".into(), result_json: String::new(), at: now_ms() };
+    b.m.store.propose(done).await.unwrap();
+    until("the end on b", || b.m.store.read(|s| s.busy_workloads().is_empty())).await;
+    b.m.sessions.command_ended("n1", g);
+    let up = WorkloadReport { workloads: vec![WorkloadState { workload_id: "app.web.1".into(), state: "running".into(), generation: r.generation, ..Default::default() }] };
+    b.m.sessions.heard("n1", g, None, Some(up.clone()));
+    b.m.reconcile().await;
+    assert!(tokio::time::timeout(Duration::from_millis(300), rx.recv()).await.is_err(), "as wanted");
+
+    // The stack goes: its container is removed.
+    a.m.store.propose(Entry::StackRemoved { name: "app".into(), at: now_ms() }).await.unwrap();
+    until("gone on b", || b.m.store.read(|s| s.stacks.is_empty())).await;
+    b.m.reconcile().await;
+    let got = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await.expect("a remove").unwrap().unwrap();
+    assert!(matches!(got.body, Some(Body::Command(ref c)) if matches!(c.op, Some(freightdock_proto::v1::command::Op::RemoveContainer(_)))), "{got:?}");
 }

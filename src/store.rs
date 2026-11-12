@@ -26,6 +26,8 @@ pub struct Store {
     sm: StateMachine,
     /// For forwarding to the leader; `None` for a manager alone (tests).
     peer_tls: Option<Arc<rustls::ClientConfig>>,
+    /// On a follower: when an append from the leader last came in.
+    leader_heard: std::sync::Mutex<Option<std::time::Instant>>,
 }
 
 #[derive(Debug)]
@@ -72,7 +74,7 @@ impl Store {
             raft.initialize(BTreeMap::from([(id, BasicNode { addr: addr.to_string() })])).await.context("making a one-manager cluster")?;
             tracing::info!(raft_id = id, "started a new Raft cluster with this manager as its only member");
         }
-        Ok(Store { raft, id, sm, peer_tls })
+        Ok(Store { raft, id, sm, peer_tls, leader_heard: Default::default() })
     }
 
     /// A store in a temporary folder, for tests: a one-manager cluster, its leader elected.
@@ -185,6 +187,25 @@ impl Store {
             Some(at) if at.elapsed() < QUORUM_STALE => Ok(()),
             Some(at) => Err(ProposeError::Unavailable(format!("no quorum: a majority of managers has not answered for {}s", at.elapsed().as_secs()))),
             None => Err(ProposeError::Unavailable("no quorum: a majority of managers has not answered yet".into())),
+        }
+    }
+
+    /// The leader's append came in (`peer.rs`).
+    pub fn heard_leader(&self) {
+        *self.leader_heard.lock().expect("leader heard lock") = Some(std::time::Instant::now());
+    }
+
+    /// Whether this manager is with a majority now: alone in a cluster of one; as the leader, a quorum answered
+    /// lately; as a follower, the leader's appends come in. A manager that is not cannot change anything, and a worker
+    /// that hears only it must not count that as hearing the cluster (G6).
+    pub fn in_quorum(&self) -> bool {
+        if self.voters().len() < 2 {
+            return true;
+        }
+        match self.leader() {
+            Some(l) if l == self.id => self.quorum_heard().is_ok(),
+            Some(_) => self.leader_heard.lock().expect("leader heard lock").is_some_and(|at| at.elapsed() < QUORUM_STALE),
+            None => false,
         }
     }
 

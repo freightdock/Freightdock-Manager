@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use serde::Serialize;
 use tokio::sync::mpsc;
 
-use freightdock_proto::v1::{HeardNode, ManagerMessage, NodeResources};
+use freightdock_proto::v1::{HeardNode, ManagerMessage, NodeResources, WorkloadReport, WorkloadState};
 
 #[derive(Debug, Clone, Copy)]
 pub struct Thresholds {
@@ -55,6 +55,13 @@ pub struct Session {
     pub connected_at: Instant,
     pub resources: Option<NodeResources>,
     pub peer: String,
+    /// The managed containers it last reported.
+    pub workloads: Option<WorkloadReport>,
+    /// Whether that report was made after the last command it finished: the reconcile acts only on a fresh one, so
+    /// it never answers a command's result with a second command made from what came before it.
+    pub fresh: bool,
+    /// Whether the worker says it is fenced (hello, heartbeats).
+    pub fenced: bool,
 }
 
 /// Ends a stream with a status. Dropping the sender is not enough: the task reading the worker's side holds a clone.
@@ -92,12 +99,16 @@ impl Sessions {
 
     /// A new stream for `node`, replacing any older one (whose sender is dropped, which ends it). Answers its
     /// generation.
-    pub fn open(&self, node: &str, tx: mpsc::Sender<Result<ManagerMessage, tonic::Status>>, peer: String) -> u64 {
+    pub fn open(&self, node: &str, tx: mpsc::Sender<Result<ManagerMessage, tonic::Status>>, peer: String, workloads: Option<WorkloadReport>) -> u64 {
+        self.open_fenced(node, tx, peer, workloads, false)
+    }
+
+    pub fn open_fenced(&self, node: &str, tx: mpsc::Sender<Result<ManagerMessage, tonic::Status>>, peer: String, workloads: Option<WorkloadReport>, fenced: bool) -> u64 {
         let mut g = self.inner.lock().expect("sessions lock");
         g.0 += 1;
         let generation = g.0;
         let now = Instant::now();
-        if let Some(old) = g.1.insert(node.to_string(), Session { generation, tx, last_heard: now, connected_at: now, resources: None, peer }) {
+        if let Some(old) = g.1.insert(node.to_string(), Session { generation, tx, last_heard: now, connected_at: now, resources: None, peer, fresh: workloads.is_some(), workloads, fenced }) {
             end(&old, "a newer stream from this node replaced this one");
         }
         generation
@@ -126,14 +137,59 @@ impl Sessions {
         }
     }
 
-    pub fn heard(&self, node: &str, generation: u64, resources: Option<NodeResources>) {
+    pub fn heard(&self, node: &str, generation: u64, resources: Option<NodeResources>, workloads: Option<WorkloadReport>) {
         let mut g = self.inner.lock().expect("sessions lock");
         if let Some(s) = g.1.get_mut(node).filter(|s| s.generation == generation) {
             s.last_heard = Instant::now();
             if resources.is_some() {
                 s.resources = resources;
             }
+            if workloads.is_some() {
+                s.workloads = workloads;
+                s.fresh = true;
+            }
         }
+    }
+
+    /// What the worker says of its fence, from a heartbeat.
+    pub fn fenced(&self, node: &str, generation: u64, fenced: bool) {
+        let mut g = self.inner.lock().expect("sessions lock");
+        if let Some(s) = g.1.get_mut(node).filter(|s| s.generation == generation) {
+            s.fenced = fenced;
+        }
+    }
+
+    /// The nodes connected here, heard lately, and whether each says it is fenced. A stream not heard from for the
+    /// suspect threshold is left out: one cut off without a close stays open here until keepalive ends it, and its
+    /// last word is no news of the node now.
+    pub fn local_fencing(&self) -> Vec<(String, bool)> {
+        let t = self.thresholds;
+        self.inner.lock().expect("sessions lock").1.iter().filter(|(_, s)| s.last_heard.elapsed() < t.suspect).map(|(id, s)| (id.clone(), s.fenced)).collect()
+    }
+
+    /// A command of the node's ended: what it reported before is no longer what is there.
+    pub fn command_ended(&self, node: &str, generation: u64) {
+        let mut g = self.inner.lock().expect("sessions lock");
+        if let Some(s) = g.1.get_mut(node).filter(|s| s.generation == generation) {
+            s.fresh = false;
+        }
+    }
+
+    /// The nodes connected here with a fresh report of their containers: the ones this manager reconciles.
+    pub fn fresh_reports(&self) -> Vec<(String, Vec<WorkloadState>)> {
+        let g = self.inner.lock().expect("sessions lock");
+        g.1.iter().filter(|(_, s)| s.fresh && !s.fenced).filter_map(|(id, s)| Some((id.clone(), s.workloads.as_ref()?.workloads.clone()))).collect()
+    }
+
+    /// The node's containers as last reported to any manager (the freshest word), for people to see.
+    pub fn reported(&self, node: &str) -> Option<Vec<WorkloadState>> {
+        if let Some(s) = self.inner.lock().expect("sessions lock").1.get(node)
+            && let Some(w) = &s.workloads
+        {
+            return Some(w.workloads.clone());
+        }
+        let g = self.remote.lock().expect("remote lock");
+        g.values().filter_map(|(at, nodes)| nodes.iter().find(|n| n.node_id == node).and_then(|n| Some((Duration::from_millis(n.heard_ms_ago) + at.elapsed(), n.workloads.as_ref()?)))).min_by_key(|c| c.0).map(|c| c.1.workloads.clone())
     }
 
     pub fn sender(&self, node: &str) -> Option<mpsc::Sender<Result<ManagerMessage, tonic::Status>>> {
@@ -154,7 +210,7 @@ impl Sessions {
     pub fn connected(&self) -> Vec<HeardNode> {
         let g = self.inner.lock().expect("sessions lock");
         g.1.iter()
-            .map(|(id, s)| HeardNode { node_id: id.clone(), heard_ms_ago: s.last_heard.elapsed().as_millis() as u64, connected_for_ms: s.connected_at.elapsed().as_millis() as u64, peer: s.peer.clone(), resources: s.resources })
+            .map(|(id, s)| HeardNode { node_id: id.clone(), heard_ms_ago: s.last_heard.elapsed().as_millis() as u64, connected_for_ms: s.connected_at.elapsed().as_millis() as u64, peer: s.peer.clone(), resources: s.resources, workloads: s.workloads.clone() })
             .collect()
     }
 
@@ -211,8 +267,8 @@ mod tests {
         let s = Sessions::default();
         let (tx1, _rx1) = mpsc::channel(1);
         let (tx2, _rx2) = mpsc::channel(1);
-        let g1 = s.open("n", tx1, "a".into());
-        let g2 = s.open("n", tx2, "b".into());
+        let g1 = s.open("n", tx1, "a".into(), None);
+        let g2 = s.open("n", tx2, "b".into(), None);
         s.close("n", g1);
         assert_eq!(s.liveness("n").peer.as_deref(), Some("b"));
         s.close("n", g2);
@@ -220,7 +276,7 @@ mod tests {
     }
 
     fn heard(node: &str, ms: u64) -> HeardNode {
-        HeardNode { node_id: node.into(), heard_ms_ago: ms, connected_for_ms: 60_000, peer: "10.0.0.9:1".into(), resources: None }
+        HeardNode { node_id: node.into(), heard_ms_ago: ms, connected_for_ms: 60_000, peer: "10.0.0.9:1".into(), resources: None, workloads: None }
     }
 
     #[test]
@@ -235,10 +291,48 @@ mod tests {
         assert_eq!(l.peer.as_deref(), Some("10.0.0.9:1"));
         // Its own session wins when it is fresher.
         let (tx, _rx) = mpsc::channel(1);
-        s.open("n", tx, "here".into());
+        s.open("n", tx, "here".into(), None);
         let l = s.liveness("n");
         assert_eq!((l.via, l.peer.as_deref()), (None, Some("here")));
         assert_eq!(s.connected().len(), 1, "what it tells the others is only its own");
+    }
+
+    fn report(ids: &[&str]) -> Option<WorkloadReport> {
+        Some(WorkloadReport { workloads: ids.iter().map(|id| WorkloadState { workload_id: id.to_string(), state: "running".into(), ..Default::default() }).collect() })
+    }
+
+    #[test]
+    fn a_report_is_stale_from_a_command_s_end_to_the_next_heartbeat() {
+        let s = Sessions::default();
+        let (tx, _rx) = mpsc::channel(1);
+        let g = s.open("n", tx, "p".into(), report(&["a"]));
+        assert_eq!(s.fresh_reports().len(), 1, "the hello's report counts");
+        s.command_ended("n", g);
+        assert!(s.fresh_reports().is_empty());
+        assert_eq!(s.reported("n").map(|w| w.len()), Some(1), "still shown");
+        s.heard("n", g, None, None);
+        assert!(s.fresh_reports().is_empty(), "a heartbeat without a report changes nothing");
+        s.heard("n", g, None, report(&["a", "b"]));
+        assert_eq!(s.fresh_reports()[0].1.len(), 2);
+    }
+
+    #[test]
+    fn a_stream_gone_quiet_says_nothing_of_the_node_s_fence() {
+        let t = Thresholds { heartbeat: Duration::from_millis(5), suspect: Duration::from_millis(30), unreachable: Duration::from_millis(60) };
+        let s = Sessions::new(t);
+        let (tx, _rx) = mpsc::channel(1);
+        s.open("n", tx, "p".into(), None);
+        assert_eq!(s.local_fencing(), vec![("n".to_string(), false)]);
+        std::thread::sleep(Duration::from_millis(40));
+        assert!(s.local_fencing().is_empty(), "half-open, as after a cut");
+    }
+
+    #[test]
+    fn what_another_manager_heard_is_shown_but_not_acted_on() {
+        let s = Sessions::default();
+        s.reports("m2:7450", vec![HeardNode { workloads: report(&["a"]), ..heard("n", 100) }]);
+        assert_eq!(s.reported("n").map(|w| w[0].workload_id.clone()).as_deref(), Some("a"));
+        assert!(s.fresh_reports().is_empty());
     }
 
     #[test]

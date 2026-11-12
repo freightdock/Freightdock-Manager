@@ -47,6 +47,10 @@ impl ManagerPeer for PeerSvc {
         match RaftRpc::try_from(r.rpc).unwrap_or(RaftRpc::Unspecified) {
             RaftRpc::AppendEntries => {
                 let res = raft.append_entries(decode(&r.payload)?).await;
+                // Accepted: from the leader of this term, so the leader is there and this manager is with it.
+                if matches!(res, Ok(Ok(_))) {
+                    self.0.store.heard_leader();
+                }
                 reply(res.map(openraft::raft::AppendEntriesResponse::<TypeConfig>::from))
             }
             RaftRpc::Vote => reply(raft.vote(decode(&r.payload)?).await),

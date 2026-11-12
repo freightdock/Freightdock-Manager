@@ -36,7 +36,19 @@ pub fn op_to_proto(op: &Op) -> v1::command::Op {
     match op.clone() {
         Op::Ping => P::Ping(v1::Ping {}),
         Op::DockerInfo => P::DockerInfo(v1::DockerInfo {}),
-        Op::RunContainer { workload_id, image, name, command, env, labels } => P::RunContainer(v1::RunContainer { workload_id, image, name, command, env: env.into_iter().collect(), labels: labels.into_iter().collect() }),
+        Op::RunContainer { workload_id, image, name, command, env, labels, generation, ports, volumes, limits } => P::RunContainer(v1::RunContainer {
+            workload_id,
+            image,
+            name,
+            command,
+            env: env.into_iter().collect(),
+            labels: labels.into_iter().collect(),
+            generation,
+            ports: ports.into_iter().map(|p| v1::PortMapping { host_port: p.host_port, container_port: p.container_port, protocol: p.protocol, host_ip: p.host_ip }).collect(),
+            volumes,
+            cpu_millis: limits.cpu_millis,
+            memory_bytes: limits.memory_bytes,
+        }),
         Op::StopContainer { workload_id, timeout_s } => P::StopContainer(v1::StopContainer { workload_id, timeout_s }),
         Op::RemoveContainer { workload_id } => P::RemoveContainer(v1::RemoveContainer { workload_id }),
     }
@@ -113,6 +125,9 @@ impl WorkerSession for SessionSvc {
 
     async fn open(&self, req: Request<Streaming<v1::WorkerMessage>>) -> Result<Response<Self::OpenStream>, Status> {
         let m = self.0.clone();
+        if m.cut_off() {
+            return Err(Status::unavailable("this manager is cut off from a majority of managers; try another"));
+        }
         let peer = peer_of(&req).ok_or_else(|| Status::internal("no peer"))?;
         let cert = peer.cert.as_ref().ok_or_else(|| Status::unauthenticated("a client certificate is needed"))?;
         let fp = sha256_hex(cert);
@@ -140,10 +155,14 @@ impl WorkerSession for SessionSvc {
                 manager_id: m.manager_id.clone(),
                 heartbeat_interval_ms: m.sessions.thresholds.heartbeat.as_millis() as u32,
                 managers: m.managers(),
+                fence_stop_s: m.fencing.stop_s,
+                fence_storage_s: m.fencing.storage_s,
+                fence_reboot_s: m.fencing.reboot_s,
             })),
         };
         tx.send(Ok(welcome)).await.map_err(|_| Status::cancelled("gone"))?;
-        let generation = m.sessions.open(&node_id, tx.clone(), peer.addr.to_string());
+        let fenced = hello.fencing_state == v1::FencingState::AwaitingAuthorization as i32;
+        let generation = m.sessions.open_fenced(&node_id, tx.clone(), peer.addr.to_string(), hello.workloads.clone(), fenced);
         tracing::info!(node = %node_id, hostname = %hello.hostname, peer = %peer.addr, in_flight = hello.in_flight.len(), "worker connected");
         m.events.push("connected", Some(&node_id), format!("connected from {}", peer.addr));
 
@@ -164,15 +183,19 @@ impl WorkerSession for SessionSvc {
                 };
                 match msg.body {
                     Some(worker_message::Body::Heartbeat(hb)) => {
-                        m.sessions.heard(&node_id, generation, hb.resources);
+                        m.sessions.fenced(&node_id, generation, hb.fencing_state == v1::FencingState::AwaitingAuthorization as i32);
+                        m.sessions.heard(&node_id, generation, hb.resources, hb.workloads);
                         let ack = v1::ManagerMessage { body: Some(manager_message::Body::HeartbeatAck(v1::HeartbeatAck { seq: hb.seq })) };
                         if tx.send(Ok(ack)).await.is_err() {
                             break;
                         }
                     }
                     Some(worker_message::Body::CommandUpdate(u)) => {
-                        m.sessions.heard(&node_id, generation, None);
+                        m.sessions.heard(&node_id, generation, None, None);
                         let Some(status) = status_from_proto(u.status) else { continue };
+                        if status.is_terminal() {
+                            m.sessions.command_ended(&node_id, generation);
+                        }
                         if m.store.read(|s| s.commands.get(&u.command_id).map(|c| c.node_id != node_id)).unwrap_or(true) {
                             tracing::warn!(node = %node_id, command = %u.command_id, "a report on a command that is not this node's");
                             continue;
