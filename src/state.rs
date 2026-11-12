@@ -227,6 +227,8 @@ pub struct JoinToken {
 /// The operation of a command, as the API takes it and the log keeps it. `grpc.rs` turns it into the protobuf op.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
+// A run is much bigger than the rest; ops are few and short-lived, so it is not boxed.
+#[allow(clippy::large_enum_variant)]
 pub enum Op {
     Ping,
     DockerInfo,
@@ -250,6 +252,9 @@ pub enum Op {
         volumes: Vec<String>,
         #[serde(default, skip_serializing_if = "Resources::is_zero")]
         limits: Resources,
+        /// On its stack's network (G9); none: Docker's default network.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        net: Option<Attach>,
     },
     StopContainer {
         workload_id: String,
@@ -423,6 +428,15 @@ pub struct Workload {
     pub host: Option<u8>,
 }
 
+/// Where a container joins the overlay (G9): its stack's network, its address there, and the stack's names as
+/// `name:address` (each service, and each replica as `<service>-<slot>`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Attach {
+    pub stack: String,
+    pub address: String,
+    pub hosts: Vec<String>,
+}
+
 /// The cluster's internal range (G9): a /16, a /24 in it per stack.
 pub const CLUSTER_RANGE: [u8; 2] = [10, 240];
 
@@ -431,6 +445,19 @@ impl ClusterState {
     pub fn subnet(&self, stack: &str) -> Option<String> {
         let n = self.stacks.get(stack)?.net?;
         Some(format!("{}.{}.{n}.0/24", CLUSTER_RANGE[0], CLUSTER_RANGE[1]))
+    }
+
+    /// How a workload joins its stack's network, once it has an address.
+    pub fn attach(&self, w: &Workload) -> Option<Attach> {
+        let address = self.address(&w.id)?;
+        let mut hosts = vec![];
+        for o in self.workloads.values().filter(|o| o.stack == w.stack) {
+            if let Some(a) = self.address(&o.id) {
+                hosts.push(format!("{}:{a}", o.service));
+                hosts.push(format!("{}-{}:{a}", o.service, o.slot));
+            }
+        }
+        Some(Attach { stack: w.stack.clone(), address, hosts })
     }
 
     /// A workload's address on its stack's network, once it has one.
@@ -783,6 +810,8 @@ impl ClusterState {
                     for w in self.workloads.values_mut().filter(|w| w.stack == *name && w.host.is_none()) {
                         w.host = (2..=254u8).find(|h| !used.contains(h));
                         used.extend(w.host);
+                        // A container made before it had one is made again, on the overlay.
+                        w.generation = index;
                     }
                 }
                 let created_at = self.stacks.get(name).map_or(*at, |s| s.created_at);
@@ -1221,7 +1250,7 @@ pub(crate) mod tests {
         assert_eq!(s.recovery_kind(&s.workloads["app.web.1"]), RecoveryKind::Stateless);
         assert_eq!(s.recovery_kind(&s.workloads["app.db.1"]), RecoveryKind::LocalData);
         assert_eq!(s.recovery_kind(&s.workloads["app.cron.1"]), RecoveryKind::Pinned);
-        let c = CommandRecord { op: Op::RunContainer { workload_id: "app.web.1".into(), image: "nginx".into(), name: String::new(), command: vec![], env: Default::default(), labels: Default::default(), generation: 0, ports: vec![], volumes: vec![], limits: Default::default() }, ..command("c", "n1") };
+        let c = CommandRecord { op: Op::RunContainer { workload_id: "app.web.1".into(), image: "nginx".into(), name: String::new(), command: vec![], env: Default::default(), labels: Default::default(), generation: 0, ports: vec![], volumes: vec![], limits: Default::default(), net: Default::default() }, ..command("c", "n1") };
         next(&mut s, &Entry::CommandCreated { command: c }).unwrap();
 
         let web = recovered(Some("n1"), &[("app.web.1", "n2")], &[("app.db.1", "keeps local data")]);
@@ -1303,7 +1332,7 @@ pub(crate) mod tests {
 
     #[test]
     fn entries_read_back_as_written() {
-        let e = Entry::CommandCreated { command: CommandRecord { op: Op::RunContainer { workload_id: "w".into(), image: "nginx".into(), name: String::new(), command: vec![], env: Default::default(), labels: Default::default(), generation: 4, ports: vec![Port { host_port: 80, container_port: 8080, protocol: "tcp".into(), host_ip: String::new() }], volumes: vec!["d:/d".into()], limits: Resources { cpu_millis: 500, memory_bytes: 0 } }, ..command("c", "n1") } };
+        let e = Entry::CommandCreated { command: CommandRecord { op: Op::RunContainer { workload_id: "w".into(), image: "nginx".into(), name: String::new(), command: vec![], env: Default::default(), labels: Default::default(), generation: 4, ports: vec![Port { host_port: 80, container_port: 8080, protocol: "tcp".into(), host_ip: String::new() }], volumes: vec!["d:/d".into()], limits: Resources { cpu_millis: 500, memory_bytes: 0 }, net: Default::default() }, ..command("c", "n1") } };
         let back: Entry = serde_json::from_str(&serde_json::to_string(&e).unwrap()).unwrap();
         assert_eq!(back, e);
         let old = r#"{"type":"command_created","command":{"id":"c","node_id":"n","op":{"op":"run_container","workload_id":"w","image":"i"},"config_version":0,"created_at":0,"deadline":0,"status":"pending","message":"","result_json":"","updated_at":0}}"#;

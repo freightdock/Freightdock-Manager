@@ -117,7 +117,7 @@ mod tests {
     use super::*;
 
     fn run(id: &str, env: BTreeMap<String, String>) -> Op {
-        Op::RunContainer { workload_id: id.into(), image: "i".into(), name: String::new(), command: vec![], env, labels: Default::default(), generation: 1, ports: vec![], volumes: vec![], limits: Default::default() }
+        Op::RunContainer { workload_id: id.into(), image: "i".into(), name: String::new(), command: vec![], env, labels: Default::default(), generation: 1, ports: vec![], volumes: vec![], limits: Default::default(), net: None }
     }
 
     fn filler() -> Fill {

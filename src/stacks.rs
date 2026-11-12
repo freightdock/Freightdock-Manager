@@ -120,7 +120,7 @@ pub fn place(s: &ClusterState, stack: &str, services: &BTreeMap<String, ServiceS
 }
 
 /// The op that brings one workload from what its node reported to what the state wants, if one is needed.
-fn op_for(w: &Workload, run: bool, actual: Option<&WorkloadState>) -> Option<Op> {
+fn op_for(w: &Workload, net: Option<crate::state::Attach>, run: bool, actual: Option<&WorkloadState>) -> Option<Op> {
     let up = actual.is_some_and(|a| matches!(a.state.as_str(), "running" | "restarting" | "paused" | "removing"));
     let current = actual.is_some_and(|a| a.generation == w.generation);
     if run && !(up && current) {
@@ -135,6 +135,7 @@ fn op_for(w: &Workload, run: bool, actual: Option<&WorkloadState>) -> Option<Op>
             ports: w.spec.ports.clone(),
             volumes: w.spec.volumes.clone(),
             limits: w.spec.limits,
+            net,
         });
     }
     if !run && actual.is_some_and(|a| a.state == "running") {
@@ -159,7 +160,7 @@ pub fn reconcile(s: &ClusterState, node: &str, actual: &[WorkloadState], busy: &
         if busy.contains(&w.id) {
             continue;
         }
-        if let Some(op) = op_for(w, s.should_run(w), actual.iter().find(|a| a.workload_id == w.id)) {
+        if let Some(op) = op_for(w, s.attach(w), s.should_run(w), actual.iter().find(|a| a.workload_id == w.id)) {
             out.push((w.id.clone(), op));
         }
     }
@@ -408,6 +409,23 @@ mod tests {
             o => panic!("{o:?}"),
         }
         assert!(reconcile(&s, "a", &[], &BTreeSet::from(["web.x.1".to_string()])).is_empty(), "busy");
+    }
+
+    #[test]
+    fn a_run_puts_the_workload_on_its_stack_s_network_with_its_address_and_the_stack_s_names() {
+        let mut s = state_with(&["a"]);
+        placed(&mut s, &[("x", spec("nginx", 2)), ("db", spec("pg", 1))]);
+        let ops = reconcile(&s, "a", &[], &BTreeSet::new());
+        let net = ops.iter().find_map(|(_, o)| match o {
+            Op::RunContainer { workload_id, net, .. } if workload_id == "web.x.1" => net.clone(),
+            _ => None,
+        });
+        let net = net.expect("on the overlay");
+        assert_eq!((net.stack.as_str(), Some(net.address.clone())), ("web", s.address("web.x.1")));
+        let db = s.address("web.db.1").unwrap();
+        let x2 = s.address("web.x.2").unwrap();
+        assert!(net.hosts.contains(&format!("db:{db}")) && net.hosts.contains(&format!("x:{x2}")), "{:?}", net.hosts);
+        assert!(net.hosts.contains(&format!("x-2:{x2}")) && net.hosts.contains(&format!("db-1:{db}")), "and each replica by itself: {:?}", net.hosts);
     }
 
     #[test]
