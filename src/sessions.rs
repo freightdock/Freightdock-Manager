@@ -64,6 +64,8 @@ pub struct Session {
     pub fenced: bool,
     /// The network it was last sent (G9), its version left out: sent again only when something else changed.
     pub network: Option<freightdock_proto::v1::NetworkState>,
+    /// What the worker last said of its overlay (hello, heartbeats).
+    pub overlay: Option<freightdock_proto::v1::NetworkReport>,
 }
 
 /// Ends a stream with a status. Dropping the sender is not enough: the task reading the worker's side holds a clone.
@@ -110,7 +112,7 @@ impl Sessions {
         g.0 += 1;
         let generation = g.0;
         let now = Instant::now();
-        if let Some(old) = g.1.insert(node.to_string(), Session { generation, tx, last_heard: now, connected_at: now, resources: None, peer, fresh: workloads.is_some(), workloads, fenced, network: None }) {
+        if let Some(old) = g.1.insert(node.to_string(), Session { generation, tx, last_heard: now, connected_at: now, resources: None, peer, fresh: workloads.is_some(), workloads, fenced, network: None, overlay: None }) {
             end(&old, "a newer stream from this node replaced this one");
         }
         generation
@@ -151,6 +153,23 @@ impl Sessions {
                 s.fresh = true;
             }
         }
+    }
+
+    /// What the worker says of its overlay (hello, heartbeats); none keeps the last.
+    pub fn heard_network(&self, node: &str, generation: u64, report: Option<freightdock_proto::v1::NetworkReport>) {
+        let mut g = self.inner.lock().expect("sessions lock");
+        if let (Some(s), Some(r)) = (g.1.get_mut(node).filter(|s| s.generation == generation), report) {
+            s.overlay = Some(r);
+        }
+    }
+
+    /// The node's overlay as last reported to any manager (this one's own session first).
+    pub fn overlay(&self, node: &str) -> Option<freightdock_proto::v1::NetworkReport> {
+        if let Some(r) = self.inner.lock().expect("sessions lock").1.get(node).and_then(|s| s.overlay.clone()) {
+            return Some(r);
+        }
+        let g = self.remote.lock().expect("remote lock");
+        g.values().filter_map(|(at, nodes)| nodes.iter().find(|n| n.node_id == node).and_then(|n| Some((Duration::from_millis(n.heard_ms_ago) + at.elapsed(), n.network.as_ref()?)))).min_by_key(|c| c.0).map(|c| c.1.clone())
     }
 
     /// What the worker says of its fence, from a heartbeat.
@@ -237,7 +256,7 @@ impl Sessions {
     pub fn connected(&self) -> Vec<HeardNode> {
         let g = self.inner.lock().expect("sessions lock");
         g.1.iter()
-            .map(|(id, s)| HeardNode { node_id: id.clone(), heard_ms_ago: s.last_heard.elapsed().as_millis() as u64, connected_for_ms: s.connected_at.elapsed().as_millis() as u64, peer: s.peer.clone(), resources: s.resources, workloads: s.workloads.clone() })
+            .map(|(id, s)| HeardNode { node_id: id.clone(), heard_ms_ago: s.last_heard.elapsed().as_millis() as u64, connected_for_ms: s.connected_at.elapsed().as_millis() as u64, peer: s.peer.clone(), resources: s.resources, workloads: s.workloads.clone(), network: s.overlay.clone() })
             .collect()
     }
 
@@ -303,7 +322,7 @@ mod tests {
     }
 
     fn heard(node: &str, ms: u64) -> HeardNode {
-        HeardNode { node_id: node.into(), heard_ms_ago: ms, connected_for_ms: 60_000, peer: "10.0.0.9:1".into(), resources: None, workloads: None }
+        HeardNode { node_id: node.into(), heard_ms_ago: ms, connected_for_ms: 60_000, peer: "10.0.0.9:1".into(), resources: None, workloads: None, network: None }
     }
 
     #[test]
@@ -360,6 +379,22 @@ mod tests {
         s.reports("m2:7450", vec![HeardNode { workloads: report(&["a"]), ..heard("n", 100) }]);
         assert_eq!(s.reported("n").map(|w| w[0].workload_id.clone()).as_deref(), Some("a"));
         assert!(s.fresh_reports().is_empty());
+    }
+
+    #[test]
+    fn a_node_s_overlay_is_what_it_last_said_here_or_to_another_manager() {
+        let s = Sessions::default();
+        let net = |v: u64, e: &str| Some(freightdock_proto::v1::NetworkReport { public_key: "k".into(), listen_port: 51820, applied_version: v, error: e.into() });
+        assert_eq!(s.overlay("n"), None);
+        s.reports("m2:7450", vec![HeardNode { network: net(3, ""), ..heard("n", 100) }]);
+        assert_eq!(s.overlay("n").map(|r| r.applied_version), Some(3), "another manager's word");
+        let (tx, _rx) = mpsc::channel(1);
+        let g = s.open("n", tx, "a".into(), None);
+        s.heard_network("n", g, net(4, "wg: not found"));
+        assert_eq!(s.overlay("n").map(|r| (r.applied_version, r.error)), Some((4, "wg: not found".to_string())), "its own session first");
+        s.heard_network("n", g, None);
+        assert_eq!(s.overlay("n").map(|r| r.applied_version), Some(4), "a heartbeat without one keeps the last");
+        assert_eq!(s.connected()[0].network.as_ref().map(|r| r.applied_version), Some(4), "and passed on to the others");
     }
 
     #[test]

@@ -235,6 +235,9 @@ bridge per stack that talks only to itself (nftables), names through the hosts f
 6. [ ] Left for later: a gratuitous ARP when an address leaves a node (a peer's stale ARP entry costs about 5 s
        after a move); removing a stack network a node no longer needs; a container made before the worker knew of
        the overlay is not made again by itself (only possible on a cluster that ran a G9 manager with older workers).
+7. [x] The network in the UI: each workload's address on the stack and node pages, each node's overlay state.
+8. [ ] Owner's wish (2026-11-12), once the network part is done: a live, interactive view of the network that shows
+       the communication between workloads and nodes.
 
 ## Open questions for the owner
 

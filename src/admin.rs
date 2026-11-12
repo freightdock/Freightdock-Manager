@@ -149,6 +149,8 @@ fn node_json(m: &Manager, n: &crate::state::Node) -> Value {
         "all_labels": n.all_labels(),
         "fencing": n.fencing,
         "liveness": m.sessions.liveness(&n.id),
+        // Its overlay as it last said (G9); the key alone is in its report.
+        "network": m.sessions.overlay(&n.id).map(|r| json!({ "public_key": r.public_key, "listen_port": r.listen_port, "applied_version": r.applied_version, "error": r.error })),
     })
 }
 
@@ -459,6 +461,7 @@ fn stack_json(m: &Manager, s: &crate::state::ClusterState, st: &crate::state::St
                 "node_id": w.node_id,
                 "hostname": w.node_id.as_ref().and_then(|n| s.nodes.get(n)).map(|n| n.hostname.clone()),
                 "generation": w.generation,
+                "address": s.address(&w.id),
                 "desired": if run { "running" } else { "stopped" },
                 "status": if fenced { "fenced" } else { workload_status(run, w.node_id.is_some(), actual.as_ref(), w.generation, report.is_some(), lc) },
                 "recovery": s.recovery_kind(w),
@@ -468,7 +471,7 @@ fn stack_json(m: &Manager, s: &crate::state::ClusterState, st: &crate::state::St
         })
         .collect();
     let services: serde_json::Map<String, Value> = st.services.iter().map(|(k, v)| (k.clone(), json!({ "image": v.image, "replicas": v.replicas, "ports": v.ports, "ha": v.ha, "limits": v.limits, "placement": { "constraints": v.placement.constraints.iter().map(ToString::to_string).collect::<Vec<_>>(), "prefer": v.placement.prefer.iter().map(ToString::to_string).collect::<Vec<_>>(), "spread": v.placement.spread, "reserve": v.placement.reserve } }))).collect();
-    let mut v = json!({ "name": st.name, "stopped": st.stopped, "created_at": st.created_at, "updated_at": st.updated_at, "services": services, "workloads": workloads });
+    let mut v = json!({ "name": st.name, "subnet": s.subnet(&st.name), "stopped": st.stopped, "created_at": st.created_at, "updated_at": st.updated_at, "services": services, "workloads": workloads });
     if with_compose {
         v["compose"] = json!(st.compose);
     }

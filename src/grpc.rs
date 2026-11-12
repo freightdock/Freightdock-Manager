@@ -167,6 +167,7 @@ impl WorkerSession for SessionSvc {
         tx.send(Ok(welcome)).await.map_err(|_| Status::cancelled("gone"))?;
         let fenced = hello.fencing_state == v1::FencingState::AwaitingAuthorization as i32;
         let generation = m.sessions.open_fenced(&node_id, tx.clone(), peer.addr.to_string(), hello.workloads.clone(), fenced);
+        m.sessions.heard_network(&node_id, generation, hello.network.clone());
         tracing::info!(node = %node_id, hostname = %hello.hostname, peer = %peer.addr, in_flight = hello.in_flight.len(), "worker connected");
         m.events.push("connected", Some(&node_id), format!("connected from {}", peer.addr));
 
@@ -188,6 +189,7 @@ impl WorkerSession for SessionSvc {
                 match msg.body {
                     Some(worker_message::Body::Heartbeat(hb)) => {
                         m.sessions.fenced(&node_id, generation, hb.fencing_state == v1::FencingState::AwaitingAuthorization as i32);
+                        m.sessions.heard_network(&node_id, generation, hb.network);
                         m.sessions.heard(&node_id, generation, hb.resources, hb.workloads);
                         let ack = v1::ManagerMessage { body: Some(manager_message::Body::HeartbeatAck(v1::HeartbeatAck { seq: hb.seq })) };
                         if tx.send(Ok(ack)).await.is_err() {
