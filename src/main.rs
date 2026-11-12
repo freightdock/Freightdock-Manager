@@ -17,6 +17,8 @@ freightdock-manager stack deploy <name> <compose file>   make or change a stack 
 freightdock-manager stack ls                list the stacks
 freightdock-manager stack ps <name>         a stack's workloads: where they run and how they are
 freightdock-manager stack start|stop|restart|rm <name>
+freightdock-manager stack expose <name> [service:port=address:port[/udp] ...]   what the stack exposes on the pool's
+                                            floating addresses, all of it (none: nothing); the Compose file is untouched
 freightdock-manager recoveries [stack]      workloads moved off fenced nodes, or left there and why
 freightdock-manager api-token create <name> [read|admin]   a token for the API over TLS (shown once)
 freightdock-manager api-token ls|rm <id>    list or revoke the API tokens
@@ -274,7 +276,15 @@ async fn stack(config: &Config, args: &[String]) -> Result<()> {
             Ok(())
         }
         (Some("ps"), Some(name)) => {
-            print_workloads(&call(config, Method::GET, &format!("/v1/stacks/{name}"), None).await?);
+            let v = call(config, Method::GET, &format!("/v1/stacks/{name}"), None).await?;
+            print_workloads(&v);
+            print_reach(&v);
+            Ok(())
+        }
+        (Some("expose"), Some(name)) => {
+            let exposures = args[2..].iter().map(|a| freightdock_manager::stacks::parse_exposure(a).with_context(|| format!("{a}: an exposure is service:port=address:port, /udp at the end for udp"))).collect::<Result<Vec<_>>>()?;
+            let v = call(config, Method::PUT, &format!("/v1/stacks/{name}/exposures"), Some(serde_json::json!({ "exposures": exposures }))).await?;
+            print_reach(&v);
             Ok(())
         }
         (Some(a @ ("start" | "stop" | "restart")), Some(name)) => {
@@ -417,4 +427,15 @@ async fn call(config: &Config, method: reqwest::Method, path: &str, body: Option
         bail!("{status}: {}", v["error"].as_str().unwrap_or(&text));
     }
     Ok(v)
+}
+
+/// How each service of a stack is reached from outside the cluster: on its pool addresses, on every node's address
+/// (its Compose file's ports), or not at all.
+fn print_reach(stack: &Value) {
+    println!("\n{:<20} REACHED FROM OUTSIDE", "SERVICE");
+    for (name, svc) in stack["services"].as_object().into_iter().flatten() {
+        let mut ways: Vec<String> = stack["exposures"].as_array().into_iter().flatten().filter(|e| e["service"] == name.as_str()).map(|e| format!("{}:{} -> {}/{}", e["address"].as_str().unwrap_or(""), e["port"], e["container_port"], e["protocol"].as_str().unwrap_or(""))).collect();
+        ways.extend(svc["ports"].as_array().into_iter().flatten().filter(|p| p["host_port"].as_u64().unwrap_or(0) != 0).map(|p| format!("every node's address:{} -> {}/{}", p["host_port"], p["container_port"], p["protocol"].as_str().unwrap_or(""))));
+        println!("{:<20} {}", name, if ways.is_empty() { "no: internal only (reached by name inside the stack)".to_string() } else { ways.join(", ") });
+    }
 }

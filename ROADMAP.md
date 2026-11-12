@@ -271,6 +271,13 @@ address across nodes later.
        worker that fences itself takes them off first. Every published port answers on it. In the UI (`freightdock:cluster-ui-10`):
        a card on the Cluster page, each address with its holder, added and removed by an Administrator.
 4. [ ] Later: the client's address kept for connections forwarded to another node (policy routing on the replies).
+5. [ ] The pool (owner, 2026-11-13): a stack picks an address and port from the pool for a service, outside its
+       Compose file, a port unique per address (two stacks share 443 on two addresses); a pool address answers only
+       its exposures, a Compose `ports:` only the nodes' own addresses, the rest is internal, and the UI says which.
+       - [x] Contracts `Exposure.address`; Network: the rules per address, Compose ports kept off the pool; Manager:
+             `Stack.exposures`, `StackExposed`, `FloatingInUse`, `PUT /v1/stacks/{name}/exposures`,
+             `stack expose`, `stack ps` says how each service is reached.
+       - [ ] The UI: the stacks page and the pool card.
 
 ## Open questions for the owner
 

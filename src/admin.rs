@@ -30,7 +30,7 @@ impl From<ProposeError> for ApiError {
     fn from(e: ProposeError) -> Self {
         match e {
             ProposeError::Rejected(r @ (Rejected::NodeUnknown | Rejected::CommandUnknown | Rejected::StackUnknown | Rejected::FloatingUnknown)) => ApiError(StatusCode::NOT_FOUND, r.to_string()),
-            ProposeError::Rejected(r @ Rejected::BadAddress) => ApiError(StatusCode::BAD_REQUEST, r.to_string()),
+            ProposeError::Rejected(r @ (Rejected::BadAddress | Rejected::BadExposure)) => ApiError(StatusCode::BAD_REQUEST, r.to_string()),
             ProposeError::Rejected(r) => ApiError(StatusCode::CONFLICT, r.to_string()),
             e @ (ProposeError::Unavailable(_) | ProposeError::NotLeader(_)) => ApiError(StatusCode::SERVICE_UNAVAILABLE, e.to_string()),
             ProposeError::Io(e) => {
@@ -109,6 +109,7 @@ pub fn router(m: Arc<Manager>) -> Router {
         .route("/v1/stacks", get(stacks).post(deploy_stack))
         .route("/v1/stacks/{name}", get(stack).delete(remove_stack))
         .route("/v1/stacks/{name}/{action}", post(stack_action))
+        .route("/v1/stacks/{name}/exposures", axum::routing::put(set_exposures))
         .layer(axum::middleware::from_fn_with_state(m.clone(), guard))
         // A snapshot of the UI's database is the whole of it.
         .layer(axum::extract::DefaultBodyLimit::max(UI_DB_MAX))
@@ -325,6 +326,20 @@ async fn traffic(State(m): State<Arc<Manager>>, h: HeaderMap) -> R<Json<Value>> 
 }
 
 #[derive(Deserialize)]
+struct ExposuresBody {
+    exposures: Vec<crate::state::Exposure>,
+}
+
+/// A stack's exposures on the pool (G10.5), all of them; answers the stack.
+async fn set_exposures(State(m): State<Arc<Manager>>, h: HeaderMap, Path(name): Path<String>, Json(b): Json<ExposuresBody>) -> R<Json<Value>> {
+    authed(&m, &h)?;
+    let what = b.exposures.iter().map(|e| format!("{}:{} to {}:{}/{}", e.address, e.port, e.service, e.container_port, e.protocol)).collect::<Vec<_>>().join(", ");
+    m.store.propose(Entry::StackExposed { name: name.clone(), exposures: b.exposures, at: now_ms() }).await?;
+    m.events.push("stack_exposed", None, if what.is_empty() { format!("stack {name} exposes nothing on the pool") } else { format!("stack {name} exposes {what}") });
+    m.store.read(|s| s.stacks.get(&name).map(|st| stack_json(&m, s, st, false))).map(Json).ok_or(ApiError(StatusCode::NOT_FOUND, "no such stack".into()))
+}
+
+#[derive(Deserialize)]
 struct FloatingBody {
     address: String,
 }
@@ -332,7 +347,17 @@ struct FloatingBody {
 /// The floating addresses (G10.3), each with its holder (none while it waits for one).
 async fn floating(State(m): State<Arc<Manager>>, h: HeaderMap) -> R<Json<Value>> {
     authed(&m, &h)?;
-    Ok(Json(m.store.read(|s| json!(s.floating.iter().map(|(a, f)| json!({ "address": a, "holder": f.holder, "since": f.since })).collect::<Vec<_>>()))))
+    Ok(Json(m.store.read(|s| {
+        json!(s
+            .floating
+            .iter()
+            .map(|(a, f)| {
+                // What the address exposes: the pool is what leaves the cluster on purpose (G10.5).
+                let on: Vec<Value> = s.stacks.values().flat_map(|st| st.exposures.iter().filter(|e| e.address == *a).map(|e| json!({ "stack": st.name, "service": e.service, "port": e.port, "protocol": e.protocol, "container_port": e.container_port }))).collect();
+                json!({ "address": a, "holder": f.holder, "since": f.since, "exposures": on })
+            })
+            .collect::<Vec<_>>())
+    })))
 }
 
 async fn add_floating(State(m): State<Arc<Manager>>, h: HeaderMap, Json(b): Json<FloatingBody>) -> R<StatusCode> {
@@ -509,7 +534,7 @@ fn stack_json(m: &Manager, s: &crate::state::ClusterState, st: &crate::state::St
         })
         .collect();
     let services: serde_json::Map<String, Value> = st.services.iter().map(|(k, v)| (k.clone(), json!({ "image": v.image, "replicas": v.replicas, "ports": v.ports, "ha": v.ha, "limits": v.limits, "placement": { "constraints": v.placement.constraints.iter().map(ToString::to_string).collect::<Vec<_>>(), "prefer": v.placement.prefer.iter().map(ToString::to_string).collect::<Vec<_>>(), "spread": v.placement.spread, "reserve": v.placement.reserve } }))).collect();
-    let mut v = json!({ "name": st.name, "subnet": s.subnet(&st.name), "stopped": st.stopped, "created_at": st.created_at, "updated_at": st.updated_at, "services": services, "workloads": workloads });
+    let mut v = json!({ "name": st.name, "subnet": s.subnet(&st.name), "stopped": st.stopped, "created_at": st.created_at, "updated_at": st.updated_at, "services": services, "workloads": workloads, "exposures": st.exposures });
     if with_compose {
         v["compose"] = json!(st.compose);
     }

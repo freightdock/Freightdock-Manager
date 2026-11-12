@@ -86,8 +86,14 @@ pub fn exposures(s: &ClusterState, down: impl Fn(&Workload) -> bool) -> Vec<v1::
             for p in spec.ports.iter().filter(|p| p.host_port != 0) {
                 let mut targets: Vec<String> = s.workloads.values().filter(|w| w.stack == st.name && &w.service == svc && w.node_id.is_some() && !down(w)).filter_map(|w| s.address(&w.id)).map(|a| format!("{a}:{}", p.container_port)).collect();
                 targets.sort();
-                out.push(v1::Exposure { stack: st.name.clone(), protocol: p.protocol.clone(), port: p.host_port, targets });
+                out.push(v1::Exposure { stack: st.name.clone(), protocol: p.protocol.clone(), port: p.host_port, targets, address: String::new() });
             }
+        }
+        // On the pool (G10.5): each on its own address.
+        for e in &st.exposures {
+            let mut targets: Vec<String> = s.workloads.values().filter(|w| w.stack == st.name && w.service == e.service && w.node_id.is_some() && !down(w)).filter_map(|w| s.address(&w.id)).map(|a| format!("{a}:{}", e.container_port)).collect();
+            targets.sort();
+            out.push(v1::Exposure { stack: st.name.clone(), protocol: e.protocol.clone(), port: e.port.into(), targets, address: e.address.clone() });
         }
     }
     out
@@ -199,4 +205,19 @@ mod tests {
         assert!(moves.iter().all(|m| matches!(m, Entry::FloatingHeld { node_id: Some(n), .. } if n == "n2")));
         assert!(floating_moves(&s, |_| false, 8).is_empty(), "no healthy node: they wait");
     }
+
+    #[test]
+    fn an_exposure_goes_to_every_node_with_its_address_beside_the_compose_ports() {
+        let mut s = with_nodes(&["n1", "n2"]);
+        next(&mut s, &Entry::FloatingAdded { address: "192.0.2.10".into(), at: 1 }).unwrap();
+        let mut web = spec("nginx", 1);
+        web.ports = vec![crate::state::Port { host_port: 8088, container_port: 80, protocol: "tcp".into(), host_ip: String::new() }];
+        next(&mut s, &deploy("a", &[("web", web)], &[("a.web.1", "n1")])).unwrap();
+        next(&mut s, &Entry::StackExposed { name: "a".into(), exposures: vec![crate::state::Exposure { service: "web".into(), container_port: 8443, protocol: "tcp".into(), address: "192.0.2.10".into(), port: 443 }], at: 2 }).unwrap();
+        let e = state_for(&s, "n2", |_| None, |_| false).exposures;
+        let web1 = s.address("a.web.1").unwrap();
+        let got: Vec<(&str, u32, Vec<String>)> = e.iter().map(|e| (e.address.as_str(), e.port, e.targets.clone())).collect();
+        assert_eq!(got, vec![("", 8088, vec![format!("{web1}:80")]), ("192.0.2.10", 443, vec![format!("{web1}:8443")])]);
+    }
 }
+

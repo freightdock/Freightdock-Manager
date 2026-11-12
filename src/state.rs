@@ -74,6 +74,10 @@ pub enum Entry {
     FloatingAdded { address: String, at: Ms },
     /// The address taken back; its holder lets it go at its next network state.
     FloatingRemoved { address: String, at: Ms },
+    /// A stack's exposures on the pool (G10.5), all of them (an empty list takes them away). Refused whole unless each
+    /// is to a service of the stack, tcp or udp, a container port and a port not the host's own, on an address of the
+    /// pool, and no other exposure (of any stack) has that address, port and protocol.
+    StackExposed { name: String, exposures: Vec<Exposure>, at: Ms },
     /// The address's holder, or none. Refused unless the address has no holder now, or its holder is fenced (or back,
     /// fenced, awaiting authorization), or is the one named; and a node named must be at rest. So an address is never
     /// given to a second node while the first may still answer for it.
@@ -111,6 +115,12 @@ pub enum Rejected {
     FloatingUnknown,
     /// Not an address a LAN could give the cluster.
     BadAddress,
+    /// A floating address a stack exposes something on.
+    FloatingInUse,
+    /// An exposure to no service of the stack, or with a protocol or port that cannot be.
+    BadExposure,
+    /// An address, port and protocol another exposure has.
+    ExposureTaken,
 }
 
 impl std::fmt::Display for Rejected {
@@ -134,6 +144,9 @@ impl std::fmt::Display for Rejected {
             Rejected::TokenExists => "an API token with that id exists",
             Rejected::FloatingExists => "the cluster has that floating address already",
             Rejected::FloatingUnknown => "no such floating address",
+            Rejected::FloatingInUse => "a stack exposes something on that floating address: take the exposure away first",
+            Rejected::BadExposure => "an exposure is to a service of the stack, over tcp or udp, from a port that is not the host's own (22, 7450 to 7452, 51820) to a container port",
+            Rejected::ExposureTaken => "that address already has that port (and protocol) exposed",
             Rejected::BadAddress => "a floating address must be a unicast IPv4 address of a LAN, outside the cluster's range 10.240.0.0/16",
             Rejected::BadName => "a stack or service name must be 1 to 40 of a-z, 0-9 and - (services may have _), starting with a letter or digit",
         })
@@ -436,6 +449,21 @@ pub struct Stack {
     /// Its /24 in the cluster's range (G9): the third byte. Given at its first deploy after G9, kept until it goes.
     #[serde(default)]
     pub net: Option<u8>,
+    /// What it exposes on the pool's floating addresses (G10.5), chosen outside its Compose file.
+    #[serde(default)]
+    pub exposures: Vec<Exposure>,
+}
+
+/// One of a stack's services reached from outside the cluster on a pool address (G10.5): `address:port` goes to the
+/// service's `container_port`, wherever its workloads run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Exposure {
+    pub service: String,
+    pub container_port: u16,
+    /// tcp or udp.
+    pub protocol: String,
+    pub address: String,
+    pub port: u16,
 }
 
 /// One replica of one service: one container on one node. Its id, `<stack>.<service>.<slot>`, is the container's
@@ -565,7 +593,7 @@ pub struct ClusterState {
     /// The UI's database (G8.1): opaque to the managers.
     #[serde(default)]
     pub ui_db: UiDb,
-    /// The floating addresses (G10.3) by address.
+    /// The floating addresses (G10.3), the pool, by address.
     #[serde(default)]
     pub floating: BTreeMap<String, Floating>,
 }
@@ -828,7 +856,13 @@ impl ClusterState {
                 self.floating.insert(address.clone(), Floating { holder: None, since: *at });
             }
             Entry::FloatingRemoved { address, .. } => {
-                self.floating.remove(address).ok_or(Rejected::FloatingUnknown)?;
+                if !self.floating.contains_key(address) {
+                    return Err(Rejected::FloatingUnknown);
+                }
+                if self.stacks.values().any(|s| s.exposures.iter().any(|e| e.address == *address)) {
+                    return Err(Rejected::FloatingInUse);
+                }
+                self.floating.remove(address);
             }
             Entry::FloatingHeld { address, node_id, at } => {
                 let Some(f) = self.floating.get(address) else { return Err(Rejected::FloatingUnknown) };
@@ -924,7 +958,27 @@ impl ClusterState {
                     }
                 }
                 let created_at = self.stacks.get(name).map_or(*at, |s| s.created_at);
-                self.stacks.insert(name.clone(), Stack { name: name.clone(), compose: compose.clone(), services: services.clone(), stopped: false, created_at, updated_at: *at, net });
+                // An exposure goes with its service.
+                let exposures = self.stacks.get(name).map(|s| s.exposures.iter().filter(|e| services.contains_key(&e.service)).cloned().collect()).unwrap_or_default();
+                self.stacks.insert(name.clone(), Stack { name: name.clone(), compose: compose.clone(), services: services.clone(), stopped: false, created_at, updated_at: *at, net, exposures });
+            }
+            Entry::StackExposed { name, exposures, at } => {
+                let st = self.stacks.get(name).ok_or(Rejected::StackUnknown)?;
+                let mut taken: std::collections::BTreeSet<(&str, u16, &str)> = self.stacks.values().filter(|o| o.name != *name).flat_map(|o| &o.exposures).map(|e| (e.address.as_str(), e.port, e.protocol.as_str())).collect();
+                for e in exposures {
+                    if !st.services.contains_key(&e.service) || !matches!(e.protocol.as_str(), "tcp" | "udp") || e.container_port == 0 || e.port == 0 || freightdock_proto::RESERVED_PORTS.contains(&u32::from(e.port)) {
+                        return Err(Rejected::BadExposure);
+                    }
+                    if !self.floating.contains_key(&e.address) {
+                        return Err(Rejected::FloatingUnknown);
+                    }
+                    if !taken.insert((e.address.as_str(), e.port, e.protocol.as_str())) {
+                        return Err(Rejected::ExposureTaken);
+                    }
+                }
+                let st = self.stacks.get_mut(name).expect("checked");
+                st.exposures = exposures.clone();
+                st.updated_at = *at;
             }
             Entry::StackStopped { name, stopped, at } => {
                 let s = self.stacks.get_mut(name).ok_or(Rejected::StackUnknown)?;
@@ -1341,6 +1395,41 @@ pub(crate) mod tests {
 
     fn fence(s: &mut ClusterState, to: FenceState) -> Result<(), Rejected> {
         next(s, &Entry::NodeFencing { node_id: "n1".into(), state: to, provider: "self".into(), message: String::new(), at: 9 })
+    }
+
+    #[test]
+    fn a_stack_exposes_its_services_on_pool_addresses_a_port_its_own_on_each() {
+        let mut s = with_nodes(&["n1"]);
+        for a in ["192.0.2.10", "192.0.2.11"] {
+            next(&mut s, &Entry::FloatingAdded { address: a.into(), at: 1 }).unwrap();
+        }
+        next(&mut s, &deploy("a", &[("web", spec("nginx", 1)), ("db", spec("pg", 1))], &[("a.web.1", "n1"), ("a.db.1", "n1")])).unwrap();
+        next(&mut s, &deploy("b", &[("shop", spec("shop", 1))], &[("b.shop.1", "n1")])).unwrap();
+        let x = |service: &str, cport: u16, address: &str, port: u16| Exposure { service: service.into(), container_port: cport, protocol: "tcp".into(), address: address.into(), port };
+        let set = |name: &str, e: Vec<Exposure>| Entry::StackExposed { name: name.into(), exposures: e, at: 2 };
+
+        next(&mut s, &set("a", vec![x("web", 80, "192.0.2.10", 443), x("web", 80, "192.0.2.10", 80)])).unwrap();
+        assert_eq!(s.stacks["a"].exposures.len(), 2);
+        assert_eq!(next(&mut s, &set("b", vec![x("shop", 8080, "192.0.2.10", 443)])), Err(Rejected::ExposureTaken), "443 on .10 is a's");
+        next(&mut s, &set("b", vec![x("shop", 8080, "192.0.2.11", 443)])).unwrap();
+        assert_eq!(next(&mut s, &set("a", vec![x("web", 80, "192.0.2.10", 443), x("db", 5432, "192.0.2.10", 443)])), Err(Rejected::ExposureTaken), "twice in one list");
+        let udp = Exposure { protocol: "udp".into(), ..x("db", 53, "192.0.2.11", 443) };
+        next(&mut s, &set("a", vec![x("web", 80, "192.0.2.10", 443), udp])).unwrap();
+        assert_eq!(s.stacks["a"].exposures.len(), 2, "the whole list replaced; udp 443 is not tcp 443");
+
+        assert_eq!(next(&mut s, &set("a", vec![x("cache", 80, "192.0.2.10", 81)])), Err(Rejected::BadExposure), "no such service");
+        assert_eq!(next(&mut s, &set("a", vec![x("web", 80, "192.0.2.10", 22)])), Err(Rejected::BadExposure), "the host's own port");
+        assert_eq!(next(&mut s, &set("a", vec![x("web", 0, "192.0.2.10", 81)])), Err(Rejected::BadExposure));
+        assert_eq!(next(&mut s, &set("a", vec![Exposure { protocol: "sctp".into(), ..x("web", 80, "192.0.2.10", 81) }])), Err(Rejected::BadExposure));
+        assert_eq!(next(&mut s, &set("a", vec![x("web", 80, "192.0.2.99", 81)])), Err(Rejected::FloatingUnknown), "not in the pool");
+        assert_eq!(next(&mut s, &set("zz", vec![])), Err(Rejected::StackUnknown));
+
+        assert_eq!(next(&mut s, &Entry::FloatingRemoved { address: "192.0.2.11".into(), at: 3 }), Err(Rejected::FloatingInUse));
+        next(&mut s, &deploy("a", &[("db", spec("pg", 1))], &[])).unwrap();
+        assert_eq!(s.stacks["a"].exposures.iter().map(|e| e.service.as_str()).collect::<Vec<_>>(), vec!["db"], "web's went with web");
+        next(&mut s, &Entry::StackRemoved { name: "b".into(), at: 4 }).unwrap();
+        next(&mut s, &set("a", vec![])).unwrap();
+        next(&mut s, &Entry::FloatingRemoved { address: "192.0.2.11".into(), at: 5 }).unwrap();
     }
 
     #[test]

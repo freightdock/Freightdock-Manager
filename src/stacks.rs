@@ -265,9 +265,32 @@ impl Manager {
     }
 }
 
+/// An exposure as the CLI writes it (G10.5): `service:container_port=address:port`, `/udp` at the end for udp.
+pub fn parse_exposure(s: &str) -> Option<crate::state::Exposure> {
+    let (rest, protocol) = match s.rsplit_once('/') {
+        Some((r, p @ ("tcp" | "udp"))) => (r, p),
+        Some(_) => return None,
+        None => (s, "tcp"),
+    };
+    let (inside, outside) = rest.split_once('=')?;
+    let (service, cport) = inside.rsplit_once(':')?;
+    let (address, port) = outside.rsplit_once(':')?;
+    Some(crate::state::Exposure { service: service.to_string(), container_port: cport.parse().ok()?, protocol: protocol.to_string(), address: address.to_string(), port: port.parse().ok()? })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_exposure_is_written_service_port_equals_address_port() {
+        let e = parse_exposure("web:80=192.0.2.10:443").unwrap();
+        assert_eq!((e.service.as_str(), e.container_port, e.address.as_str(), e.port, e.protocol.as_str()), ("web", 80, "192.0.2.10", 443, "tcp"));
+        assert_eq!(parse_exposure("dns:53=192.0.2.10:53/udp").unwrap().protocol, "udp");
+        for bad in ["web:80", "web=192.0.2.10:443", "web:x=192.0.2.10:443", "web:80=192.0.2.10:443/sctp", "web:80=192.0.2.10"] {
+            assert!(parse_exposure(bad).is_none(), "{bad}");
+        }
+    }
     use crate::state::Port;
     use crate::state::tests::{cluster, spec};
 
@@ -344,7 +367,7 @@ mod tests {
         // Off it (the range full) Docker publishes the port on the node, once.
         for n in 1..=254u8 {
             let name = format!("s{n}");
-            s.stacks.insert(name.clone(), crate::state::Stack { name, compose: String::new(), services: BTreeMap::new(), stopped: false, created_at: 0, updated_at: 0, net: Some(n) });
+            s.stacks.insert(name.clone(), crate::state::Stack { name, compose: String::new(), services: BTreeMap::new(), stopped: false, created_at: 0, updated_at: 0, net: Some(n), exposures: vec![] });
         }
         let p = place(&s, "web", &svc(&[("x", published("nginx", 2, 8080))]), &eligible(&["a", "b"])).unwrap();
         assert_ne!(p["web.x.1"], p["web.x.2"]);

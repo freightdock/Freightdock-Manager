@@ -114,7 +114,8 @@ a client trusts that CA alone and checks that name. `GET /v1/health` and `GET /v
 | `GET /v1/recoveries?stack=` | the recovery history, newest first |
 | `GET /v1/api-tokens`, `POST /v1/api-tokens`, `DELETE /v1/api-tokens/{id}` | API tokens: `{"name", "role": "read" or "admin"}` gives the token once |
 | `GET /v1/ca` | the cluster CA's certificate (PEM), no token |
-| `GET /v1/floating`, `POST /v1/floating`, `DELETE /v1/floating/{address}` | floating addresses (G10.3) and each one's holder; `{"address"}` adds one (400 if not a LAN's unicast IPv4 address outside 10.240.0.0/16, 409 if there) |
+| `GET /v1/floating`, `POST /v1/floating`, `DELETE /v1/floating/{address}` | the pool of floating addresses (G10.3), each with its holder and what stacks expose on it; `{"address"}` adds one (400 if not a LAN's unicast IPv4 address outside 10.240.0.0/16, 409 if there); one in use is not removed (409) |
+| `PUT /v1/stacks/{name}/exposures` | `{"exposures": [{"service", "container_port", "protocol", "address", "port"}]}`: what the stack exposes on the pool (G10.5), all of it; a port is unique per address and protocol; answers the stack |
 | `GET /v1/ui-db?after=` | the UI's database (admin token): its snapshot and changes, or only the changes after `after` |
 | `POST /v1/ui-db/changes`, `PUT /v1/ui-db/snapshot` | `{"seq", "data"}`: the next change only (else 409); `{"head", "data"}`: a snapshot at the latest change only |
 | `GET /v1/ui`, `PUT /v1/ui`, `DELETE /v1/ui` | the UI: on or off, its image and its stack; `{"image"}` runs it or moves it to that image; off |
@@ -125,6 +126,12 @@ a client trusts that CA alone and checks that name. `GET /v1/health` and `GET /v
 | `POST /v1/stacks/{name}/start`, `/stop`, `/restart`; `DELETE /v1/stacks/{name}` | run, stop, restart (stop, and the reconcile starts it) or remove |
 
 ### Stacks
+
+What a stack's services are reached on from outside the cluster, and nothing else leaves it: an **exposure** on a
+pool address (`freightdock-manager stack expose app web:80=192.0.2.10:443`, or the UI), answered on that address
+only, the port its own there so other stacks may use it on other addresses; a Compose file's `ports:`, answered on
+every node's own address and never on a pool address; anything else is internal, reached by name inside the stack.
+The address and port follow the workloads wherever they run.
 
 A stack is a Compose file. Its services become workloads, one per replica, with the id `<stack>.<service>.<n>`; the
 manager that takes the deploy places each new one on a healthy node with Docker that meets its constraints, has its

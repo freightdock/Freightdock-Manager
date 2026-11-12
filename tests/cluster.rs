@@ -491,3 +491,33 @@ async fn a_floating_address_is_added_given_to_a_healthy_worker_and_taken_back() 
     assert_eq!(https(&a.m, &addr, "DELETE", "/v1/floating/192.0.2.10", admin).await.0, 404);
     a.server.abort();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stack_s_exposures_are_set_shown_with_the_stack_and_on_their_pool_address() {
+    let a = start(None).await;
+    until("a leader", || a.m.store.leader().is_some()).await;
+    let t = JoinToken::parse(&issue(&a.m, false).await).unwrap();
+    a.m.store.propose(Entry::NodeEnrolled { node_id: "n1".into(), hostname: "h".into(), secret_hash: t.secret_hash(), cert_sha256: "c1".into(), at: now_ms() }).await.unwrap();
+    let parsed = freightdock_manager::compose::parse("services:\n  web:\n    image: nginx\n").unwrap();
+    a.m.store.propose(Entry::StackDeployed { name: "app".into(), compose: String::new(), services: parsed.services, placements: [("app.web.1".to_string(), "n1".to_string())].into(), at: now_ms() }).await.unwrap();
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap().to_string();
+    tokio::spawn(freightdock_manager::serve_admin_tls(a.m.clone(), l));
+    let admin = Some(a.m.admin_token.as_str());
+    assert_eq!(https_with(&a.m, &addr, "POST", "/v1/floating", admin, r#"{"address":"192.0.2.10"}"#).await.0, 201);
+    let body = |port: u16, service: &str| format!(r#"{{"exposures":[{{"service":"{service}","container_port":80,"protocol":"tcp","address":"192.0.2.10","port":{port}}}]}}"#);
+    let (s, b) = https_with(&a.m, &addr, "PUT", "/v1/stacks/app/exposures", admin, &body(443, "web")).await;
+    let v: serde_json::Value = serde_json::from_str(&b).unwrap();
+    assert_eq!((s, v["exposures"][0]["port"].as_u64()), (200, Some(443)), "{b}");
+    assert_eq!(https_with(&a.m, &addr, "PUT", "/v1/stacks/app/exposures", admin, &body(22, "web")).await.0, 400, "the host's own port");
+    assert_eq!(https_with(&a.m, &addr, "PUT", "/v1/stacks/nope/exposures", admin, &body(443, "web")).await.0, 404);
+    let (_, b) = https(&a.m, &addr, "GET", "/v1/stacks/app", admin).await;
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&b).unwrap()["exposures"][0]["address"].as_str(), Some("192.0.2.10"), "{b}");
+    let (_, b) = https(&a.m, &addr, "GET", "/v1/floating", admin).await;
+    let v: serde_json::Value = serde_json::from_str(&b).unwrap();
+    assert_eq!((v[0]["exposures"][0]["stack"].as_str(), v[0]["exposures"][0]["port"].as_u64()), (Some("app"), Some(443)), "{b}");
+    assert_eq!(https(&a.m, &addr, "DELETE", "/v1/floating/192.0.2.10", admin).await.0, 409, "in use");
+    assert_eq!(https_with(&a.m, &addr, "PUT", "/v1/stacks/app/exposures", admin, r#"{"exposures":[]}"#).await.0, 200);
+    assert_eq!(https(&a.m, &addr, "DELETE", "/v1/floating/192.0.2.10", admin).await.0, 204);
+    a.server.abort();
+}
