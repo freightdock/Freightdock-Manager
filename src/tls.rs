@@ -25,6 +25,15 @@ pub fn server_config(ca: &Ca, id: ServerIdentity) -> Result<Arc<rustls::ServerCo
     Ok(Arc::new(c))
 }
 
+/// TLS for the admin API on the network: this manager's server certificate, no client certificate (the API takes
+/// bearer tokens), HTTP/1.1.
+pub fn api_server_config(id: ServerIdentity) -> Result<Arc<rustls::ServerConfig>> {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let mut c = rustls::ServerConfig::builder_with_provider(provider).with_safe_default_protocol_versions()?.with_no_client_auth().with_single_cert(id.chain, id.key)?;
+    c.alpn_protocols = vec![b"http/1.1".to_vec()];
+    Ok(Arc::new(c))
+}
+
 /// Who is on the other end of a connection: its address, and its client certificate if it showed one (already checked
 /// against the cluster CA by the handshake).
 #[derive(Debug, Clone)]

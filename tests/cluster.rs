@@ -26,7 +26,7 @@ async fn start(join: Option<(&str, String)>) -> Running {
     let port = free_port();
     let addr = format!("127.0.0.1:{port}");
     let join = join.map(|(a, token)| Join { addr: a.to_string(), token });
-    let config = Config { data_dir: dir.path().into(), bind: addr.parse().unwrap(), api_bind: None, advertise: vec![addr.clone()], thresholds: Default::default(), bootstrap: join.is_none(), join: join.clone(), local_worker_token: None, fencing: Default::default() };
+    let config = Config { data_dir: dir.path().into(), bind: addr.parse().unwrap(), api_bind: None, api_tls_bind: None, advertise: vec![addr.clone()], thresholds: Default::default(), bootstrap: join.is_none(), join: join.clone(), local_worker_token: None, fencing: Default::default() };
     let m = Manager::open(&config).await.unwrap();
     let l = tokio::net::TcpListener::bind(config.bind).await.unwrap();
     let server = tokio::spawn({
@@ -205,7 +205,7 @@ async fn a_manager_leaves_a_token_for_the_worker_on_its_own_node() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("local-worker.token");
     let addr = format!("127.0.0.1:{}", free_port());
-    let config = Config { data_dir: dir.path().join("data"), bind: addr.parse().unwrap(), api_bind: None, advertise: vec![addr], thresholds: Default::default(), bootstrap: true, join: None, local_worker_token: Some(path.clone()), fencing: Default::default() };
+    let config = Config { data_dir: dir.path().join("data"), bind: addr.parse().unwrap(), api_bind: None, api_tls_bind: None, advertise: vec![addr], thresholds: Default::default(), bootstrap: true, join: None, local_worker_token: Some(path.clone()), fencing: Default::default() };
     let m = Manager::open(&config).await.unwrap();
     m.local_worker_token().await;
     let t = JoinToken::parse(&std::fs::read_to_string(&path).unwrap()).expect("a worker's join token");
@@ -267,4 +267,44 @@ async fn a_stack_deployed_on_one_manager_is_reconciled_by_the_worker_s_manager()
     b.m.reconcile().await;
     let got = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await.expect("a remove").unwrap().unwrap();
     assert!(matches!(got.body, Some(Body::Command(ref c)) if matches!(c.op, Some(freightdock_proto::v1::command::Op::RemoveContainer(_)))), "{got:?}");
+}
+
+/// One HTTP/1.1 request over TLS, checked against the cluster CA for the managers' name: (status, body).
+async fn https(m: &Manager, addr: &str, method: &str, path: &str, token: Option<&str>) -> (u16, String) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(m.ca.cert_der.clone()).unwrap();
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let cfg = rustls::ClientConfig::builder_with_provider(provider).with_safe_default_protocol_versions().unwrap().with_root_certificates(roots).with_no_client_auth();
+    let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let name = rustls::pki_types::ServerName::try_from(freightdock_proto::MANAGER_SERVER_NAME).unwrap();
+    let mut tls = tokio_rustls::TlsConnector::from(Arc::new(cfg)).connect(name, tcp).await.unwrap();
+    let auth = token.map(|t| format!("Authorization: Bearer {t}\r\n")).unwrap_or_default();
+    tls.write_all(format!("{method} {path} HTTP/1.1\r\nHost: m\r\n{auth}Content-Length: 2\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{{}}").as_bytes()).await.unwrap();
+    let mut out = String::new();
+    let _ = tls.read_to_string(&mut out).await;
+    let status = out.split(' ').nth(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+    (status, out.split("\r\n\r\n").nth(1).unwrap_or("").to_string())
+}
+
+#[tokio::test]
+async fn the_api_over_tls_takes_api_tokens_by_role() {
+    let a = start(None).await;
+    until("a leader", || a.m.store.leader().is_some()).await;
+    let read = format!("{}{}", freightdock_manager::admin::API_TOKEN_PREFIX, "ab".repeat(32));
+    let e = Entry::ApiTokenIssued { id: "t1".into(), name: "ui".into(), role: freightdock_manager::state::ApiRole::Read, secret_hash: freightdock_proto::sha256_hex(&read), at: now_ms() };
+    a.m.store.propose(e).await.unwrap();
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap().to_string();
+    tokio::spawn(freightdock_manager::serve_admin_tls(a.m.clone(), l));
+    assert_eq!(https(&a.m, &addr, "GET", "/v1/health", None).await.0, 200);
+    let (s, ca) = https(&a.m, &addr, "GET", "/v1/ca", None).await;
+    assert!(s == 200 && ca.contains("BEGIN CERTIFICATE"), "the CA's certificate is public");
+    assert_eq!(https(&a.m, &addr, "GET", "/v1/nodes", None).await.0, 401);
+    assert_eq!(https(&a.m, &addr, "GET", "/v1/nodes", Some("FDAT1-nope")).await.0, 401);
+    assert_eq!(https(&a.m, &addr, "GET", "/v1/nodes", Some(&read)).await.0, 200);
+    assert_eq!(https(&a.m, &addr, "POST", "/v1/join-tokens", Some(&read)).await.0, 403, "a read token only reads");
+    let (s, b) = https(&a.m, &addr, "POST", "/v1/api-tokens", Some(&a.m.admin_token)).await;
+    assert_eq!(s, 422, "a name is needed: {b}");
+    a.server.abort();
 }

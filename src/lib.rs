@@ -41,6 +41,8 @@ pub struct Config {
     pub bind: SocketAddr,
     /// The admin HTTP API; `None` turns it off.
     pub api_bind: Option<SocketAddr>,
+    /// The same API over TLS for the network (G8.2), for API tokens: the UI on another node, a remote CLI.
+    pub api_tls_bind: Option<SocketAddr>,
     /// The manager endpoints handed to workers (host:port), this one's first.
     pub advertise: Vec<String>,
     pub thresholds: Thresholds,
@@ -68,11 +70,18 @@ fn env_ms(name: &str, default: Duration) -> Result<Duration> {
 }
 
 impl Config {
+    /// Where the cluster CA is kept: `ca.pem`, `ca.key`.
+    pub fn ca_dir(&self) -> PathBuf {
+        self.data_dir.join("ca")
+    }
+
     pub fn from_env() -> Result<Self> {
         let get = |k: &str, d: &str| std::env::var(k).unwrap_or_else(|_| d.to_string());
         let bind: SocketAddr = get("FREIGHTDOCK_MANAGER_BIND", "0.0.0.0:7450").parse().context("FREIGHTDOCK_MANAGER_BIND")?;
         let api = get("FREIGHTDOCK_MANAGER_API_BIND", "127.0.0.1:7451");
         let api_bind = if api == "off" { None } else { Some(api.parse().context("FREIGHTDOCK_MANAGER_API_BIND")?) };
+        let api_tls = get("FREIGHTDOCK_MANAGER_API_TLS_BIND", "0.0.0.0:7452");
+        let api_tls_bind = if api_tls == "off" { None } else { Some(api_tls.parse().context("FREIGHTDOCK_MANAGER_API_TLS_BIND")?) };
         let advertise = match std::env::var("FREIGHTDOCK_MANAGER_ADVERTISE") {
             Ok(v) => v.split(',').map(str::trim).filter(|s| !s.is_empty()).map(freightdock_proto::with_default_port).collect(),
             Err(_) => {
@@ -92,7 +101,7 @@ impl Config {
             (Err(_), Err(_)) => None,
             _ => anyhow::bail!("FREIGHTDOCK_MANAGER_JOIN and FREIGHTDOCK_MANAGER_JOIN_TOKEN go together"),
         };
-        Ok(Config { data_dir: get("FREIGHTDOCK_MANAGER_DATA", "/var/lib/freightdock-manager").into(), bind, api_bind, advertise, thresholds, bootstrap: join.is_none(), join, local_worker_token: std::env::var("FREIGHTDOCK_MANAGER_LOCAL_WORKER_TOKEN").ok().filter(|p| !p.trim().is_empty()).map(PathBuf::from), fencing: fencing::FenceConfig::from_env()? })
+        Ok(Config { data_dir: get("FREIGHTDOCK_MANAGER_DATA", "/var/lib/freightdock-manager").into(), bind, api_bind, api_tls_bind, advertise, thresholds, bootstrap: join.is_none(), join, local_worker_token: std::env::var("FREIGHTDOCK_MANAGER_LOCAL_WORKER_TOKEN").ok().filter(|p| !p.trim().is_empty()).map(PathBuf::from), fencing: fencing::FenceConfig::from_env()? })
     }
 }
 
@@ -138,7 +147,7 @@ impl Manager {
         // The Raft node id: a number for the manager's whole life, never given to another (openraft's rule).
         let raft_id: u64 = kept(&config.data_dir.join("raft.id"), || (rand::random::<u64>() >> 1 | 1).to_string())?.parse().context("raft.id")?;
         let addr = config.advertise.first().cloned().unwrap_or_else(|| config.bind.to_string());
-        let ca_dir = config.data_dir.join("ca");
+        let ca_dir = config.ca_dir();
         if let Some(j) = &config.join
             && !ca_dir.join("ca.pem").exists()
         {
@@ -388,4 +397,34 @@ pub async fn serve_workers(m: Arc<Manager>, listener: tokio::net::TcpListener) -
 pub async fn serve_admin(m: Arc<Manager>, listener: tokio::net::TcpListener) -> Result<()> {
     axum::serve(listener, admin::router(m)).await?;
     Ok(())
+}
+
+/// Serves the admin API over TLS (HTTP/1.1) on `listener`, with this manager's server certificate (the cluster CA's,
+/// for `MANAGER_SERVER_NAME`). Every route but health and the CA's certificate needs a token (`admin::guard`).
+pub async fn serve_admin_tls(m: Arc<Manager>, listener: tokio::net::TcpListener) -> Result<()> {
+    use tower::ServiceExt;
+    let acceptor = tokio_rustls::TlsAcceptor::from(tls::api_server_config(m.ca.server_identity()?)?);
+    let app = admin::router(m);
+    loop {
+        let (tcp, addr) = match listener.accept().await {
+            Ok(x) => x,
+            Err(e) => {
+                tracing::warn!("accept: {e}");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+        };
+        let (acceptor, app) = (acceptor.clone(), app.clone());
+        tokio::spawn(async move {
+            let tls = match tokio::time::timeout(Duration::from_secs(10), acceptor.accept(tcp)).await {
+                Ok(Ok(t)) => t,
+                _ => return tracing::debug!("API TLS handshake with {addr} failed or took too long"),
+            };
+            let svc = hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| app.clone().oneshot(req.map(axum::body::Body::new)));
+            let conn = hyper::server::conn::http1::Builder::new().timer(hyper_util::rt::TokioTimer::new()).header_read_timeout(Duration::from_secs(10)).serve_connection(hyper_util::rt::TokioIo::new(tls), svc);
+            if let Err(e) = conn.await {
+                tracing::debug!("API connection from {addr}: {e}");
+            }
+        });
+    }
 }

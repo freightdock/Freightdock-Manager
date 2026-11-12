@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
 
-use freightdock_manager::{Config, Manager, housekeeping, serve_admin, serve_workers};
+use freightdock_manager::{Config, Manager, housekeeping, serve_admin, serve_admin_tls, serve_workers};
 
 const USAGE: &str = "freightdock-manager [serve]                 run the manager
 freightdock-manager join-token [ttl_s]      make a join token for a worker
@@ -18,6 +18,9 @@ freightdock-manager stack ls                list the stacks
 freightdock-manager stack ps <name>         a stack's workloads: where they run and how they are
 freightdock-manager stack start|stop|restart|rm <name>
 freightdock-manager recoveries [stack]      workloads moved off fenced nodes, or left there and why
+freightdock-manager api-token create <name> [read|admin]   a token for the API over TLS (shown once)
+freightdock-manager api-token ls|rm <id>    list or revoke the API tokens
+freightdock-manager ca                      the cluster CA's certificate (PEM), for a client of the API over TLS
 
 A manager joins a cluster on its first start with FREIGHTDOCK_MANAGER_JOIN=<a manager's host:port> and
 FREIGHTDOCK_MANAGER_JOIN_TOKEN=<a manager-token>.
@@ -91,6 +94,39 @@ async fn main() -> Result<()> {
                 after.get_or_insert(0);
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             }
+        }
+        Some("api-token") => match (args.get(1).map(String::as_str), args.get(2)) {
+            (Some("create"), Some(name)) => {
+                let role = args.get(3).map(String::as_str).unwrap_or("read");
+                anyhow::ensure!(matches!(role, "read" | "admin"), "the role is read or admin");
+                let t = call(&config, reqwest::Method::POST, "/v1/api-tokens", Some(serde_json::json!({ "name": name, "role": role }))).await?;
+                eprintln!("API token {} ({role}), id {}. It is shown this once; the cluster CA is sha256 {}.", name, t["id"].as_str().unwrap_or(""), t["ca_sha256"].as_str().unwrap_or(""));
+                println!("{}", t["token"].as_str().unwrap_or(""));
+                Ok(())
+            }
+            (Some("ls"), _) => {
+                let v = call(&config, reqwest::Method::GET, "/v1/api-tokens", None).await?;
+                println!("{:<38} {:<24} {:<6}", "ID", "NAME", "ROLE");
+                for t in v.as_array().into_iter().flatten() {
+                    println!("{:<38} {:<24} {:<6}", t["id"].as_str().unwrap_or(""), t["name"].as_str().unwrap_or(""), t["role"].as_str().unwrap_or(""));
+                }
+                Ok(())
+            }
+            (Some("rm"), Some(id)) => {
+                call(&config, reqwest::Method::DELETE, &format!("/v1/api-tokens/{id}"), None).await?;
+                eprintln!("revoked");
+                Ok(())
+            }
+            _ => bail!("{USAGE}"),
+        },
+        Some("ca") => {
+            // Only read: a host with no CA gets none made by asking.
+            let path = config.ca_dir().join("ca.pem");
+            let pem = std::fs::read_to_string(&path).with_context(|| format!("reading {}: is this a manager's host?", path.display()))?;
+            let der: rustls::pki_types::CertificateDer = rustls::pki_types::pem::PemObject::from_pem_slice(pem.as_bytes()).context("the CA's certificate")?;
+            print!("{pem}");
+            eprintln!("sha256 {}", freightdock_proto::sha256_hex(der.as_ref()));
+            Ok(())
         }
         Some("recoveries") => {
             let path = match args.get(1) {
@@ -271,6 +307,16 @@ async fn serve(config: Config) -> Result<()> {
         }
         None => None,
     };
+    if let Some(a) = config.api_tls_bind {
+        let l = tokio::net::TcpListener::bind(a).await.with_context(|| format!("binding {a}"))?;
+        tracing::info!("admin API over TLS on {a}, for API tokens (freightdock-manager api-token)");
+        let m = m.clone();
+        tokio::spawn(async move {
+            if let Err(e) = serve_admin_tls(m, l).await {
+                tracing::error!("admin API over TLS: {e:#}");
+            }
+        });
+    }
     tokio::spawn(housekeeping(m.clone()));
     if let Some(j) = &config.join {
         tokio::spawn(m.clone().become_voter(j.addr.clone()));

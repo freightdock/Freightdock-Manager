@@ -13,7 +13,7 @@ axum = { version = "0.8", default-features = false, features = ["http1", "json",
 freightdock-proto = { path = "../Freightdock-Contracts" }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 hex = "0.4"
-hyper = { version = "1", features = ["client", "http1"] }
+hyper = { version = "1", features = ["client", "server", "http1"] }
 http-body-util = "0.1"
 hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
 libc = "0.2"

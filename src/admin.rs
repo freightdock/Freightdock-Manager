@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 
 use freightdock_proto::token::JoinToken;
 
-use crate::state::{CommandRecord, CommandStatus, Entry, Op, Rejected};
+use crate::state::{ApiRole, CommandRecord, CommandStatus, Entry, Op, Rejected};
 use crate::store::ProposeError;
 use crate::{Manager, now_ms};
 
@@ -42,15 +42,50 @@ impl From<ProposeError> for ApiError {
 
 type R<T> = Result<T, ApiError>;
 
-fn authed(m: &Manager, h: &HeaderMap) -> R<()> {
-    let given = h.get("authorization").and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer ")).unwrap_or("");
-    let ok = !m.admin_token.is_empty() && given.len() == m.admin_token.len() && given.bytes().zip(m.admin_token.bytes()).fold(0u8, |a, (x, y)| a | (x ^ y)) == 0;
-    if ok { Ok(()) } else { Err(ApiError(StatusCode::UNAUTHORIZED, "a valid bearer token is needed".into())) }
+/// What the bearer token `given` may do: the admin token (on the manager's host) everything, an API token what its role
+/// says (G8.2), anything else nothing.
+pub fn role_of(admin_token: &str, s: &crate::state::ClusterState, given: &str) -> Option<ApiRole> {
+    let admin = !admin_token.is_empty() && given.len() == admin_token.len() && given.bytes().zip(admin_token.bytes()).fold(0u8, |a, (x, y)| a | (x ^ y)) == 0;
+    if admin {
+        return Some(ApiRole::Admin);
+    }
+    given.starts_with(API_TOKEN_PREFIX).then(|| s.api_token(&freightdock_proto::sha256_hex(given)).map(|t| t.role)).flatten()
+}
+
+/// Whether `role` may make a request with `method`: a read token only reads.
+pub fn allowed(role: ApiRole, method: &axum::http::Method) -> bool {
+    role == ApiRole::Admin || matches!(*method, axum::http::Method::GET | axum::http::Method::HEAD)
+}
+
+pub const API_TOKEN_PREFIX: &str = "FDAT1-";
+
+fn bearer(h: &HeaderMap) -> &str {
+    h.get("authorization").and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer ")).unwrap_or("")
+}
+
+fn authed(m: &Manager, h: &HeaderMap) -> R<ApiRole> {
+    m.store.read(|s| role_of(&m.admin_token, s, bearer(h))).ok_or_else(|| ApiError(StatusCode::UNAUTHORIZED, "a valid bearer token is needed".into()))
+}
+
+/// Every route but health and the CA's certificate needs a token, and a read token only reads.
+async fn guard(State(m): State<Arc<Manager>>, req: axum::extract::Request, next: axum::middleware::Next) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if matches!(req.uri().path(), "/v1/health" | "/v1/ca") {
+        return next.run(req).await;
+    }
+    match authed(&m, req.headers()) {
+        Ok(role) if allowed(role, req.method()) => next.run(req).await,
+        Ok(_) => ApiError(StatusCode::FORBIDDEN, "this token only reads".into()).into_response(),
+        Err(e) => e.into_response(),
+    }
 }
 
 pub fn router(m: Arc<Manager>) -> Router {
     Router::new()
         .route("/v1/health", get(|| async { Json(json!({ "ok": true })) }))
+        .route("/v1/ca", get(ca_pem))
+        .route("/v1/api-tokens", get(api_tokens).post(create_api_token))
+        .route("/v1/api-tokens/{id}", axum::routing::delete(revoke_api_token))
         .route("/v1/cluster", get(cluster))
         .route("/v1/nodes", get(nodes))
         .route("/v1/nodes/{id}", get(node).delete(remove_node))
@@ -66,6 +101,7 @@ pub fn router(m: Arc<Manager>) -> Router {
         .route("/v1/stacks", get(stacks).post(deploy_stack))
         .route("/v1/stacks/{name}", get(stack).delete(remove_stack))
         .route("/v1/stacks/{name}/{action}", post(stack_action))
+        .layer(axum::middleware::from_fn_with_state(m.clone(), guard))
         .with_state(m)
 }
 
@@ -166,6 +202,46 @@ async fn join_token(State(m): State<Arc<Manager>>, h: HeaderMap, body: Option<Js
     let expires_at = now_ms() + ttl * 1000;
     m.store.propose(Entry::JoinTokenIssued { secret_hash: token.secret_hash(), expires_at, at: now_ms(), for_manager: false }).await?;
     Ok(Json(json!({ "token": token.to_string(), "expires_at": expires_at, "managers": m.managers() })))
+}
+
+/// The cluster CA's certificate (public), for a client of the API over TLS to trust. Check its fingerprint against
+/// `freightdock-manager status` before trusting it.
+async fn ca_pem(State(m): State<Arc<Manager>>) -> Response {
+    ([(axum::http::header::CONTENT_TYPE, "application/x-pem-file")], m.ca.cert_pem.clone()).into_response()
+}
+
+#[derive(Deserialize)]
+struct ApiTokenBody {
+    name: String,
+    role: Option<ApiRole>,
+}
+
+fn api_token_json(t: &crate::state::ApiToken) -> Value {
+    json!({ "id": t.id, "name": t.name, "role": t.role, "created_at": t.created_at })
+}
+
+/// A new API token (G8.2): shown once, kept only as its hash. Read-only unless `role` says admin.
+async fn create_api_token(State(m): State<Arc<Manager>>, h: HeaderMap, Json(b): Json<ApiTokenBody>) -> R<(StatusCode, Json<Value>)> {
+    authed(&m, &h)?;
+    let token = format!("{API_TOKEN_PREFIX}{}", hex::encode(rand::random::<[u8; 32]>()));
+    let id = uuid::Uuid::new_v4().to_string();
+    let role = b.role.unwrap_or(ApiRole::Read);
+    let name = b.name.trim().to_string();
+    m.store.propose(Entry::ApiTokenIssued { id: id.clone(), name: name.clone(), role, secret_hash: freightdock_proto::sha256_hex(&token), at: now_ms() }).await?;
+    m.events.push("api_token", None, format!("API token {name} ({role:?}) made").to_lowercase());
+    Ok((StatusCode::CREATED, Json(json!({ "id": id, "name": name, "role": role, "token": token, "ca_sha256": m.ca.fingerprint() }))))
+}
+
+async fn api_tokens(State(m): State<Arc<Manager>>, h: HeaderMap) -> R<Json<Value>> {
+    authed(&m, &h)?;
+    Ok(Json(m.store.read(|s| json!(s.api_tokens.values().map(api_token_json).collect::<Vec<_>>()))))
+}
+
+async fn revoke_api_token(State(m): State<Arc<Manager>>, h: HeaderMap, Path(id): Path<String>) -> R<StatusCode> {
+    authed(&m, &h)?;
+    m.store.propose(Entry::ApiTokenRevoked { id: id.clone(), at: now_ms() }).await?;
+    m.events.push("api_token", None, format!("API token {} revoked", &id[..id.len().min(8)]));
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// A token for another manager to join with (`FREIGHTDOCK_MANAGER_JOIN_TOKEN`). Good once, an hour by default.
@@ -418,6 +494,22 @@ fn raft_members(members: Vec<(u64, String)>, voters: &[u64], leader: Option<u64>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_admin_token_does_everything_an_api_token_its_role_and_a_read_token_only_reads() {
+        let mut s = crate::state::tests::cluster();
+        let token = format!("{API_TOKEN_PREFIX}{}", "ab".repeat(32));
+        s.apply_at(9, &Entry::ApiTokenIssued { id: "t".into(), name: "ui".into(), role: ApiRole::Read, secret_hash: freightdock_proto::sha256_hex(&token), at: 1 }).unwrap();
+        assert_eq!(role_of("adm1n", &s, "adm1n"), Some(ApiRole::Admin));
+        assert_eq!(role_of("adm1n", &s, &token), Some(ApiRole::Read));
+        assert_eq!(role_of("adm1n", &s, "adm1N"), None);
+        assert_eq!(role_of("", &s, ""), None, "no admin token: nothing matches it");
+        assert_eq!(role_of("adm1n", &s, &format!("{API_TOKEN_PREFIX}{}", "cd".repeat(32))), None);
+        use axum::http::Method;
+        assert!(allowed(ApiRole::Read, &Method::GET));
+        assert!(!allowed(ApiRole::Read, &Method::POST) && !allowed(ApiRole::Read, &Method::DELETE));
+        assert!(allowed(ApiRole::Admin, &Method::DELETE));
+    }
 
     #[test]
     fn a_workload_s_last_command_is_the_latest_on_the_node_it_is_on_now() {

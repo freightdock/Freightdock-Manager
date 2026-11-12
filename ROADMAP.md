@@ -174,11 +174,12 @@ same host. Each later goal adds its pages there (stacks with G4, and so on).
 
 1. [ ] Users, sessions and settings in the manager's replicated state; login and roles on the manager API (the
        admin token stays for the CLI on the manager's host).
-2. [ ] The manager API reachable from the UI: HTTP on the cluster port or a second port, TLS, behind the users above
-       (today it is loopback-only).
+2. [x] The manager API reachable from the UI: a second port (7452), TLS with the cluster CA for the managers' fixed
+       name, API tokens (read or admin) in the replicated state; Freightdock takes several `https://` managers and goes
+       on to the next when one cannot be reached. The users of item 1 come in front of it later.
 3. [ ] Freightdock trimmed to the UI: its server becomes a client of the manager API; its SQLite, local Docker
        access and tunnel agent go (or stay only where they serve the UI itself). Its own image.
-4. [ ] A cluster section: nodes, health, stacks, events.
+4. [x] A cluster section: nodes, health, stacks, events, fencing, recoveries (the Cluster and Cluster stacks pages).
 5. [ ] The managers run the UI as a system workload (G4's workloads): placed on a node, recovered when that node
        goes, on the single-node cluster too; reachable through any manager.
 

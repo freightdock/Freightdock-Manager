@@ -67,6 +67,7 @@ Port 7450/tcp must be open between managers and from workers to managers; nothin
 | `FREIGHTDOCK_MANAGER_DATA` | `/var/lib/freightdock-manager` | State log, CA, manager id, admin token |
 | `FREIGHTDOCK_MANAGER_BIND` | `0.0.0.0:7450` | The worker API (gRPC, mutual TLS) |
 | `FREIGHTDOCK_MANAGER_API_BIND` | `127.0.0.1:7451` | The admin HTTP API, or `off` |
+| `FREIGHTDOCK_MANAGER_API_TLS_BIND` | `0.0.0.0:7452` | The same API over TLS for the network (API tokens), or `off` |
 | `FREIGHTDOCK_MANAGER_ADVERTISE` | `<hostname>:7450` | Where the others reach this manager, comma separated (the first is its Raft address) |
 | `FREIGHTDOCK_MANAGER_JOIN` | | First start only: join the cluster of the manager at `host[:port]` |
 | `FREIGHTDOCK_MANAGER_JOIN_TOKEN` | | With it: a token from `manager-token` (`FDMT1-...`) |
@@ -78,7 +79,11 @@ Port 7450/tcp must be open between managers and from workers to managers; nothin
 
 ## Admin API
 
-All under `http://127.0.0.1:7451`, with `Authorization: Bearer <data>/admin.token`.
+All under `http://127.0.0.1:7451`, with `Authorization: Bearer <data>/admin.token`, or over the network at
+`https://<manager>:7452` with an API token (`freightdock-manager api-token create <name> [read|admin]`, kept by the
+managers only as its hash, good at every manager; a read token only reads). The TLS certificate is the cluster CA's
+(`freightdock-manager ca` prints it), for the name `manager.freightdock.internal` whatever address reaches the manager:
+a client trusts that CA alone and checks that name. `GET /v1/health` and `GET /v1/ca` need no token.
 
 | | |
 |---|---|
@@ -91,6 +96,8 @@ All under `http://127.0.0.1:7451`, with `Authorization: Bearer <data>/admin.toke
 | `POST /v1/manager-tokens` | `{"ttl_s": 3600}` gives `{"token": "FDMT1-..."}`, for a manager |
 | `GET /v1/events?after=&node=` | recent node events |
 | `GET /v1/recoveries?stack=` | the recovery history, newest first |
+| `GET /v1/api-tokens`, `POST /v1/api-tokens`, `DELETE /v1/api-tokens/{id}` | API tokens: `{"name", "role": "read" or "admin"}` gives the token once |
+| `GET /v1/ca` | the cluster CA's certificate (PEM), no token |
 | `POST /v1/nodes/{id}/commands` | `{"op": "ping"}` and the other ops; answers the command (202) |
 | `GET /v1/commands?node=`, `GET /v1/commands/{id}` | commands and their status |
 | `GET /v1/stacks`, `GET /v1/stacks/{name}` | stacks with each workload's node, status, container and last command; one with its Compose file |

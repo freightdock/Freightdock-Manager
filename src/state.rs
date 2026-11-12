@@ -57,6 +57,9 @@ pub enum Entry {
     /// changed, unless `from` is fenced (or back, fenced, awaiting authorization), every moved workload is still on
     /// `from` and may be moved, and every new node is enrolled.
     WorkloadsRecovered { from: Option<String>, moves: BTreeMap<String, String>, left: BTreeMap<String, String>, at: Ms },
+    /// A token for the API (G8.2), kept only as the SHA-256 of its secret, so any manager can check it.
+    ApiTokenIssued { id: String, name: String, role: ApiRole, secret_hash: String, at: Ms },
+    ApiTokenRevoked { id: String, at: Ms },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -82,6 +85,8 @@ pub enum Rejected {
     BadName,
     /// A recovery for a workload that is no longer where it said, or may not move by itself (pinned or local data).
     NotRecoverable,
+    /// An API token with that id or secret exists.
+    TokenExists,
 }
 
 impl std::fmt::Display for Rejected {
@@ -101,6 +106,7 @@ impl std::fmt::Display for Rejected {
             Rejected::WorkloadBusy => "the workload has a command open already",
             Rejected::FenceStep => "the node's fencing is not at a point where that step can be taken",
             Rejected::NotRecoverable => "the workload is not on that node any more, or may not be moved by itself",
+            Rejected::TokenExists => "an API token with that id exists",
             Rejected::BadName => "a stack or service name must be 1 to 40 of a-z, 0-9 and - (services may have _), starting with a letter or digit",
         })
     }
@@ -465,6 +471,29 @@ pub struct ClusterState {
     /// The latest recoveries, oldest first, at most `RECOVERY_HISTORY` (G7).
     #[serde(default)]
     pub recoveries: std::collections::VecDeque<Recovery>,
+    /// API tokens by id (G8.2).
+    #[serde(default)]
+    pub api_tokens: BTreeMap<String, ApiToken>,
+}
+
+/// What an API token may do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApiRole {
+    /// Everything the admin token may.
+    Admin,
+    /// Only reading (GET).
+    Read,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApiToken {
+    pub id: String,
+    pub name: String,
+    pub role: ApiRole,
+    /// The SHA-256 of the token's secret; the API never shows it.
+    pub secret_hash: String,
+    pub created_at: Ms,
 }
 
 /// How many recoveries the state keeps.
@@ -525,6 +554,11 @@ impl ClusterState {
     }
 
     /// Whether the workload is to run: its stack is not stopped.
+    /// The API token whose secret hashes to `secret_hash`.
+    pub fn api_token(&self, secret_hash: &str) -> Option<&ApiToken> {
+        self.api_tokens.values().find(|t| t.secret_hash == secret_hash)
+    }
+
     /// The workload's recovery kind, from its stack's service (a workload's own spec has no `ha`).
     pub fn recovery_kind(&self, w: &Workload) -> RecoveryKind {
         let sp = self.stacks.get(&w.stack).and_then(|s| s.services.get(&w.service));
@@ -726,6 +760,18 @@ impl ClusterState {
                 if let Some(n) = from.as_ref().and_then(|f| self.nodes.get_mut(f)) {
                     n.recovered = true;
                 }
+            }
+            Entry::ApiTokenIssued { id, name, role, secret_hash, at } => {
+                if self.api_tokens.contains_key(id) || self.api_token(secret_hash).is_some() {
+                    return Err(Rejected::TokenExists);
+                }
+                if name.trim().is_empty() || name.len() > 64 {
+                    return Err(Rejected::BadName);
+                }
+                self.api_tokens.insert(id.clone(), ApiToken { id: id.clone(), name: name.clone(), role: *role, secret_hash: secret_hash.clone(), created_at: *at });
+            }
+            Entry::ApiTokenRevoked { id, .. } => {
+                self.api_tokens.remove(id).ok_or(Rejected::TokenUnknown)?;
             }
             Entry::StackRemoved { name, .. } => {
                 self.stacks.remove(name).ok_or(Rejected::StackUnknown)?;
@@ -1012,6 +1058,21 @@ pub(crate) mod tests {
 
     fn fence(s: &mut ClusterState, to: FenceState) -> Result<(), Rejected> {
         next(s, &Entry::NodeFencing { node_id: "n1".into(), state: to, provider: "self".into(), message: String::new(), at: 9 })
+    }
+
+    #[test]
+    fn api_tokens_are_found_by_their_hash_and_revoked_by_id() {
+        let mut s = cluster();
+        let issue = |id: &str, hash: &str| Entry::ApiTokenIssued { id: id.into(), name: "ui".into(), role: ApiRole::Read, secret_hash: hash.into(), at: 1 };
+        next(&mut s, &issue("t1", "h1")).unwrap();
+        assert_eq!(next(&mut s, &issue("t2", "h1")), Err(Rejected::TokenExists));
+        assert_eq!(s.api_token("h1").map(|t| (t.id.as_str(), t.role)), Some(("t1", ApiRole::Read)));
+        assert!(s.api_token("h2").is_none());
+        next(&mut s, &Entry::ApiTokenRevoked { id: "t1".into(), at: 2 }).unwrap();
+        assert!(s.api_token("h1").is_none());
+        assert_eq!(next(&mut s, &Entry::ApiTokenRevoked { id: "t1".into(), at: 2 }), Err(Rejected::TokenUnknown));
+        let json = serde_json::to_value(ApiToken { id: "x".into(), name: "n".into(), role: ApiRole::Admin, secret_hash: "secret".into(), created_at: 0 }).unwrap();
+        assert!(json.get("secret_hash").is_some(), "kept in the state (serialized for the log)");
     }
 
     fn recovered(from: Option<&str>, moves: &[(&str, &str)], left: &[(&str, &str)]) -> Entry {
