@@ -253,7 +253,7 @@ mod tests {
     fn state_with(nodes: &[&str]) -> ClusterState {
         let mut s = cluster();
         for n in nodes {
-            s.nodes.insert(n.to_string(), crate::state::Node { id: n.to_string(), hostname: n.to_string(), cert_sha256: String::new(), enrolled_at: 0, report: None, reported_at: None, labels: Default::default(), fencing: Default::default(), recovered: false });
+            s.nodes.insert(n.to_string(), crate::state::Node { id: n.to_string(), hostname: n.to_string(), cert_sha256: String::new(), prev_cert_sha256: None, enrolled_at: 0, report: None, reported_at: None, labels: Default::default(), fencing: Default::default(), recovered: false });
         }
         s
     }

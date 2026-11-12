@@ -11,7 +11,7 @@ Status marks: **[x]** done, **[~]** in progress, **[ ]** not started.
 | Rank | Goal | Why it is here | Needs | Status |
 |---|---|---|---|---|
 | 1 | G1 Manager and worker talk | Everything else rides on this link | | **done** |
-| 2 | G2 The link is hardened and observable | Cheap now, expensive to retrofit; the test cluster must tell us what happens | G1 | **done** but CI (blocked) and cert renewal (deferred) |
+| 2 | G2 The link is hardened and observable | Cheap now, expensive to retrofit; the test cluster must tell us what happens | G1 | **done** but CI (blocked on publishing) |
 | 3 | G3 Manager high availability (Raft) | Success criteria 1 and 2 of the first release; changes how every write works, so before anything writes much | G2 | **done** |
 | 4 | G4 Workloads and Compose stacks | The point of the product: deploy and manage stacks across workers | G3 | **done** (first slice; see G4) |
 | 4a | G8 first slice: a Cluster page in Freightdock | Pulled forward (2026-11-11) so every goal from here is seen in the browser as it is built | G3 | **done** |
@@ -112,9 +112,13 @@ Ranked inside the goal:
 4. [x] Node events (connected, disconnected, health changes, enrolled, removed) in memory, `GET /v1/events`.
 5. [x] A `status` CLI command: cluster, managers, nodes and recent events in one view.
 6. [ ] CI for Contracts and Manager (tests, clippy, gitleaks), as Agent has. **Blocked** on publishing (question 2).
-7. [~] Certificate renewal before expiry. Managers (done 2026-11-12): their server and client certificates (90 days)
+7. [x] Certificate renewal before expiry. Managers (done 2026-11-12): their server and client certificates (90 days)
        are made again at the first handshake after 30 days (`tls::Rotating`), so a manager that runs for months never
-       shows an expired one. Workers (5 years): renewal over the session, still to do (a Contracts change).
+       shows an expired one. Workers (5 years, done 2026-11-12): in its last year the welcome says
+       `renew_certificate`, the worker asks `WorkerSession.Renew` with its current certificate for one for a new key,
+       keeps both whole (`renewal.json`, finished at the next start if cut off) and uses it from the next stream; the
+       managers keep the one before it good until the next renewal (`NodeCertRenewed`), so a worker that lost the new
+       one is not locked out.
 
 ## G3: Manager high availability (Raft) (done, 2026-11-11)
 

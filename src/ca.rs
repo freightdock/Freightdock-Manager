@@ -129,6 +129,13 @@ impl Ca {
     }
 }
 
+/// Whether the certificate expires within `d` from now; one that cannot be read counts as expiring.
+pub fn expires_within(cert: &CertificateDer<'_>, d: std::time::Duration) -> bool {
+    let Ok((_, x)) = x509_parser::parse_x509_certificate(cert) else { return true };
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|t| t.as_secs() as i64).unwrap_or(0);
+    x.validity().not_after.timestamp() <= now + d.as_secs() as i64
+}
+
 /// The Raft id of the manager a certificate (already checked against the cluster CA) was given to, or `None` when it
 /// is not a manager's (a worker's common name is its node UUID, which never starts with `manager:`).
 pub fn manager_of(cert: &CertificateDer<'_>) -> Option<u64> {
@@ -193,6 +200,11 @@ mod tests {
         let server = rustls::client::WebPkiServerVerifier::builder_with_provider(roots, p).build().unwrap();
         let name = rustls::pki_types::ServerName::try_from(MANAGER_SERVER_NAME).unwrap();
         assert!(server.verify_server_cert(&der, &[], &name, &[], now).is_err());
+        use std::time::Duration;
+        // Five years: not due for renewal within a year, due within six.
+        assert!(!expires_within(&der, Duration::from_secs(365 * 86_400)));
+        assert!(expires_within(&der, Duration::from_secs(6 * 365 * 86_400)));
+        assert!(expires_within(&CertificateDer::from(vec![1, 2, 3]), Duration::ZERO), "what cannot be read is renewed");
         let evil = rustls::pki_types::ServerName::try_from("evil.example").unwrap();
         assert!(server.verify_server_cert(&der, &[], &evil, &[], now).is_err());
     }

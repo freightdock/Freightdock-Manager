@@ -34,6 +34,8 @@ pub enum Entry {
     /// What a worker said of itself in its hello, recorded when it differs from what is known.
     NodeReported { node_id: String, report: NodeReport, at: Ms },
     NodeRemoved { node_id: String, at: Ms },
+    /// A worker's new certificate (G2.7), asked for with its current one; that one stays good until the next.
+    NodeCertRenewed { node_id: String, cert_sha256: String, at: Ms },
     /// A step of the node's fencing. Only a step the state machine allows is applied (`FenceState::allows`).
     NodeFencing { node_id: String, state: FenceState, provider: String, message: String, at: Ms },
     /// The node may run workloads again (plan 7.4): from awaiting authorization to authorized.
@@ -147,6 +149,9 @@ pub struct Node {
     pub id: String,
     pub hostname: String,
     pub cert_sha256: String,
+    /// The certificate before the last renewal, still good: a worker that failed to keep the new one comes back.
+    #[serde(default)]
+    pub prev_cert_sha256: Option<String>,
     pub enrolled_at: Ms,
     pub report: Option<NodeReport>,
     pub reported_at: Option<Ms>,
@@ -615,7 +620,7 @@ impl ClusterState {
     }
 
     pub fn node_by_cert(&self, cert_sha256: &str) -> Option<&Node> {
-        self.nodes.values().find(|n| n.cert_sha256 == cert_sha256)
+        self.nodes.values().find(|n| n.cert_sha256 == cert_sha256 || n.prev_cert_sha256.as_deref() == Some(cert_sha256))
     }
 
     /// Commands for `node_id` that are not finished, oldest first: what to send again when it connects.
@@ -711,7 +716,7 @@ impl ClusterState {
                     return Err(Rejected::NodeExists);
                 }
                 self.join_tokens.get_mut(secret_hash).expect("checked").spent_by = Some(node_id.clone());
-                self.nodes.insert(node_id.clone(), Node { id: node_id.clone(), hostname: hostname.clone(), cert_sha256: cert_sha256.clone(), enrolled_at: *at, report: None, reported_at: None, labels: BTreeMap::new(), fencing: Fencing::default(), recovered: false });
+                self.nodes.insert(node_id.clone(), Node { id: node_id.clone(), hostname: hostname.clone(), cert_sha256: cert_sha256.clone(), prev_cert_sha256: None, enrolled_at: *at, report: None, reported_at: None, labels: BTreeMap::new(), fencing: Fencing::default(), recovered: false });
             }
             Entry::NodeReported { node_id, report, at } => {
                 let n = self.nodes.get_mut(node_id).ok_or(Rejected::NodeUnknown)?;
@@ -751,6 +756,12 @@ impl ClusterState {
                 for c in self.commands.values_mut().filter(|c| &c.node_id == node_id && !c.status.is_terminal()) {
                     c.status = CommandStatus::Rejected;
                     c.message = "the node was removed".into();
+                }
+            }
+            Entry::NodeCertRenewed { node_id, cert_sha256, .. } => {
+                let n = self.nodes.get_mut(node_id).ok_or(Rejected::NodeUnknown)?;
+                if n.cert_sha256 != *cert_sha256 {
+                    n.prev_cert_sha256 = Some(std::mem::replace(&mut n.cert_sha256, cert_sha256.clone()));
                 }
             }
             Entry::CommandCreated { command } => {
@@ -1054,6 +1065,22 @@ pub(crate) mod tests {
         s.apply_at(6, &status("b", CommandStatus::Received)).unwrap();
         assert!(s.overdue(104, 5).is_empty(), "within the grace");
         assert_eq!(s.overdue(106, 5), vec!["a".to_string()], "b reached its node: the worker reports its end");
+    }
+
+    #[test]
+    fn a_renewed_certificate_opens_and_the_one_before_it_still_does_until_the_next() {
+        let mut s = cluster();
+        with_token(&mut s, "t", 1000);
+        s.apply_at(3, &enrol("n1", "t", 10)).unwrap();
+        s.apply_at(4, &Entry::NodeCertRenewed { node_id: "n1".into(), cert_sha256: "cert-2".into(), at: 20 }).unwrap();
+        assert_eq!(s.node_by_cert("cert-2").map(|n| n.id.as_str()), Some("n1"));
+        assert_eq!(s.node_by_cert("cert-n1").map(|n| n.id.as_str()), Some("n1"), "a worker that failed to keep the new one is not locked out");
+        s.apply_at(5, &Entry::NodeCertRenewed { node_id: "n1".into(), cert_sha256: "cert-3".into(), at: 30 }).unwrap();
+        assert!(s.node_by_cert("cert-n1").is_none(), "two back opens nothing");
+        assert!(s.node_by_cert("cert-2").is_some() && s.node_by_cert("cert-3").is_some());
+        assert_eq!(s.apply_at(6, &Entry::NodeCertRenewed { node_id: "n9".into(), cert_sha256: "x".into(), at: 40 }), Err(Rejected::NodeUnknown));
+        s.apply_at(7, &Entry::NodeRemoved { node_id: "n1".into(), at: 50 }).unwrap();
+        assert!(s.node_by_cert("cert-2").is_none(), "nor any of a removed node's");
     }
 
     #[test]

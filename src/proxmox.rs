@@ -189,7 +189,7 @@ mod tests {
     use std::sync::Mutex;
 
     fn node(labels: &[(&str, &str)]) -> Node {
-        Node { id: "n".into(), hostname: "h".into(), cert_sha256: String::new(), enrolled_at: 0, report: None, reported_at: None, labels: labels.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(), fencing: Default::default(), recovered: false }
+        Node { id: "n".into(), hostname: "h".into(), cert_sha256: String::new(), prev_cert_sha256: None, enrolled_at: 0, report: None, reported_at: None, labels: labels.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(), fencing: Default::default(), recovered: false }
     }
 
     #[test]

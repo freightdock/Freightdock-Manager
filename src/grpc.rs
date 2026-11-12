@@ -121,11 +121,28 @@ impl Enrollment for EnrollmentSvc {
     }
 }
 
+/// A worker's certificate (five years) is renewed in its last year.
+pub const RENEW_BEFORE: std::time::Duration = std::time::Duration::from_secs(365 * 86_400);
+
 pub struct SessionSvc(pub Arc<Manager>);
 
 #[tonic::async_trait]
 impl WorkerSession for SessionSvc {
     type OpenStream = ReceiverStream<Result<v1::ManagerMessage, Status>>;
+
+    /// A new certificate for the node whose certificate this call came with (G2.7).
+    async fn renew(&self, req: Request<v1::RenewRequest>) -> Result<Response<v1::RenewResponse>, Status> {
+        let m = &self.0;
+        let peer = peer_of(&req).ok_or_else(|| Status::internal("no peer"))?;
+        let cert = peer.cert.as_ref().ok_or_else(|| Status::unauthenticated("a client certificate is needed"))?;
+        let fp = sha256_hex(cert);
+        let node_id = m.store.read(|s| s.node_by_cert(&fp).map(|n| n.id.clone())).ok_or_else(|| Status::permission_denied("this certificate is not an enrolled node's"))?;
+        let (cert_pem, cert_sha256) = m.ca.sign_worker(&req.into_inner().csr_pem, &node_id).map_err(|e| Status::invalid_argument(format!("{e:#}")))?;
+        m.store.propose(Entry::NodeCertRenewed { node_id: node_id.clone(), cert_sha256, at: now_ms() }).await.map_err(status_of)?;
+        tracing::info!(node = %node_id, peer = %peer.addr, "a worker's certificate renewed");
+        m.events.push("renewed", Some(&node_id), "its certificate was renewed");
+        Ok(Response::new(v1::RenewResponse { cert_pem, ca_pem: m.ca.cert_pem.clone() }))
+    }
 
     async fn open(&self, req: Request<Streaming<v1::WorkerMessage>>) -> Result<Response<Self::OpenStream>, Status> {
         let m = self.0.clone();
@@ -162,6 +179,7 @@ impl WorkerSession for SessionSvc {
                 fence_stop_s: m.fencing.stop_s,
                 fence_storage_s: m.fencing.storage_s,
                 fence_reboot_s: m.fencing.reboot_s,
+                renew_certificate: crate::ca::expires_within(cert, RENEW_BEFORE),
             })),
         };
         tx.send(Ok(welcome)).await.map_err(|_| Status::cancelled("gone"))?;
