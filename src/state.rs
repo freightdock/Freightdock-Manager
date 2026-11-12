@@ -400,6 +400,9 @@ pub struct Stack {
     pub stopped: bool,
     pub created_at: Ms,
     pub updated_at: Ms,
+    /// Its /24 in the cluster's range (G9): the third byte. Given at its first deploy after G9, kept until it goes.
+    #[serde(default)]
+    pub net: Option<u8>,
 }
 
 /// One replica of one service: one container on one node. Its id, `<stack>.<service>.<slot>`, is the container's
@@ -415,6 +418,27 @@ pub struct Workload {
     pub spec: ServiceSpec,
     /// The log index at which its spec last changed: a container made for an older one is made again.
     pub generation: u64,
+    /// Its address in its stack's /24 (G9): the last byte, 2 to 254 (.1 is the bridge). Kept when it moves.
+    #[serde(default)]
+    pub host: Option<u8>,
+}
+
+/// The cluster's internal range (G9): a /16, a /24 in it per stack.
+pub const CLUSTER_RANGE: [u8; 2] = [10, 240];
+
+impl ClusterState {
+    /// A stack's subnet, as `10.240.3.0/24`, once it has one.
+    pub fn subnet(&self, stack: &str) -> Option<String> {
+        let n = self.stacks.get(stack)?.net?;
+        Some(format!("{}.{}.{n}.0/24", CLUSTER_RANGE[0], CLUSTER_RANGE[1]))
+    }
+
+    /// A workload's address on its stack's network, once it has one.
+    pub fn address(&self, workload: &str) -> Option<String> {
+        let w = self.workloads.get(workload)?;
+        let n = self.stacks.get(&w.stack)?.net?;
+        Some(format!("{}.{}.{n}.{}", CLUSTER_RANGE[0], CLUSTER_RANGE[1], w.host?))
+    }
 }
 
 pub fn workload_id(stack: &str, service: &str, slot: u32) -> String {
@@ -744,12 +768,25 @@ impl ClusterState {
                             }
                         }
                         None => {
-                            self.workloads.insert(id.clone(), Workload { id: id.clone(), stack: name.clone(), service: svc.clone(), slot: *slot, node_id: placements.get(id).cloned(), spec, generation: index });
+                            self.workloads.insert(id.clone(), Workload { id: id.clone(), stack: name.clone(), service: svc.clone(), slot: *slot, node_id: placements.get(id).cloned(), spec, generation: index, host: None });
                         }
                     }
                 }
+                // Addresses (G9): the stack's /24 and each workload's host, the lowest free, kept once given. A full
+                // range (254 stacks, 253 workloads each) leaves the rest without one: they run off the overlay.
+                let net = self.stacks.get(name).and_then(|s| s.net).or_else(|| {
+                    let used: std::collections::BTreeSet<u8> = self.stacks.values().filter_map(|s| s.net).collect();
+                    (1..=254u8).find(|n| !used.contains(n))
+                });
+                if net.is_some() {
+                    let mut used: std::collections::BTreeSet<u8> = self.workloads.values().filter(|w| w.stack == *name).filter_map(|w| w.host).collect();
+                    for w in self.workloads.values_mut().filter(|w| w.stack == *name && w.host.is_none()) {
+                        w.host = (2..=254u8).find(|h| !used.contains(h));
+                        used.extend(w.host);
+                    }
+                }
                 let created_at = self.stacks.get(name).map_or(*at, |s| s.created_at);
-                self.stacks.insert(name.clone(), Stack { name: name.clone(), compose: compose.clone(), services: services.clone(), stopped: false, created_at, updated_at: *at });
+                self.stacks.insert(name.clone(), Stack { name: name.clone(), compose: compose.clone(), services: services.clone(), stopped: false, created_at, updated_at: *at, net });
             }
             Entry::StackStopped { name, stopped, at } => {
                 let s = self.stacks.get_mut(name).ok_or(Rejected::StackUnknown)?;
@@ -908,6 +945,36 @@ pub(crate) mod tests {
         assert!(!s.manager_joined(8));
         assert_eq!(s.join_tokens["m"].spent_by.as_deref(), Some("manager:9"));
         assert_eq!(s.check(&joined("m")), Err(Rejected::TokenSpent));
+    }
+
+    #[test]
+    fn every_stack_gets_a_subnet_and_every_workload_an_address_kept_until_it_goes() {
+        let mut s = with_nodes(&["n1", "n2"]);
+        let addr = |s: &ClusterState, id: &str| s.address(id);
+        next(&mut s, &deploy("a", &[("web", spec("nginx", 2))], &[("a.web.1", "n1"), ("a.web.2", "n2")])).unwrap();
+        next(&mut s, &deploy("b", &[("db", spec("pg", 1))], &[("b.db.1", "n1")])).unwrap();
+        assert_eq!(s.subnet("a").as_deref(), Some("10.240.1.0/24"));
+        assert_eq!(s.subnet("b").as_deref(), Some("10.240.2.0/24"));
+        assert_eq!((addr(&s, "a.web.1").as_deref(), addr(&s, "a.web.2").as_deref()), (Some("10.240.1.2"), Some("10.240.1.3")), ".1 is the gateway");
+        assert_eq!(addr(&s, "b.db.1").as_deref(), Some("10.240.2.2"));
+
+        // Scaled down and up again: a new replica takes a free address, the others keep theirs.
+        next(&mut s, &deploy("a", &[("web", spec("nginx", 1))], &[])).unwrap();
+        next(&mut s, &deploy("a", &[("web", spec("nginx", 3))], &[("a.web.2", "n1"), ("a.web.3", "n2")])).unwrap();
+        assert_eq!(addr(&s, "a.web.1").as_deref(), Some("10.240.1.2"));
+        let mut all: Vec<_> = ["a.web.1", "a.web.2", "a.web.3"].iter().map(|w| addr(&s, w).unwrap()).collect();
+        all.dedup();
+        assert_eq!(all.len(), 3, "never two on one address: {all:?}");
+
+        // Moved by recovery: the same address.
+        let before = addr(&s, "b.db.1");
+        next(&mut s, &deploy("b", &[("db", spec("pg", 1))], &[("b.db.1", "n2")])).unwrap();
+        assert_eq!(addr(&s, "b.db.1"), before);
+
+        // A stack that goes frees its subnet for the next.
+        next(&mut s, &Entry::StackRemoved { name: "a".into(), at: 60 }).unwrap();
+        next(&mut s, &deploy("c", &[("x", spec("i", 1))], &[("c.x.1", "n1")])).unwrap();
+        assert_eq!(s.subnet("c").as_deref(), Some("10.240.1.0/24"));
     }
 
     #[test]

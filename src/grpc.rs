@@ -48,6 +48,7 @@ pub fn op_to_proto(op: &Op) -> v1::command::Op {
             volumes,
             cpu_millis: limits.cpu_millis,
             memory_bytes: limits.memory_bytes,
+            ..Default::default()
         }),
         Op::StopContainer { workload_id, timeout_s } => P::StopContainer(v1::StopContainer { workload_id, timeout_s }),
         Op::RemoveContainer { workload_id } => P::RemoveContainer(v1::RemoveContainer { workload_id }),

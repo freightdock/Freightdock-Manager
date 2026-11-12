@@ -19,7 +19,7 @@ Status marks: **[x]** done, **[~]** in progress, **[ ]** not started.
 | 6 | G6 Fencing | A worker must be able to fence itself before anything is recovered elsewhere (plan rule 10, 11) | G4 | done |
 | 7 | G7 Failure detection and stateless recovery | Success criteria 4 and 5; safe only with G6 | G5, G6 | done |
 | 8 | G8 UI: Freightdock as the cluster's UI | Usable by people, not just the CLI; can start in parallel once G4's API settles | G4 | **done** |
-| 9 | G9 Internal networking (Network repo) | Stable workload IPs across workers; postponed by the plan's first release | G7 | not started |
+| 9 | G9 Internal networking (Network repo) | Stable workload IPs across workers; postponed by the plan's first release | G7 | **in progress** (design agreed) |
 | 10 | G10 External networking | Exposing services without per-deploy setup | G9 | not started |
 | 11 | G11 Shared storage | Moving stateful workloads safely; needs fencing and storage leases | G6, G7 | not started |
 | 12 | G12 Advanced | Ceph, replicated storage, gateway redundancy, anti-affinity, more fencing providers | G9 to G11 | not started |
@@ -217,6 +217,20 @@ same host. Each later goal adds its pages there (stacks with G4, and so on).
 
 Internal networking (Network repo, overlay chosen after writing down the plan's 6.6 requirements), external IPs and
 ports, shared storage with leases and capabilities, then the advanced items, in that order.
+
+### G9: internal networking
+
+The design is Freightdock-Network's [DESIGN.md](../Freightdock-Network/DESIGN.md), agreed 2026-11-12: a WireGuard
+mesh (`fd0`) with each workload's address routed to its node, the network-agent a library the worker runs, a /24 and
+bridge per stack that talks only to itself (nftables), names through the hosts file.
+
+1. [ ] Contracts: the node's WireGuard key in its report, the desired network state down the session.
+2. [ ] Manager: IPAM (cluster range, a /24 per stack, an address per workload kept across moves), the network state
+       per node.
+3. [ ] Network: the agent (WireGuard over netlink, routes, proxy ARP, bridges, nftables), tested in a namespace.
+4. [ ] Worker: runs the agent; workloads on their stack's network with their address and the hosts of their stack.
+5. [ ] Test cluster: a service reaching another across nodes by name, two stacks kept apart, a recovered workload
+       reached at the same address.
 
 ## Open questions for the owner
 
