@@ -92,6 +92,7 @@ fn report_of(h: &v1::Hello) -> NodeReport {
         kernel: caps.kernel,
         cpu_count: res.cpu_count,
         memory_total_bytes: res.memory_total_bytes,
+        wg_public_key: h.network.as_ref().map(|n| n.public_key.clone()).unwrap_or_default(),
     }
 }
 

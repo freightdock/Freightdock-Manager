@@ -224,8 +224,8 @@ The design is Freightdock-Network's [DESIGN.md](../Freightdock-Network/DESIGN.md
 mesh (`fd0`) with each workload's address routed to its node, the network-agent a library the worker runs, a /24 and
 bridge per stack that talks only to itself (nftables), names through the hosts file.
 
-1. [ ] Contracts: the node's WireGuard key in its report, the desired network state down the session.
-2. [ ] Manager: IPAM (cluster range, a /24 per stack, an address per workload kept across moves), the network state
+1. [x] Contracts: the node's WireGuard key in its report, the desired network state down the session.
+2. [x] Manager: IPAM (cluster range, a /24 per stack, an address per workload kept across moves), the network state
        per node.
 3. [ ] Network: the agent (WireGuard over netlink, routes, proxy ARP, bridges, nftables), tested in a namespace.
 4. [ ] Worker: runs the agent; workloads on their stack's network with their address and the hosts of their stack.

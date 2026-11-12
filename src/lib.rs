@@ -15,6 +15,7 @@ pub mod stacks;
 pub mod state;
 pub mod store;
 pub mod tls;
+pub mod network;
 pub mod ui;
 
 use std::net::SocketAddr;
@@ -270,6 +271,21 @@ impl Manager {
         }
     }
 
+    /// Sends each worker connected here its network (G9), when it changed.
+    pub fn push_network(&self) {
+        for node in self.sessions.local_nodes() {
+            let state = self.store.read(|s| {
+                network::state_for(s, &node, |other| {
+                    // A worker on this manager's host, connected over loopback, is reached at this manager's address:
+                    // the endpoint goes to other nodes, for which 127.0.0.1 is themselves.
+                    let l = self.sessions.liveness(other);
+                    ui::target(l.peer.as_deref()?, l.via.as_deref().or(self.advertise.first().map(String::as_str)), network::WG_PORT)
+                })
+            });
+            self.sessions.send_network(&node, state);
+        }
+    }
+
     /// Where the UI's connections go now: its workload's node, as [`ui::target`] reads it.
     pub fn ui_target(&self, port: u32) -> Option<String> {
         let node = self.store.read(|s| s.workloads.get(ui::WORKLOAD).and_then(|w| w.node_id.clone()))?;
@@ -393,6 +409,7 @@ pub async fn housekeeping(m: Arc<Manager>) {
         m.fence_round().await;
         m.recover_round().await;
         m.reconcile().await;
+        m.push_network();
         m.local_worker_token().await;
         let health: Vec<_> = m.store.read(|s| s.nodes.keys().cloned().collect::<Vec<_>>()).into_iter().map(|id| {
             let h = m.sessions.liveness(&id).health;

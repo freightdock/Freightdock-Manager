@@ -62,6 +62,8 @@ pub struct Session {
     pub fresh: bool,
     /// Whether the worker says it is fenced (hello, heartbeats).
     pub fenced: bool,
+    /// The network it was last sent (G9), its version left out: sent again only when something else changed.
+    pub network: Option<freightdock_proto::v1::NetworkState>,
 }
 
 /// Ends a stream with a status. Dropping the sender is not enough: the task reading the worker's side holds a clone.
@@ -108,7 +110,7 @@ impl Sessions {
         g.0 += 1;
         let generation = g.0;
         let now = Instant::now();
-        if let Some(old) = g.1.insert(node.to_string(), Session { generation, tx, last_heard: now, connected_at: now, resources: None, peer, fresh: workloads.is_some(), workloads, fenced }) {
+        if let Some(old) = g.1.insert(node.to_string(), Session { generation, tx, last_heard: now, connected_at: now, resources: None, peer, fresh: workloads.is_some(), workloads, fenced, network: None }) {
             end(&old, "a newer stream from this node replaced this one");
         }
         generation
@@ -190,6 +192,26 @@ impl Sessions {
         }
         let g = self.remote.lock().expect("remote lock");
         g.values().filter_map(|(at, nodes)| nodes.iter().find(|n| n.node_id == node).and_then(|n| Some((Duration::from_millis(n.heard_ms_ago) + at.elapsed(), n.workloads.as_ref()?)))).min_by_key(|c| c.0).map(|c| c.1.workloads.clone())
+    }
+
+    /// The nodes connected here.
+    pub fn local_nodes(&self) -> Vec<String> {
+        self.inner.lock().expect("sessions lock").1.keys().cloned().collect()
+    }
+
+    /// Sends `node` its network if it differs from the one it was sent last on this stream.
+    pub fn send_network(&self, node: &str, state: freightdock_proto::v1::NetworkState) {
+        let mut g = self.inner.lock().expect("sessions lock");
+        let Some(s) = g.1.get_mut(node) else { return };
+        let same = freightdock_proto::v1::NetworkState { version: 0, ..state.clone() };
+        if s.network.as_ref() == Some(&same) {
+            return;
+        }
+        let msg = ManagerMessage { body: Some(freightdock_proto::v1::manager_message::Body::Network(state)) };
+        // A full channel: tried again next round, as nothing was marked sent.
+        if s.tx.try_send(Ok(msg)).is_ok() {
+            s.network = Some(same);
+        }
     }
 
     pub fn sender(&self, node: &str) -> Option<mpsc::Sender<Result<ManagerMessage, tonic::Status>>> {

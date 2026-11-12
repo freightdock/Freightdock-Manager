@@ -137,6 +137,9 @@ pub struct NodeReport {
     pub kernel: String,
     pub cpu_count: u32,
     pub memory_total_bytes: u64,
+    /// The node's WireGuard public key (G9); empty for a worker without the overlay.
+    #[serde(default)]
+    pub wg_public_key: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1069,7 +1072,7 @@ pub(crate) mod tests {
         ServiceSpec { image: image.into(), command: vec![], env: Default::default(), labels: Default::default(), ports: vec![], volumes: vec![], replicas, limits: Default::default(), placement: Default::default(), ha: true }
     }
 
-    fn with_nodes(nodes: &[&str]) -> ClusterState {
+    pub fn with_nodes(nodes: &[&str]) -> ClusterState {
         let mut s = cluster();
         for (i, n) in nodes.iter().enumerate() {
             let hash = format!("t{i}");
@@ -1080,7 +1083,7 @@ pub(crate) mod tests {
         s
     }
 
-    fn deploy(name: &str, services: &[(&str, ServiceSpec)], placements: &[(&str, &str)]) -> Entry {
+    pub fn deploy(name: &str, services: &[(&str, ServiceSpec)], placements: &[(&str, &str)]) -> Entry {
         Entry::StackDeployed {
             name: name.into(),
             compose: "services: {}".into(),
@@ -1090,7 +1093,7 @@ pub(crate) mod tests {
         }
     }
 
-    fn next(s: &mut ClusterState, e: &Entry) -> Result<(), Rejected> {
+    pub fn next(s: &mut ClusterState, e: &Entry) -> Result<(), Rejected> {
         let i = s.applied + 1;
         s.apply_at(i, e)
     }

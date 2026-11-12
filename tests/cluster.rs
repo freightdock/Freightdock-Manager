@@ -424,3 +424,37 @@ async fn every_manager_forwards_the_ui_s_port_to_the_node_it_runs_on() {
     assert_eq!(&buf, b"hello");
     a.server.abort();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_worker_is_sent_its_network_when_it_connects_and_when_it_changes() {
+    use freightdock_manager::state::NodeReport;
+    use freightdock_proto::v1::manager_message::Body;
+    let a = start(None).await;
+    until("a leader", || a.m.store.leader().is_some()).await;
+    for (n, key) in [("n1", "K1"), ("n2", "K2")] {
+        let t = JoinToken::parse(&issue(&a.m, false).await).unwrap();
+        a.m.store.propose(Entry::NodeEnrolled { node_id: n.into(), hostname: "h".into(), secret_hash: t.secret_hash(), cert_sha256: format!("c{n}"), at: now_ms() }).await.unwrap();
+        a.m.store.propose(Entry::NodeReported { node_id: n.into(), report: NodeReport { wg_public_key: key.into(), docker: true, ..Default::default() }, at: now_ms() }).await.unwrap();
+    }
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+    a.m.sessions.open("n1", tx, "192.0.2.1:40000".into(), None);
+    let (tx2, _rx2) = tokio::sync::mpsc::channel(8);
+    a.m.sessions.open("n2", tx2, "192.0.2.2:40000".into(), None);
+    let network = |rx: &mut tokio::sync::mpsc::Receiver<_>| match rx.try_recv() {
+        Ok(Ok(freightdock_proto::v1::ManagerMessage { body: Some(Body::Network(n)) })) => Some(n),
+        _ => None,
+    };
+
+    a.m.push_network();
+    let n = network(&mut rx).expect("sent once connected");
+    assert_eq!((n.peers.len(), n.peers[0].endpoint.as_str()), (1, "192.0.2.2:51820"));
+    a.m.push_network();
+    assert!(network(&mut rx).is_none(), "nothing new, nothing sent");
+
+    let parsed = freightdock_manager::compose::parse("services:\n  web:\n    image: nginx\n").unwrap();
+    a.m.store.propose(Entry::StackDeployed { name: "app".into(), compose: String::new(), services: parsed.services, placements: [("app.web.1".to_string(), "n2".to_string())].into(), at: now_ms() }).await.unwrap();
+    a.m.push_network();
+    let n = network(&mut rx).expect("a workload on n2: a route to it");
+    assert_eq!(n.peers[0].addresses, vec!["10.240.1.2/32".to_string()]);
+    a.server.abort();
+}
