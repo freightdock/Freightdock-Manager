@@ -112,8 +112,9 @@ Ranked inside the goal:
 4. [x] Node events (connected, disconnected, health changes, enrolled, removed) in memory, `GET /v1/events`.
 5. [x] A `status` CLI command: cluster, managers, nodes and recent events in one view.
 6. [ ] CI for Contracts and Manager (tests, clippy, gitleaks), as Agent has. **Blocked** on publishing (question 2).
-7. [ ] (deferred to before the first release) Certificate renewal before expiry (worker certificates last 5 years, server certificates 90 days and are made
-       again at each start; renewal over the session is enough for now).
+7. [~] Certificate renewal before expiry. Managers (done 2026-11-12): their server and client certificates (90 days)
+       are made again at the first handshake after 30 days (`tls::Rotating`), so a manager that runs for months never
+       shows an expired one. Workers (5 years): renewal over the session, still to do (a Contracts change).
 
 ## G3: Manager high availability (Raft) (done, 2026-11-11)
 

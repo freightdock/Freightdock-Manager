@@ -114,7 +114,7 @@ pub struct Manager {
     pub store: Store,
     pub events: events::Events,
     pub sessions: Sessions,
-    pub ca: Ca,
+    pub ca: Arc<Ca>,
     pub manager_id: String,
     /// This manager's own addresses (`Config::advertise`).
     pub advertise: Vec<String>,
@@ -158,8 +158,9 @@ impl Manager {
         {
             join_cluster(j, raft_id, &addr, &ca_dir).await?;
         }
-        let ca = Ca::load_or_create(&ca_dir)?;
-        let peer_tls = tls::peer_client_config(&ca, ca.manager_client_identity(raft_id)?)?;
+        let ca = Arc::new(Ca::load_or_create(&ca_dir)?);
+        let c = ca.clone();
+        let peer_tls = tls::peer_client_config(&ca, tls::Rotating::new(move || c.manager_client_identity(raft_id), tls::RENEW_AFTER)?)?;
         let store = Store::open(&config.data_dir, raft_id, &addr, config.bootstrap && config.join.is_none(), raft::network::Network::new(raft_id, peer_tls.clone()), Some(peer_tls.clone())).await?;
         store.migrate_pre_raft(&config.data_dir).await?;
         if config.bootstrap && store.read(|s| s.cluster_id.is_none()) {
@@ -403,7 +404,8 @@ pub async fn housekeeping(m: Arc<Manager>) {
 
 /// Serves the worker API on `listener` until the process ends.
 pub async fn serve_workers(m: Arc<Manager>, listener: tokio::net::TcpListener) -> Result<()> {
-    let tls = tls::server_config(&m.ca, m.ca.server_identity()?)?;
+    let ca = m.ca.clone();
+    let tls = tls::server_config(&m.ca, tls::Rotating::new(move || ca.server_identity(), tls::RENEW_AFTER)?)?;
     tonic::transport::Server::builder()
         .http2_keepalive_interval(Some(Duration::from_secs(10)))
         .http2_keepalive_timeout(Some(Duration::from_secs(10)))
@@ -453,7 +455,8 @@ pub async fn serve_admin(m: Arc<Manager>, listener: tokio::net::TcpListener) -> 
 /// for `MANAGER_SERVER_NAME`). Every route but health and the CA's certificate needs a token (`admin::guard`).
 pub async fn serve_admin_tls(m: Arc<Manager>, listener: tokio::net::TcpListener) -> Result<()> {
     use tower::ServiceExt;
-    let acceptor = tokio_rustls::TlsAcceptor::from(tls::api_server_config(m.ca.server_identity()?)?);
+    let ca = m.ca.clone();
+    let acceptor = tokio_rustls::TlsAcceptor::from(tls::api_server_config(tls::Rotating::new(move || ca.server_identity(), tls::RENEW_AFTER)?)?);
     let app = admin::router(m);
     loop {
         let (tcp, addr) = match listener.accept().await {

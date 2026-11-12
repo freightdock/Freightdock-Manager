@@ -5,6 +5,7 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use rustls::pki_types::CertificateDer;
@@ -15,21 +16,83 @@ use tonic::transport::server::Connected;
 
 use crate::ca::{Ca, ServerIdentity};
 
-pub fn server_config(ca: &Ca, id: ServerIdentity) -> Result<Arc<rustls::ServerConfig>> {
+/// How long a manager's own certificate is used before a new one is made: well inside its 90 days.
+pub const RENEW_AFTER: Duration = Duration::from_secs(30 * 24 * 3600);
+
+/// A manager's own certificate (server or client), made again by `make` at the first handshake after it is `every`
+/// old, so a manager that runs for months never shows an expired one (G2.7). A failed renewal keeps the one there is
+/// and is tried again at the next handshake.
+pub struct Rotating {
+    make: Box<dyn Fn() -> Result<ServerIdentity> + Send + Sync>,
+    every: Duration,
+    provider: Arc<rustls::crypto::CryptoProvider>,
+    cur: std::sync::Mutex<(Arc<rustls::sign::CertifiedKey>, Instant)>,
+}
+
+impl std::fmt::Debug for Rotating {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Rotating").field("every", &self.every).finish_non_exhaustive()
+    }
+}
+
+impl Rotating {
+    pub fn new(make: impl Fn() -> Result<ServerIdentity> + Send + Sync + 'static, every: Duration) -> Result<Arc<Self>> {
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let first = certified(make()?, &provider)?;
+        Ok(Arc::new(Rotating { make: Box::new(make), every, provider, cur: std::sync::Mutex::new((first, Instant::now())) }))
+    }
+
+    /// The certificate to show now, made again first when it is old.
+    pub fn current(&self) -> Arc<rustls::sign::CertifiedKey> {
+        let mut cur = self.cur.lock().unwrap_or_else(|e| e.into_inner());
+        if cur.1.elapsed() >= self.every {
+            match (self.make)().and_then(|id| certified(id, &self.provider)) {
+                Ok(k) => {
+                    *cur = (k, Instant::now());
+                    tracing::info!("made a new certificate for this manager");
+                }
+                Err(e) => tracing::warn!("renewing this manager's certificate: {e:#}; keeping the one there is"),
+            }
+        }
+        cur.0.clone()
+    }
+}
+
+fn certified(id: ServerIdentity, provider: &rustls::crypto::CryptoProvider) -> Result<Arc<rustls::sign::CertifiedKey>> {
+    Ok(Arc::new(rustls::sign::CertifiedKey::from_der(id.chain, id.key, provider)?))
+}
+
+impl rustls::server::ResolvesServerCert for Rotating {
+    fn resolve(&self, _: rustls::server::ClientHello<'_>) -> Option<Arc<rustls::sign::CertifiedKey>> {
+        Some(self.current())
+    }
+}
+
+impl rustls::client::ResolvesClientCert for Rotating {
+    fn resolve(&self, _: &[&[u8]], _: &[rustls::SignatureScheme]) -> Option<Arc<rustls::sign::CertifiedKey>> {
+        Some(self.current())
+    }
+
+    fn has_certs(&self) -> bool {
+        true
+    }
+}
+
+pub fn server_config(ca: &Ca, id: Arc<Rotating>) -> Result<Arc<rustls::ServerConfig>> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let mut roots = rustls::RootCertStore::empty();
     roots.add(ca.cert_der.clone())?;
     let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(Arc::new(roots), provider.clone()).allow_unauthenticated().build()?;
-    let mut c = rustls::ServerConfig::builder_with_provider(provider).with_safe_default_protocol_versions()?.with_client_cert_verifier(verifier).with_single_cert(id.chain, id.key)?;
+    let mut c = rustls::ServerConfig::builder_with_provider(provider).with_safe_default_protocol_versions()?.with_client_cert_verifier(verifier).with_cert_resolver(id);
     c.alpn_protocols = vec![b"h2".to_vec()];
     Ok(Arc::new(c))
 }
 
 /// TLS for the admin API on the network: this manager's server certificate, no client certificate (the API takes
 /// bearer tokens), HTTP/1.1.
-pub fn api_server_config(id: ServerIdentity) -> Result<Arc<rustls::ServerConfig>> {
+pub fn api_server_config(id: Arc<Rotating>) -> Result<Arc<rustls::ServerConfig>> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let mut c = rustls::ServerConfig::builder_with_provider(provider).with_safe_default_protocol_versions()?.with_no_client_auth().with_single_cert(id.chain, id.key)?;
+    let mut c = rustls::ServerConfig::builder_with_provider(provider).with_safe_default_protocol_versions()?.with_no_client_auth().with_cert_resolver(id);
     c.alpn_protocols = vec![b"http/1.1".to_vec()];
     Ok(Arc::new(c))
 }
@@ -125,13 +188,13 @@ pub fn incoming(listener: TcpListener, tls: Arc<rustls::ServerConfig>) -> tokio_
 
 /// TLS for calling other managers: this manager's client certificate, the other end checked against the cluster CA
 /// for `MANAGER_SERVER_NAME`.
-pub fn peer_client_config(ca: &Ca, id: ServerIdentity) -> Result<Arc<rustls::ClientConfig>> {
+pub fn peer_client_config(ca: &Ca, id: Arc<Rotating>) -> Result<Arc<rustls::ClientConfig>> {
     let mut roots = rustls::RootCertStore::empty();
     roots.add(ca.cert_der.clone())?;
     let mut c = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
         .with_safe_default_protocol_versions()?
         .with_root_certificates(roots)
-        .with_client_auth_cert(id.chain, id.key)?;
+        .with_client_cert_resolver(id);
     c.alpn_protocols = vec![b"h2".to_vec()];
     Ok(Arc::new(c))
 }
@@ -199,4 +262,29 @@ pub fn pinned_client_config(pin: &str) -> Result<Arc<rustls::ClientConfig>> {
         .with_no_client_auth();
     c.alpn_protocols = vec![b"h2".to_vec()];
     Ok(Arc::new(c))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_certificate_is_made_again_once_it_is_old_and_kept_when_that_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let ca = Arc::new(Ca::load_or_create(dir.path()).unwrap());
+        let c = ca.clone();
+        let young = Rotating::new(move || c.server_identity(), Duration::from_secs(3600)).unwrap();
+        assert_eq!(young.current().cert[0], young.current().cert[0], "kept while it is young");
+        let c = ca.clone();
+        let old = Rotating::new(move || c.server_identity(), Duration::ZERO).unwrap();
+        assert_ne!(old.current().cert[0], old.current().cert[0], "made again once it is old");
+
+        let fails = std::sync::atomic::AtomicBool::new(false);
+        let fails = Arc::new(fails);
+        let (c, f) = (ca.clone(), fails.clone());
+        let r = Rotating::new(move || if f.load(std::sync::atomic::Ordering::SeqCst) { anyhow::bail!("no") } else { c.server_identity() }, Duration::ZERO).unwrap();
+        let before = r.current();
+        fails.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(r.current().cert[0], before.cert[0], "a failed renewal keeps the one there is");
+    }
 }

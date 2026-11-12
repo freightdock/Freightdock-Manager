@@ -137,7 +137,8 @@ async fn a_worker_certificate_opens_nothing_between_managers() {
     let csr = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap().serialize_request(&key).unwrap().pem().unwrap();
     let (pem, _) = a.m.ca.sign_worker(&csr, "6f1c7c2e-0000-4000-8000-000000000000").unwrap();
     let worker = ServerIdentity { chain: vec![CertificateDer::from_pem_slice(pem.as_bytes()).unwrap()], key: PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der())) };
-    let tls = freightdock_manager::tls::peer_client_config(&a.m.ca, worker).unwrap();
+    let rotating = freightdock_manager::tls::Rotating::new(move || Ok(ServerIdentity { chain: worker.chain.clone(), key: worker.key.clone_key() }), freightdock_manager::tls::RENEW_AFTER).unwrap();
+    let tls = freightdock_manager::tls::peer_client_config(&a.m.ca, rotating).unwrap();
     let mut client = ManagerPeerClient::new(freightdock_manager::tls::peer_channel(&a.addr, tls).unwrap());
     let err = client.raft(RaftRequest { target: a.m.store.id, rpc: RaftRpc::Vote as i32, payload: b"{}".to_vec() }).await.unwrap_err();
     assert_eq!(err.code(), tonic::Code::PermissionDenied, "{err:?}");
