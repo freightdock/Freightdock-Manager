@@ -103,7 +103,7 @@ a client trusts that CA alone and checks that name. `GET /v1/health` and `GET /v
 
 | | |
 |---|---|
-| `GET /v1/cluster` | cluster id, manager id, managers, Raft members (voter, leader), applied index, CA fingerprint |
+| `GET /v1/cluster` | cluster id, manager id, managers, Raft members (voter, leader, online as this manager hears them), `quorate`, applied index, CA fingerprint |
 | `GET /v1/nodes`, `GET /v1/nodes/{id}` | nodes with their last report, labels (`labels` set here, `all_labels` merged) and live health (from any manager that hears them); one node also with `containers`, as it last reported them |
 | `PUT /v1/nodes/{id}/labels` | `{"labels": {...}}`: the node's labels, all of them |
 | `POST /v1/nodes/{id}/authorize` | lets a node that came back fenced run workloads again |

@@ -223,6 +223,11 @@ impl Sessions {
         self.remote.lock().expect("remote lock").insert(via.to_string(), (Instant::now(), nodes));
     }
 
+    /// Whether manager `via` reported what it hears lately (they do each second): online, as far as this one knows.
+    pub fn manager_online(&self, via: &str) -> bool {
+        self.remote.lock().expect("remote lock").get(via).is_some_and(|(at, _)| at.elapsed() < self.thresholds.suspect)
+    }
+
     /// Forgets a manager's reports (it left the cluster).
     pub fn forget_reports(&self, keep: &[String]) {
         self.remote.lock().expect("remote lock").retain(|via, _| keep.contains(via));
@@ -366,5 +371,20 @@ mod tests {
         // The report ages as it sits here: m2 last said so 70 ms ago.
         std::thread::sleep(Duration::from_millis(70));
         assert_eq!(s.liveness("n").health, Health::Unreachable);
+    }
+}
+
+#[cfg(test)]
+mod manager_tests {
+    use super::*;
+
+    #[test]
+    fn a_manager_is_online_while_its_reports_keep_coming() {
+        let s = Sessions::new(Thresholds::default());
+        assert!(!s.manager_online("192.0.2.2:7450"), "never heard");
+        s.reports("192.0.2.2:7450", vec![]);
+        assert!(s.manager_online("192.0.2.2:7450"));
+        s.remote.lock().unwrap().get_mut("192.0.2.2:7450").unwrap().0 = Instant::now() - s.thresholds.suspect;
+        assert!(!s.manager_online("192.0.2.2:7450"), "silent as long as a suspect worker");
     }
 }

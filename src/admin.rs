@@ -116,13 +116,20 @@ async fn cluster(State(m): State<Arc<Manager>>, h: HeaderMap) -> R<Json<Value>> 
     let managers = m.managers();
     let voters = m.store.voters();
     let leader = m.store.leader();
-    let raft = raft_members(m.store.members(), &voters, leader, m.store.id);
+    let mut raft = raft_members(m.store.members(), &voters, leader, m.store.id);
+    // Online: this one, and each other whose reports keep coming. Quorate: a majority of the voters online.
+    for r in &mut raft {
+        r["online"] = json!(r["me"] == true || r["addr"].as_str().is_some_and(|a| m.sessions.manager_online(a)));
+    }
+    let online_voters = raft.iter().filter(|r| r["voter"] == true && r["online"] == true).count();
+    let quorate = !voters.is_empty() && online_voters * 2 > voters.len() && leader.is_some();
     Ok(Json(m.store.read(|s| {
         json!({
             "cluster_id": s.cluster_id,
             "manager_id": m.manager_id,
             "managers": managers,
             "raft": raft,
+            "quorate": quorate,
             "applied_index": s.applied,
             "nodes": s.nodes.len(),
             "ca_sha256": m.ca.fingerprint(),
