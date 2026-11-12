@@ -239,7 +239,7 @@ async fn a_stack_deployed_on_one_manager_is_reconciled_by_the_worker_s_manager()
     let g = b.m.sessions.open("n1", tx, "test".into(), Some(WorkloadReport::default()));
     let parsed = freightdock_manager::compose::parse("services:\n  web:\n    image: nginx:alpine\n").unwrap();
     let placements = [("app.web.1".to_string(), "n1".to_string())].into();
-    a.m.store.propose(Entry::StackDeployed { name: "app".into(), compose: String::new(), services: parsed.services, placements, at: now_ms() }).await.unwrap();
+    a.m.store.propose(Entry::StackDeployed { name: "app".into(), compose: String::new(), services: parsed.services, placements, at: now_ms(), nodes: vec![], exposures: None }).await.unwrap();
     until("the stack on b", || b.m.store.read(|s| s.workloads.contains_key("app.web.1"))).await;
 
     a.m.reconcile().await;
@@ -418,7 +418,7 @@ async fn every_manager_forwards_the_ui_s_port_to_the_node_it_runs_on() {
     a.m.sessions.open("n1", tx, "127.0.0.1:50000".into(), None);
     let services: std::collections::BTreeMap<_, _> = [(freightdock_manager::ui::SERVICE.to_string(), freightdock_manager::ui::spec("i"))].into();
     let placements = [(freightdock_manager::ui::WORKLOAD.to_string(), "n1".to_string())].into();
-    a.m.store.propose(Entry::StackDeployed { name: freightdock_manager::ui::STACK.into(), compose: String::new(), services, placements, at: now_ms() }).await.unwrap();
+    a.m.store.propose(Entry::StackDeployed { name: freightdock_manager::ui::STACK.into(), compose: String::new(), services, placements, at: now_ms(), nodes: vec![], exposures: None }).await.unwrap();
     let mut c = tokio::net::TcpStream::connect(paddr).await.unwrap();
     c.write_all(b"hello").await.unwrap();
     let mut buf = [0u8; 5];
@@ -454,7 +454,7 @@ async fn a_worker_is_sent_its_network_when_it_connects_and_when_it_changes() {
     assert!(network(&mut rx).is_none(), "nothing new, nothing sent");
 
     let parsed = freightdock_manager::compose::parse("services:\n  web:\n    image: nginx\n").unwrap();
-    a.m.store.propose(Entry::StackDeployed { name: "app".into(), compose: String::new(), services: parsed.services, placements: [("app.web.1".to_string(), "n2".to_string())].into(), at: now_ms() }).await.unwrap();
+    a.m.store.propose(Entry::StackDeployed { name: "app".into(), compose: String::new(), services: parsed.services, placements: [("app.web.1".to_string(), "n2".to_string())].into(), at: now_ms(), nodes: vec![], exposures: None }).await.unwrap();
     a.m.push_network();
     let n = network(&mut rx).expect("a workload on n2: a route to it");
     assert_eq!(n.peers[0].addresses, vec!["10.240.0.2/32".to_string(), "10.240.1.2/32".to_string()], "n2's own address and its workload's");
@@ -508,7 +508,7 @@ async fn a_stack_s_exposures_are_set_shown_with_the_stack_and_on_their_pool_addr
     let t = JoinToken::parse(&issue(&a.m, false).await).unwrap();
     a.m.store.propose(Entry::NodeEnrolled { node_id: "n1".into(), hostname: "h".into(), secret_hash: t.secret_hash(), cert_sha256: "c1".into(), at: now_ms() }).await.unwrap();
     let parsed = freightdock_manager::compose::parse("services:\n  web:\n    image: nginx\n").unwrap();
-    a.m.store.propose(Entry::StackDeployed { name: "app".into(), compose: String::new(), services: parsed.services, placements: [("app.web.1".to_string(), "n1".to_string())].into(), at: now_ms() }).await.unwrap();
+    a.m.store.propose(Entry::StackDeployed { name: "app".into(), compose: String::new(), services: parsed.services, placements: [("app.web.1".to_string(), "n1".to_string())].into(), at: now_ms(), nodes: vec![], exposures: None }).await.unwrap();
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = l.local_addr().unwrap().to_string();
     tokio::spawn(freightdock_manager::serve_admin_tls(a.m.clone(), l));
@@ -528,5 +528,31 @@ async fn a_stack_s_exposures_are_set_shown_with_the_stack_and_on_their_pool_addr
     assert_eq!(https(&a.m, &addr, "DELETE", "/v1/floating/192.0.2.10", admin).await.0, 409, "in use");
     assert_eq!(https_with(&a.m, &addr, "PUT", "/v1/stacks/app/exposures", admin, r#"{"exposures":[]}"#).await.0, 200);
     assert_eq!(https(&a.m, &addr, "DELETE", "/v1/floating/192.0.2.10", admin).await.0, 204);
+    a.server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_compose_file_is_checked_before_it_is_deployed_on_the_nodes_chosen_for_it() {
+    let a = start(None).await;
+    until("a leader", || a.m.store.leader().is_some()).await;
+    let t = JoinToken::parse(&issue(&a.m, false).await).unwrap();
+    a.m.store.propose(Entry::NodeEnrolled { node_id: "n1".into(), hostname: "w1".into(), secret_hash: t.secret_hash(), cert_sha256: "c1".into(), at: now_ms() }).await.unwrap();
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap().to_string();
+    tokio::spawn(freightdock_manager::serve_admin_tls(a.m.clone(), l));
+    let admin = Some(a.m.admin_token.as_str());
+    let compose = r#"services:\n  web:\n    image: nginx\n    ports: [\"8080:80\"]\n  db:\n    image: postgres\n"#;
+    let (s, b) = https_with(&a.m, &addr, "POST", "/v1/stack-check", admin, &format!(r#"{{"name":"app","compose":"{compose}","nodes":["w1"]}}"#)).await;
+    let v: serde_json::Value = serde_json::from_str(&b).unwrap();
+    assert_eq!(s, 200, "{b}");
+    assert_eq!((v["services"]["web"]["ports"][0]["host_port"].as_u64(), v["services"]["web"]["ports"][0]["container_port"].as_u64()), (Some(8080), Some(80)), "the ports it asks for, to expose on the pool");
+    assert!(v["services"]["db"]["ports"].as_array().unwrap().is_empty());
+    assert_eq!(v["nodes"], serde_json::json!(["n1"]), "a node by its hostname too");
+    assert!(v["unplaced"].as_str().unwrap().contains("none of the nodes chosen"), "{b}");
+    assert!(a.m.store.read(|s| s.stacks.is_empty()), "a check deploys nothing");
+    assert_eq!(https_with(&a.m, &addr, "POST", "/v1/stack-check", admin, r#"{"name":"app","compose":"services: ["}"#).await.0, 400);
+    assert_eq!(https_with(&a.m, &addr, "POST", "/v1/stack-check", admin, &format!(r#"{{"name":"app","compose":"{compose}","nodes":["nope"]}}"#)).await.0, 400, "no such node");
+    let (s, b) = https_with(&a.m, &addr, "POST", "/v1/stacks", admin, &format!(r#"{{"name":"app","compose":"{compose}","nodes":["n1"]}}"#)).await;
+    assert_eq!(s, 409, "n1 is not connected: {b}");
     a.server.abort();
 }

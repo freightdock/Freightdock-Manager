@@ -84,7 +84,9 @@ pub fn floating_moves(s: &ClusterState, healthy: impl Fn(&str) -> bool, at: Ms) 
 pub fn exposures(s: &ClusterState, down: impl Fn(&Workload) -> bool) -> Vec<v1::Exposure> {
     let mut out = vec![];
     for st in s.stacks.values().filter(|st| !st.stopped) {
-        for (svc, spec) in &st.services {
+        // A Compose port opens nothing on the nodes' own addresses but for the managers' own stack, whose port
+        // they forward the UI to: a user's stack leaves the cluster only on the pool.
+        for (svc, spec) in st.services.iter().filter(|_| st.name == crate::ui::STACK) {
             for p in spec.ports.iter().filter(|p| p.host_port != 0) {
                 let mut targets: Vec<String> = s.workloads.values().filter(|w| w.stack == st.name && &w.service == svc && w.node_id.is_some() && !down(w)).filter_map(|w| s.address(&w.id)).map(|a| format!("{a}:{}", p.container_port)).collect();
                 targets.sort();
@@ -138,29 +140,29 @@ mod tests {
     }
 
     #[test]
-    fn every_node_answers_every_published_port_for_the_workloads_behind_it() {
+    fn a_compose_port_is_answered_on_the_nodes_only_for_the_managers_own_stack() {
         let mut s = with_nodes(&["n1", "n2"]);
         let mut web = spec("nginx", 2);
-        web.ports = vec![crate::state::Port { host_port: 8088, container_port: 80, protocol: "tcp".into(), host_ip: String::new() }, crate::state::Port { host_port: 0, container_port: 9000, protocol: "tcp".into(), host_ip: String::new() }];
+        web.ports = vec![crate::state::Port { host_port: 8088, container_port: 80, protocol: "tcp".into(), host_ip: String::new() }];
         next(&mut s, &deploy("a", &[("web", web)], &[("a.web.1", "n1"), ("a.web.2", "n2")])).unwrap();
+        assert!(state_for(&s, "n1", |_| None, |_| false).exposures.is_empty(), "a user's Compose port opens nothing on a node's own address");
+        next(&mut s, &deploy(crate::ui::STACK, &[(crate::ui::SERVICE, crate::ui::spec("freightdock:x"))], &[("freightdock.ui.1", "n1")])).unwrap();
         for n in ["n1", "n2"] {
             let e = state_for(&s, n, |_| None, |_| false).exposures;
-            assert_eq!(e.len(), 1, "a published port only, on every node: {e:?}");
-            assert_eq!((e[0].stack.as_str(), e[0].protocol.as_str(), e[0].port), ("a", "tcp", 8088));
-            let mut want = vec![format!("{}:80", s.address("a.web.1").unwrap()), format!("{}:80", s.address("a.web.2").unwrap())];
-            want.sort();
-            assert_eq!(e[0].targets, want);
+            assert_eq!(e.len(), 1, "the UI's port, on every node, for the managers to forward to: {e:?}");
+            assert_eq!((e[0].stack.as_str(), e[0].port, e[0].address.as_str()), (crate::ui::STACK, crate::ui::HOST_PORT, ""));
+            assert_eq!(e[0].targets, vec![format!("{}:7443", s.address("freightdock.ui.1").unwrap())]);
         }
-        next(&mut s, &Entry::StackStopped { name: "a".into(), stopped: true, at: 9 }).unwrap();
+        next(&mut s, &Entry::StackStopped { name: crate::ui::STACK.into(), stopped: true, at: 9 }).unwrap();
         assert!(state_for(&s, "n1", |_| None, |_| false).exposures.is_empty(), "a stopped stack answers on nothing");
     }
 
     #[test]
     fn a_workload_known_to_be_down_takes_no_connections() {
         let mut s = with_nodes(&["n1", "n2"]);
-        let mut web = spec("nginx", 2);
-        web.ports = vec![crate::state::Port { host_port: 8088, container_port: 80, protocol: "tcp".into(), host_ip: String::new() }];
-        next(&mut s, &deploy("a", &[("web", web)], &[("a.web.1", "n1"), ("a.web.2", "n2")])).unwrap();
+        next(&mut s, &Entry::FloatingAdded { address: "192.0.2.10".into(), at: 1 }).unwrap();
+        next(&mut s, &deploy("a", &[("web", spec("nginx", 2))], &[("a.web.1", "n1"), ("a.web.2", "n2")])).unwrap();
+        next(&mut s, &Entry::StackExposed { name: "a".into(), exposures: vec![crate::state::Exposure { service: "web".into(), container_port: 80, protocol: "tcp".into(), address: "192.0.2.10".into(), port: 80 }], at: 2 }).unwrap();
         let e = exposures(&s, |w| w.id == "a.web.1");
         assert_eq!(e[0].targets, vec![format!("{}:80", s.address("a.web.2").unwrap())], "only the one running");
         assert!(exposures(&s, |_| true)[0].targets.is_empty(), "none up: the port answers nothing");
@@ -212,7 +214,7 @@ mod tests {
     }
 
     #[test]
-    fn an_exposure_goes_to_every_node_with_its_address_beside_the_compose_ports() {
+    fn an_exposure_goes_to_every_node_with_its_address_and_the_compose_port_nowhere() {
         let mut s = with_nodes(&["n1", "n2"]);
         next(&mut s, &Entry::FloatingAdded { address: "192.0.2.10".into(), at: 1 }).unwrap();
         let mut web = spec("nginx", 1);
@@ -222,7 +224,7 @@ mod tests {
         let e = state_for(&s, "n2", |_| None, |_| false).exposures;
         let web1 = s.address("a.web.1").unwrap();
         let got: Vec<(&str, u32, Vec<String>)> = e.iter().map(|e| (e.address.as_str(), e.port, e.targets.clone())).collect();
-        assert_eq!(got, vec![("", 8088, vec![format!("{web1}:80")]), ("192.0.2.10", 443, vec![format!("{web1}:8443")])]);
+        assert_eq!(got, vec![("192.0.2.10", 443, vec![format!("{web1}:8443")])], "8088 is only what the Compose file asked for");
     }
 }
 

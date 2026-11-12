@@ -107,6 +107,7 @@ pub fn router(m: Arc<Manager>) -> Router {
         .route("/v1/commands/{id}", get(command))
         .route("/v1/ui", get(ui_status).put(ui_deploy).delete(ui_remove))
         .route("/v1/stacks", get(stacks).post(deploy_stack))
+        .route("/v1/stack-check", post(stack_check))
         .route("/v1/stacks/{name}", get(stack).delete(remove_stack))
         .route("/v1/stacks/{name}/{action}", post(stack_action))
         .route("/v1/stacks/{name}/exposures", axum::routing::put(set_exposures))
@@ -545,7 +546,7 @@ fn stack_json(m: &Manager, s: &crate::state::ClusterState, st: &crate::state::St
         })
         .collect();
     let services: serde_json::Map<String, Value> = st.services.iter().map(|(k, v)| (k.clone(), json!({ "image": v.image, "replicas": v.replicas, "ports": v.ports, "ha": v.ha, "limits": v.limits, "placement": { "constraints": v.placement.constraints.iter().map(ToString::to_string).collect::<Vec<_>>(), "prefer": v.placement.prefer.iter().map(ToString::to_string).collect::<Vec<_>>(), "spread": v.placement.spread, "reserve": v.placement.reserve } }))).collect();
-    let mut v = json!({ "name": st.name, "subnet": s.subnet(&st.name), "stopped": st.stopped, "created_at": st.created_at, "updated_at": st.updated_at, "services": services, "workloads": workloads, "exposures": st.exposures });
+    let mut v = json!({ "name": st.name, "subnet": s.subnet(&st.name), "stopped": st.stopped, "created_at": st.created_at, "updated_at": st.updated_at, "services": services, "workloads": workloads, "exposures": st.exposures, "nodes": st.nodes });
     if with_compose {
         v["compose"] = json!(st.compose);
     }
@@ -590,9 +591,9 @@ async fn ui_deploy(State(m): State<Arc<Manager>>, h: HeaderMap, Json(b): Json<Ui
     }
     let services: std::collections::BTreeMap<String, crate::state::ServiceSpec> = [(crate::ui::SERVICE.to_string(), crate::ui::spec(&image))].into();
     let compose = format!("# The managers' own stack: the Freightdock UI (PUT /v1/ui).\nservices:\n  {}:\n    image: {image}\n", crate::ui::SERVICE);
-    let placements = m.store.read(|s| crate::stacks::place(s, crate::ui::STACK, &services, &m.eligible(s))).map_err(|e| ApiError(StatusCode::CONFLICT, e))?;
+    let placements = m.store.read(|s| crate::stacks::place(s, crate::ui::STACK, &services, &m.eligible(s), &[])).map_err(|e| ApiError(StatusCode::CONFLICT, e))?;
     let existed = m.store.read(|s| s.stacks.contains_key(crate::ui::STACK));
-    m.store.propose(Entry::StackDeployed { name: crate::ui::STACK.into(), compose, services, placements, at: now_ms() }).await?;
+    m.store.propose(Entry::StackDeployed { name: crate::ui::STACK.into(), compose, services, placements, at: now_ms(), nodes: vec![], exposures: None }).await?;
     m.events.push("ui", None, format!("the UI {} ({image})", if existed { "updated" } else { "deployed" }));
     let (code, Json(v)) = (if existed { StatusCode::OK } else { StatusCode::CREATED }, ui_status(State(m), h).await?);
     Ok((code, Json(v)))
@@ -615,12 +616,23 @@ async fn ui_remove(State(m): State<Arc<Manager>>, h: HeaderMap) -> R<StatusCode>
 struct DeployBody {
     name: String,
     compose: String,
+    /// The nodes it may run on, by id or hostname; empty: any. Left out: as it was (any for a new stack).
+    #[serde(default)]
+    nodes: Option<Vec<String>>,
+    /// Its exposures on the pool, all of them. Left out: as they were.
+    #[serde(default)]
+    exposures: Option<Vec<crate::state::Exposure>>,
 }
 
-/// Makes or changes a stack from a Compose file: its new workloads are placed on connected nodes with Docker, and the
-/// reconcile on each node's manager does the rest.
-async fn deploy_stack(State(m): State<Arc<Manager>>, h: HeaderMap, Json(b): Json<DeployBody>) -> R<(StatusCode, Json<Value>)> {
-    authed(&m, &h)?;
+/// A deploy made ready: the Compose file parsed, the nodes named resolved to ids, and the new workloads placed (or
+/// why they cannot be).
+struct Ready {
+    parsed: crate::compose::Parsed,
+    nodes: Vec<String>,
+    placements: Result<std::collections::BTreeMap<String, String>, String>,
+}
+
+fn ready(m: &Manager, b: &DeployBody) -> R<(String, Ready)> {
     let name = b.name.trim().to_string();
     if !crate::state::valid_stack_name(&name) {
         return Err(ApiError(StatusCode::BAD_REQUEST, Rejected::BadName.to_string()));
@@ -629,19 +641,59 @@ async fn deploy_stack(State(m): State<Arc<Manager>>, h: HeaderMap, Json(b): Json
         return Err(ApiError(StatusCode::BAD_REQUEST, format!("{} is the managers' own stack, for the UI: PUT /v1/ui", crate::ui::STACK)));
     }
     let parsed = crate::compose::parse(&b.compose).map_err(|e| ApiError(StatusCode::BAD_REQUEST, e))?;
-    if let Some(why) = m.store.read(|s| crate::stacks::port_conflict(s, &name, &parsed.services)) {
-        return Err(ApiError(StatusCode::CONFLICT, why));
-    }
-    let placements = m.store.read(|s| {
-        let eligible = m.eligible(s);
-        crate::stacks::place(s, &name, &parsed.services, &eligible)
-    });
-    let placements = placements.map_err(|e| ApiError(StatusCode::CONFLICT, e))?;
+    m.store.read(|s| {
+        let nodes = match &b.nodes {
+            None => s.stacks.get(&name).map(|st| st.nodes.clone()).unwrap_or_default(),
+            Some(list) => {
+                let mut ids = vec![];
+                for n in list.iter().map(|n| n.trim()).filter(|n| !n.is_empty()) {
+                    let by_host: Vec<&String> = s.nodes.values().filter(|x| x.hostname == n).map(|x| &x.id).collect();
+                    let id = if s.nodes.contains_key(n) {
+                        n.to_string()
+                    } else if let [one] = by_host[..] {
+                        one.clone()
+                    } else {
+                        return Err(ApiError(StatusCode::BAD_REQUEST, format!("{n:?} is no node's id, or no one node's hostname")));
+                    };
+                    if !ids.contains(&id) {
+                        ids.push(id);
+                    }
+                }
+                ids
+            }
+        };
+        let placements = crate::stacks::place(s, &name, &parsed.services, &m.eligible(s), &nodes);
+        Ok((name.clone(), Ready { parsed, nodes, placements }))
+    })
+}
+
+/// What a deploy would do, changing nothing: the services with the ports their Compose file asks for (to be exposed
+/// on the pool, never on a node's own address), the warnings, the nodes resolved, and where the new workloads would go
+/// or why they could not.
+async fn stack_check(State(m): State<Arc<Manager>>, h: HeaderMap, Json(b): Json<DeployBody>) -> R<Json<Value>> {
+    authed(&m, &h)?;
+    let (name, r) = ready(&m, &b)?;
+    let services: serde_json::Map<String, Value> = r.parsed.services.iter().map(|(k, v)| (k.clone(), json!({ "image": v.image, "replicas": v.replicas, "ports": v.ports }))).collect();
+    let (placements, unplaced) = match r.placements {
+        Ok(p) => (json!(p), Value::Null),
+        Err(why) => (Value::Null, json!(why)),
+    };
+    let exists = m.store.read(|s| s.stacks.contains_key(&name));
+    Ok(Json(json!({ "name": name, "exists": exists, "services": services, "warnings": r.parsed.warnings, "nodes": r.nodes, "placements": placements, "unplaced": unplaced })))
+}
+
+/// Makes or changes a stack from a Compose file: its new workloads are placed on connected nodes with Docker (the
+/// ones chosen for it, if any), and the reconcile on each node's manager does the rest. Its Compose ports are
+/// published nowhere: what leaves the cluster is its exposures on the pool, given here or later.
+async fn deploy_stack(State(m): State<Arc<Manager>>, h: HeaderMap, Json(b): Json<DeployBody>) -> R<(StatusCode, Json<Value>)> {
+    authed(&m, &h)?;
+    let (name, r) = ready(&m, &b)?;
+    let placements = r.placements.map_err(|e| ApiError(StatusCode::CONFLICT, e))?;
     let existed = m.store.read(|s| s.stacks.contains_key(&name));
-    m.store.propose(Entry::StackDeployed { name: name.clone(), compose: b.compose, services: parsed.services, placements, at: now_ms() }).await?;
+    m.store.propose(Entry::StackDeployed { name: name.clone(), compose: b.compose, services: r.parsed.services, placements, at: now_ms(), nodes: r.nodes, exposures: b.exposures }).await?;
     m.events.push("stack_deployed", None, format!("stack {name} {}", if existed { "updated" } else { "deployed" }));
     let v = m.store.read(|s| s.stacks.get(&name).map(|st| stack_json(&m, s, st, false))).unwrap_or(Value::Null);
-    Ok((if existed { StatusCode::OK } else { StatusCode::CREATED }, Json(json!({ "stack": v, "warnings": parsed.warnings }))))
+    Ok((if existed { StatusCode::OK } else { StatusCode::CREATED }, Json(json!({ "stack": v, "warnings": r.parsed.warnings }))))
 }
 
 async fn remove_stack(State(m): State<Arc<Manager>>, h: HeaderMap, Path(name): Path<String>) -> R<StatusCode> {

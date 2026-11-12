@@ -13,7 +13,9 @@ freightdock-manager command <node> <json>   send a command, e.g. '{\"op\":\"ping
 freightdock-manager remove <node>           forget a node; its certificate opens nothing more
 freightdock-manager authorize <node>        let a node that came back fenced run workloads again
 freightdock-manager label <node> [k=v ...]  set the node's labels (all of them; none clears them)
-freightdock-manager stack deploy <name> <compose file>   make or change a stack (- reads the file from stdin)
+freightdock-manager stack deploy <name> <compose file> [--on node,...]   make or change a stack (- reads the file
+                                            from stdin), on the nodes named (id or hostname; --on any: any node). Its
+                                            Compose ports open nothing: expose them on the pool with stack expose
 freightdock-manager stack ls                list the stacks
 freightdock-manager stack ps <name>         a stack's workloads: where they run and how they are
 freightdock-manager stack start|stop|restart|rm <name>
@@ -252,12 +254,18 @@ async fn stack(config: &Config, args: &[String]) -> Result<()> {
     match (args.first().map(String::as_str), name) {
         (Some("deploy"), Some(name)) => {
             let Some(file) = args.get(2) else { bail!("{USAGE}") };
+            let nodes = match (args.get(3).map(String::as_str), args.get(4)) {
+                (None, _) => None,
+                (Some("--on"), Some(list)) if list == "any" => Some(vec![]),
+                (Some("--on"), Some(list)) => Some(list.split(',').map(str::to_string).collect::<Vec<_>>()),
+                _ => bail!("{USAGE}"),
+            };
             let compose = if file == "-" {
                 std::io::read_to_string(std::io::stdin())?
             } else {
                 std::fs::read_to_string(file).with_context(|| format!("reading {file}"))?
             };
-            let v = call(config, Method::POST, "/v1/stacks", Some(serde_json::json!({ "name": name, "compose": compose }))).await?;
+            let v = call(config, Method::POST, "/v1/stacks", Some(serde_json::json!({ "name": name, "compose": compose, "nodes": nodes }))).await?;
             for w in v["warnings"].as_array().into_iter().flatten() {
                 eprintln!("warning: {}", w.as_str().unwrap_or(""));
             }
@@ -277,6 +285,8 @@ async fn stack(config: &Config, args: &[String]) -> Result<()> {
         }
         (Some("ps"), Some(name)) => {
             let v = call(config, Method::GET, &format!("/v1/stacks/{name}"), None).await?;
+            let on: Vec<&str> = v["nodes"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+            println!("runs on: {}\n", if on.is_empty() { "any healthy node".to_string() } else { on.join(", ") });
             print_workloads(&v);
             print_reach(&v);
             Ok(())
@@ -434,8 +444,15 @@ async fn call(config: &Config, method: reqwest::Method, path: &str, body: Option
 fn print_reach(stack: &Value) {
     println!("\n{:<20} REACHED FROM OUTSIDE", "SERVICE");
     for (name, svc) in stack["services"].as_object().into_iter().flatten() {
-        let mut ways: Vec<String> = stack["exposures"].as_array().into_iter().flatten().filter(|e| e["service"] == name.as_str()).map(|e| format!("{}:{} -> {}/{}", e["address"].as_str().unwrap_or(""), e["port"], e["container_port"], e["protocol"].as_str().unwrap_or(""))).collect();
-        ways.extend(svc["ports"].as_array().into_iter().flatten().filter(|p| p["host_port"].as_u64().unwrap_or(0) != 0).map(|p| format!("every node's address:{} -> {}/{}", p["host_port"], p["container_port"], p["protocol"].as_str().unwrap_or(""))));
-        println!("{:<20} {}", name, if ways.is_empty() { "no: internal only (reached by name inside the stack)".to_string() } else { ways.join(", ") });
+        let ways: Vec<String> = stack["exposures"].as_array().into_iter().flatten().filter(|e| e["service"] == name.as_str()).map(|e| format!("{}:{} -> {}/{}", e["address"].as_str().unwrap_or(""), e["port"], e["container_port"], e["protocol"].as_str().unwrap_or(""))).collect();
+        let asked: Vec<String> = svc["ports"].as_array().into_iter().flatten().filter(|p| p["host_port"].as_u64().unwrap_or(0) != 0).map(|p| format!("{}", p["host_port"])).collect();
+        let line = if !ways.is_empty() {
+            ways.join(", ")
+        } else if !asked.is_empty() {
+            format!("no: internal only; its Compose file asks for {} (stack expose puts it on the pool)", asked.join(", "))
+        } else {
+            "no: internal only (reached by name inside the stack)".to_string()
+        };
+        println!("{:<20} {line}", name);
     }
 }

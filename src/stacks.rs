@@ -30,22 +30,6 @@ fn host_ports(spec: &ServiceSpec) -> BTreeSet<(u32, String)> {
     spec.ports.iter().filter(|p| p.host_port != 0).map(|p| (p.host_port, p.protocol.clone())).collect()
 }
 
-/// Why `services` cannot be deployed as stack `name` for their published ports, if they cannot (G10): every node
-/// answers a published port, so it is one stack's in the whole cluster, and never one the host keeps for itself.
-pub fn port_conflict(s: &ClusterState, name: &str, services: &BTreeMap<String, ServiceSpec>) -> Option<String> {
-    for (svc, spec) in services {
-        for (port, proto) in host_ports(spec) {
-            if freightdock_proto::RESERVED_PORTS.contains(&port) {
-                return Some(format!("service {svc}: port {port} is the cluster's own (ssh, the managers, WireGuard)"));
-            }
-            if let Some(other) = s.stacks.values().find(|o| o.name != name && o.services.values().any(|os| host_ports(os).contains(&(port, proto.clone())))) {
-                return Some(format!("service {svc}: port {port}/{proto} is published by stack {} already, and every node answers it", other.name));
-            }
-        }
-    }
-    None
-}
-
 /// Whether `need` fits beside `held` on `n`. A node that did not report its size takes anything.
 fn fits(n: &Node, held: &Resources, need: &Resources) -> bool {
     let (cpus, mem) = n.report.as_ref().map_or((0, 0), |r| (r.cpu_count as u64 * 1000, r.memory_total_bytes));
@@ -56,14 +40,16 @@ fn fits(n: &Node, held: &Resources, need: &Resources) -> bool {
 /// meets their service's constraints (moved). Candidates are the nodes in `eligible` that meet every constraint, have
 /// none of the host ports taken (only off the overlay: on it the mesh publishes them, G10.2) and room for the reservation; of those, the one that meets the most preferences, then
 /// holds the fewest of the service's replicas in its spread groups and on itself, then the fewest workloads, then the
-/// lowest id. An error names the first workload with nowhere to go, and why.
-pub fn place(s: &ClusterState, stack: &str, services: &BTreeMap<String, ServiceSpec>, eligible: &[String]) -> Result<BTreeMap<String, String>, String> {
+/// lowest id. `only`, when not empty, is the nodes chosen for the stack: the others are no candidates, and a workload
+/// on one of them is moved. An error names the first workload with nowhere to go, and why.
+pub fn place(s: &ClusterState, stack: &str, services: &BTreeMap<String, ServiceSpec>, eligible: &[String], only: &[String]) -> Result<BTreeMap<String, String>, String> {
+    let allowed = |n: &str| only.is_empty() || only.iter().any(|o| o == n);
     let wanted = ClusterState::wanted(stack, services);
     let keep: BTreeSet<&String> = wanted.iter().map(|w| &w.0).collect();
     // A placed workload of this stack stays where it is while its node exists and meets its constraints.
     let stays = |w: &Workload| -> bool {
         let Some(n) = w.node_id.as_ref().and_then(|id| s.nodes.get(id)) else { return false };
-        w.stack != stack || services[&w.service].placement.constraints.iter().all(|c| c.holds(n))
+        w.stack != stack || (allowed(&n.id) && services[&w.service].placement.constraints.iter().all(|c| c.holds(n)))
     };
     let spec_of = |w: &Workload| -> Option<&ServiceSpec> { if w.stack == stack { services.get(&w.service) } else { s.stacks.get(&w.stack)?.services.get(&w.service) } };
     let mut held: HashMap<&str, Held> = HashMap::new();
@@ -85,7 +71,7 @@ pub fn place(s: &ClusterState, stack: &str, services: &BTreeMap<String, ServiceS
             replicas.push((w.service.as_str(), node));
         }
     }
-    let nodes: Vec<&Node> = eligible.iter().filter_map(|id| s.nodes.get(id)).collect();
+    let nodes: Vec<&Node> = eligible.iter().filter(|id| allowed(id)).filter_map(|id| s.nodes.get(id)).collect();
     // On the overlay (it has, or will get, a /24) the mesh answers its ports and Docker binds none on the node.
     let on_overlay = s.stacks.get(stack).and_then(|st| st.net).is_some() || s.stacks.values().filter(|st| st.net.is_some()).count() < 254;
     let mut out = BTreeMap::new();
@@ -99,7 +85,9 @@ pub fn place(s: &ClusterState, stack: &str, services: &BTreeMap<String, ServiceS
         let meets: Vec<&Node> = nodes.iter().copied().filter(|n| p.constraints.iter().all(|c| c.holds(n))).collect();
         let free: Vec<&Node> = meets.iter().copied().filter(|n| held.get(n.id.as_str()).is_none_or(|h| h.ports.is_disjoint(&needs))).collect();
         let room: Vec<&Node> = free.iter().copied().filter(|n| fits(n, &held.get(n.id.as_str()).map(|h| h.reserved).unwrap_or_default(), &p.reserve)).collect();
-        let why = if nodes.is_empty() {
+        let why = if nodes.is_empty() && !only.is_empty() {
+            Some(format!("none of the nodes chosen for it can take it now ({})", only.join(", ")))
+        } else if nodes.is_empty() {
             Some("none is connected with Docker".to_string())
         } else if meets.is_empty() {
             Some(format!("none meets {}", p.constraints.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ")))
@@ -153,7 +141,9 @@ fn op_for(w: &Workload, net: Option<crate::state::Attach>, run: bool, actual: Op
             env: w.spec.env.clone(),
             labels: w.spec.labels.iter().map(|(k, v)| (k.clone(), v.clone())).chain([("io.freightdock.stack".to_string(), w.stack.clone()), ("io.freightdock.service".to_string(), w.service.clone())]).collect(),
             generation: w.generation,
-            ports: w.spec.ports.clone(),
+            // A user's stack is reached on the pool or not at all, never on a node's own address: Docker publishes
+            // nothing for it. The managers' own stack keeps its port, which they forward the UI to.
+            ports: if w.stack == crate::ui::STACK { w.spec.ports.clone() } else { vec![] },
             volumes: w.spec.volumes.clone(),
             limits: w.spec.limits,
             net,
@@ -302,28 +292,9 @@ mod tests {
         s
     }
 
-    #[test]
-    fn a_published_port_is_the_cluster_s_once_and_never_the_host_s_own() {
-        let mut s = state_with(&["n1"]);
-        let with = |port: u32, proto: &str| {
-            let mut w = spec("nginx", 1);
-            w.ports = vec![Port { host_port: port, container_port: 80, protocol: proto.into(), host_ip: String::new() }];
-            BTreeMap::from([("web".to_string(), w)])
-        };
-        assert_eq!(port_conflict(&s, "a", &with(8088, "tcp")), None);
-        deploy(&mut s, "a", &with(8088, "tcp"), BTreeMap::from([("a.web.1".to_string(), "n1".to_string())]));
-        assert!(port_conflict(&s, "b", &with(8088, "tcp")).unwrap().contains("stack a"), "every node answers it: one stack's");
-        assert_eq!(port_conflict(&s, "a", &with(8088, "tcp")), None, "its own again, redeployed");
-        assert_eq!(port_conflict(&s, "b", &with(8088, "udp")), None, "another protocol");
-        for p in [22, 7450, 7451, 7452, 51820] {
-            assert!(port_conflict(&s, "b", &with(p, "tcp")).is_some(), "{p}");
-        }
-        assert_eq!(port_conflict(&s, "b", &with(0, "tcp")), None, "not published");
-    }
-
     fn deploy(s: &mut ClusterState, stack: &str, services: &BTreeMap<String, ServiceSpec>, placements: BTreeMap<String, String>) {
         let i = s.applied + 1;
-        s.apply_at(i, &Entry::StackDeployed { name: stack.into(), compose: String::new(), services: services.clone(), placements, at: 1 }).unwrap();
+        s.apply_at(i, &Entry::StackDeployed { name: stack.into(), compose: String::new(), services: services.clone(), placements, at: 1, nodes: vec![], exposures: None }).unwrap();
     }
 
     fn svc(list: &[(&str, ServiceSpec)]) -> BTreeMap<String, ServiceSpec> {
@@ -341,7 +312,7 @@ mod tests {
     #[test]
     fn workloads_spread_over_the_least_loaded_nodes() {
         let s = state_with(&["a", "b", "c"]);
-        let p = place(&s, "web", &svc(&[("x", spec("nginx", 4))]), &eligible(&["a", "b", "c"])).unwrap();
+        let p = place(&s, "web", &svc(&[("x", spec("nginx", 4))]), &eligible(&["a", "b", "c"]), &[]).unwrap();
         let on: Vec<&str> = p.values().map(String::as_str).collect();
         assert_eq!(on, vec!["a", "b", "c", "a"]);
     }
@@ -350,10 +321,10 @@ mod tests {
     fn a_workload_already_placed_stays_and_counts() {
         let mut s = state_with(&["a", "b"]);
         let one = svc(&[("x", spec("nginx", 1))]);
-        let p = place(&s, "web", &one, &eligible(&["a", "b"])).unwrap();
+        let p = place(&s, "web", &one, &eligible(&["a", "b"]), &[]).unwrap();
         deploy(&mut s, "web", &one, p);
         let two = svc(&[("x", spec("nginx", 2))]);
-        let p = place(&s, "web", &two, &eligible(&["a", "b"])).unwrap();
+        let p = place(&s, "web", &two, &eligible(&["a", "b"]), &[]).unwrap();
         assert_eq!(p.len(), 1, "only the new one: {p:?}");
         assert_eq!(p["web.x.2"], "b");
     }
@@ -362,18 +333,18 @@ mod tests {
     fn a_published_port_holds_a_node_only_off_the_overlay() {
         let mut s = state_with(&["a", "b"]);
         // On the overlay the mesh answers the port and Docker binds nothing (G10.2): replicas may share a node.
-        let p = place(&s, "web", &svc(&[("x", published("nginx", 3, 8080))]), &eligible(&["a"])).unwrap();
+        let p = place(&s, "web", &svc(&[("x", published("nginx", 3, 8080))]), &eligible(&["a"]), &[]).unwrap();
         assert_eq!(p.values().filter(|n| *n == "a").count(), 3, "{p:?}");
         // Off it (the range full) Docker publishes the port on the node, once.
         for n in 1..=254u8 {
             let name = format!("s{n}");
-            s.stacks.insert(name.clone(), crate::state::Stack { name, compose: String::new(), services: BTreeMap::new(), stopped: false, created_at: 0, updated_at: 0, net: Some(n), exposures: vec![] });
+            s.stacks.insert(name.clone(), crate::state::Stack { name, compose: String::new(), services: BTreeMap::new(), stopped: false, created_at: 0, updated_at: 0, net: Some(n), exposures: vec![], nodes: vec![] });
         }
-        let p = place(&s, "web", &svc(&[("x", published("nginx", 2, 8080))]), &eligible(&["a", "b"])).unwrap();
+        let p = place(&s, "web", &svc(&[("x", published("nginx", 2, 8080))]), &eligible(&["a", "b"]), &[]).unwrap();
         assert_ne!(p["web.x.1"], p["web.x.2"]);
-        let e = place(&s, "web", &svc(&[("x", published("nginx", 3, 8080))]), &eligible(&["a", "b"])).unwrap_err();
+        let e = place(&s, "web", &svc(&[("x", published("nginx", 3, 8080))]), &eligible(&["a", "b"]), &[]).unwrap_err();
         assert!(e.contains("web.x.3"), "{e}");
-        assert!(place(&s, "web", &svc(&[("x", spec("nginx", 1))]), &[]).unwrap_err().contains("none is connected"));
+        assert!(place(&s, "web", &svc(&[("x", spec("nginx", 1))]), &[], &[]).unwrap_err().contains("none is connected"));
     }
 
     /// Nodes with labels and a size: (id, labels as k=v, cpus, memory in MiB).
@@ -401,9 +372,9 @@ mod tests {
         let s = sized(&[("a", &["ssd=true"], 4, 1024), ("b", &[], 4, 1024), ("c", &["ssd=true", "old=yes"], 4, 1024)]);
         let all = eligible(&["a", "b", "c"]);
         let sp = with(spec("db", 2), |x| x.placement.constraints = vec![c("node.labels.ssd==true"), c("node.labels.old!=yes")]);
-        let p = place(&s, "st", &svc(&[("db", sp)]), &all).unwrap();
+        let p = place(&s, "st", &svc(&[("db", sp)]), &all, &[]).unwrap();
         assert!(p.values().all(|n| n == "a"), "only a has ssd and no old: {p:?}");
-        let e = place(&s, "st", &svc(&[("x", with(spec("x", 1), |x| x.placement.constraints = vec![c("node.labels.gpu==yes")]))]), &all).unwrap_err();
+        let e = place(&s, "st", &svc(&[("x", with(spec("x", 1), |x| x.placement.constraints = vec![c("node.labels.gpu==yes")]))]), &all, &[]).unwrap_err();
         assert!(e.contains("none meets node.labels.gpu==yes"), "{e}");
     }
 
@@ -411,7 +382,7 @@ mod tests {
     fn two_replicas_land_on_one_node_only_when_nothing_else_will_do() {
         let s = sized(&[("a", &["ssd=true"], 4, 1024), ("b", &[], 4, 1024)]);
         let sp = with(spec("db", 2), |x| x.placement.constraints = vec![c("node.labels.ssd==true")]);
-        let p = place(&s, "st", &svc(&[("db", sp)]), &eligible(&["a", "b"])).unwrap();
+        let p = place(&s, "st", &svc(&[("db", sp)]), &eligible(&["a", "b"]), &[]).unwrap();
         assert_eq!((p["st.db.1"].as_str(), p["st.db.2"].as_str()), ("a", "a"));
     }
 
@@ -419,9 +390,9 @@ mod tests {
     fn preferences_come_first_and_replicas_spread_over_a_label() {
         let s = sized(&[("a", &["zone=1"], 4, 1024), ("b", &["zone=1", "fast=yes"], 4, 1024), ("c", &["zone=2"], 4, 1024)]);
         let all = eligible(&["a", "b", "c"]);
-        let p = place(&s, "st", &svc(&[("w", with(spec("w", 1), |x| x.placement.prefer = vec![c("node.labels.fast==yes")]))]), &all).unwrap();
+        let p = place(&s, "st", &svc(&[("w", with(spec("w", 1), |x| x.placement.prefer = vec![c("node.labels.fast==yes")]))]), &all, &[]).unwrap();
         assert_eq!(p["st.w.1"], "b");
-        let p = place(&s, "st", &svc(&[("w", with(spec("w", 2), |x| x.placement.spread = vec!["zone".into()]))]), &all).unwrap();
+        let p = place(&s, "st", &svc(&[("w", with(spec("w", 2), |x| x.placement.spread = vec!["zone".into()]))]), &all, &[]).unwrap();
         let zones: BTreeSet<&str> = p.values().map(|n| if n == "c" { "2" } else { "1" }).collect();
         assert_eq!(zones.len(), 2, "one per zone: {p:?}");
     }
@@ -430,11 +401,11 @@ mod tests {
     fn reservations_count_against_the_node_s_size() {
         let s = sized(&[("a", &[], 2, 1024), ("b", &[], 1, 512)]);
         let big = with(spec("x", 1), |x| x.placement.reserve = Resources { cpu_millis: 1500, memory_bytes: 0 });
-        assert_eq!(place(&s, "st", &svc(&[("x", big.clone())]), &eligible(&["a", "b"])).unwrap()["st.x.1"], "a");
-        let e = place(&s, "st", &svc(&[("x", with(big, |x| x.replicas = 2))]), &eligible(&["a", "b"])).unwrap_err();
+        assert_eq!(place(&s, "st", &svc(&[("x", big.clone())]), &eligible(&["a", "b"]), &[]).unwrap()["st.x.1"], "a");
+        let e = place(&s, "st", &svc(&[("x", with(big, |x| x.replicas = 2))]), &eligible(&["a", "b"]), &[]).unwrap_err();
         assert!(e.contains("room"), "{e}");
         let mem = with(spec("m", 3), |x| x.placement.reserve = Resources { cpu_millis: 0, memory_bytes: 512 << 20 });
-        let p = place(&s, "st", &svc(&[("m", mem)]), &eligible(&["a", "b"])).unwrap();
+        let p = place(&s, "st", &svc(&[("m", mem)]), &eligible(&["a", "b"]), &[]).unwrap();
         assert_eq!(p.values().filter(|n| *n == "a").count(), 2, "1 GiB holds two of 512 MiB: {p:?}");
     }
 
@@ -442,10 +413,10 @@ mod tests {
     fn a_workload_whose_node_no_longer_qualifies_is_moved_and_the_others_stay() {
         let mut s = sized(&[("a", &["ssd=true"], 4, 1024), ("b", &[], 4, 1024)]);
         let two = svc(&[("x", spec("x", 2))]);
-        let p = place(&s, "st", &two, &eligible(&["a", "b"])).unwrap();
+        let p = place(&s, "st", &two, &eligible(&["a", "b"]), &[]).unwrap();
         deploy(&mut s, "st", &two, p);
         let only_ssd = svc(&[("x", with(spec("x", 2), |x| x.placement.constraints = vec![c("node.labels.ssd==true")]))]);
-        let p = place(&s, "st", &only_ssd, &eligible(&["a", "b"])).unwrap();
+        let p = place(&s, "st", &only_ssd, &eligible(&["a", "b"]), &[]).unwrap();
         let on_b = s.workloads.values().find(|w| w.node_id.as_deref() == Some("b")).unwrap().id.clone();
         assert_eq!(p.len(), 1, "{p:?}");
         assert_eq!(p[&on_b], "a");
@@ -457,8 +428,38 @@ mod tests {
 
     fn placed(s: &mut ClusterState, services: &[(&str, ServiceSpec)]) {
         let services = svc(services);
-        let p = place(s, "web", &services, &eligible(&["a"])).unwrap();
+        let p = place(s, "web", &services, &eligible(&["a"]), &[]).unwrap();
         deploy(s, "web", &services, p);
+    }
+
+    #[test]
+    fn a_stack_runs_only_on_the_nodes_chosen_for_it_and_moves_onto_them() {
+        let mut s = state_with(&["a", "b", "c"]);
+        let two = svc(&[("x", spec("nginx", 2))]);
+        let p = place(&s, "web", &two, &eligible(&["a", "b", "c"]), &eligible(&["c"])).unwrap();
+        assert_eq!(p.values().collect::<Vec<_>>(), vec!["c", "c"], "only c, though a and b are free");
+        let p = place(&s, "web", &two, &eligible(&["a", "b", "c"]), &[]).unwrap();
+        deploy(&mut s, "web", &two, p);
+        let moved = place(&s, "web", &two, &eligible(&["a", "b", "c"]), &eligible(&["b"])).unwrap();
+        assert_eq!(moved, BTreeMap::from([("web.x.1".to_string(), "b".to_string())]), "chosen again: the one on a moves onto b, the one on b stays");
+        let e = place(&s, "web", &two, &eligible(&["a", "b"]), &eligible(&["c"])).unwrap_err();
+        assert!(e.contains("none of the nodes chosen for it can take it now"), "{e}");
+    }
+
+    #[test]
+    fn a_compose_port_is_published_by_docker_only_for_the_managers_own_stack() {
+        let mut s = state_with(&["a"]);
+        placed(&mut s, &[("x", published("nginx", 1, 8080))]);
+        let ports = |s: &ClusterState| match &reconcile(s, "a", &[], &BTreeSet::new())[..] {
+            [(_, Op::RunContainer { ports, .. })] => ports.clone(),
+            o => panic!("{o:?}"),
+        };
+        assert!(ports(&s).is_empty(), "a user's stack is reached on the pool or not at all, never on a node's own address");
+        let ui = svc(&[(crate::ui::SERVICE, crate::ui::spec("freightdock:x"))]);
+        let mut s = state_with(&["a"]);
+        let p = place(&s, crate::ui::STACK, &ui, &eligible(&["a"]), &[]).unwrap();
+        deploy(&mut s, crate::ui::STACK, &ui, p);
+        assert_eq!(ports(&s).len(), 1, "the managers forward to the UI's port on its node");
     }
 
     #[test]

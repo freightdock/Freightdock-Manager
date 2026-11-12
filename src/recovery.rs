@@ -46,8 +46,8 @@ pub fn plan(s: &ClusterState, from: Option<&str>, eligible: &[String]) -> Plan {
     }
     let stacks: BTreeSet<String> = go.iter().map(|id| s.workloads[id].stack.clone()).collect();
     for stack in stacks {
-        let services = s.stacks[&stack].services.clone();
-        match crate::stacks::place(&s, &stack, &services, eligible) {
+        let (services, only) = (s.stacks[&stack].services.clone(), s.stacks[&stack].nodes.clone());
+        match crate::stacks::place(&s, &stack, &services, eligible, &only) {
             Ok(p) => {
                 for (id, node) in p.into_iter().filter(|(id, _)| go.contains(id)) {
                     s.workloads.get_mut(&id).expect("placed").node_id = Some(node.clone());
@@ -156,7 +156,7 @@ mod tests {
             ("cron".to_string(), ServiceSpec { ha: false, ..spec("cron", 1) }),
         ]
         .into();
-        s.stacks.insert("app".into(), Stack { name: "app".into(), compose: String::new(), services: services.clone(), stopped: false, created_at: 0, updated_at: 0, net: None, exposures: vec![] });
+        s.stacks.insert("app".into(), Stack { name: "app".into(), compose: String::new(), services: services.clone(), stopped: false, created_at: 0, updated_at: 0, net: None, exposures: vec![], nodes: vec![] });
         for (id, svc, slot, on) in [("app.web.1", "web", 1, "a"), ("app.web.2", "web", 2, "b"), ("app.db.1", "db", 1, "a"), ("app.cron.1", "cron", 1, "a")] {
             let sp = services[svc].for_workload();
             s.workloads.insert(id.into(), Workload { id: id.into(), stack: "app".into(), service: svc.into(), slot, node_id: Some(on.into()), spec: sp, generation: 1, host: None });

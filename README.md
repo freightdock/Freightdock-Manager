@@ -122,21 +122,28 @@ a client trusts that CA alone and checks that name. `GET /v1/health` and `GET /v
 | `POST /v1/nodes/{id}/commands` | `{"op": "ping"}` and the other ops; answers the command (202) |
 | `GET /v1/commands?node=`, `GET /v1/commands/{id}` | commands and their status |
 | `GET /v1/stacks`, `GET /v1/stacks/{name}` | stacks with each workload's node, status, container and last command; one with its Compose file |
-| `POST /v1/stacks` | `{"name", "compose"}`: make or change a stack; answers it and the file's warnings |
+| `POST /v1/stacks` | `{"name", "compose", "nodes"?, "exposures"?}`: make or change a stack, on the nodes named (ids or hostnames; `[]` any, left out as it was) with its exposures on the pool (left out: as they were); answers it and the file's warnings |
+| `POST /v1/stack-check` | the same body, changing nothing: the services with the ports the file asks for, the warnings, the nodes resolved, and where the new workloads would go (`placements`) or why not (`unplaced`) |
 | `POST /v1/stacks/{name}/start`, `/stop`, `/restart`; `DELETE /v1/stacks/{name}` | run, stop, restart (stop, and the reconcile starts it) or remove |
 
 ### Stacks
 
 What a stack's services are reached on from outside the cluster, and nothing else leaves it: an **exposure** on a
 pool address (`freightdock-manager stack expose app web:80=192.0.2.10:443`, or the UI), answered on that address
-only, the port its own there so other stacks may use it on other addresses; a Compose file's `ports:`, answered on
-every node's own address and never on a pool address; anything else is internal, reached by name inside the stack.
-The address and port follow the workloads wherever they run.
+only, the port its own there so other stacks may use it on other addresses. Anything else is internal, reached by
+name inside the stack. A Compose file's `ports:` open nothing, on a node's own address or anywhere: they are what the
+file asks for, which the UI offers to expose on the pool when it deploys the stack (two stacks may both ask for 80).
+Only the managers' own stack, the UI, has its port answered on every node, for the managers to forward 7443 to. The
+address and port follow the workloads wherever they run.
+
+A stack may be given the nodes it runs on (`stack deploy app app.yml --on w3,w4`, by id or hostname, or the UI): its
+workloads are placed only there, moved there when the list changes, and wait (unplaced) while none of them can take
+them. None given, it runs on any healthy node.
 
 A stack is a Compose file. Its services become workloads, one per replica, with the id `<stack>.<service>.<n>`; the
 manager that takes the deploy places each new one on a healthy node with Docker that meets its constraints, has its
-room for its reservation (and its host ports free, only for a workload off the overlay: on it, the routing mesh
-answers a published port on every node, so replicas may share one), preferring nodes that meet its preferences, then spread over a label,
+room for its reservation (and, off the overlay, the managers' own stack's host port free), on the nodes chosen for the
+stack if any, preferring nodes that meet its preferences, then spread over a label,
 then away from its other replicas, then the least loaded. From then on the manager each worker is connected to
 compares what the worker reports in every heartbeat with what the state says and sends a command for the difference:
 run (a missing or exited container, or one made for an older spec), stop (a stopped stack), remove (a stack

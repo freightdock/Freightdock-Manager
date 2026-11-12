@@ -50,8 +50,19 @@ pub enum Entry {
     CommandCreated { command: CommandRecord },
     /// A stack made or changed from its Compose file. `placements` names the node of each workload it adds (and of
     /// each it has with no node); a workload already placed stays where it is. Refused, with nothing changed, when a
-    /// new workload has no placement or its node is not enrolled.
-    StackDeployed { name: String, compose: String, services: BTreeMap<String, ServiceSpec>, placements: BTreeMap<String, String>, at: Ms },
+    /// new workload has no placement or its node is not enrolled. `nodes` are the nodes chosen for it (none: any);
+    /// `exposures`, when given, replace its exposures on the pool, checked as `StackExposed` checks them.
+    StackDeployed {
+        name: String,
+        compose: String,
+        services: BTreeMap<String, ServiceSpec>,
+        placements: BTreeMap<String, String>,
+        at: Ms,
+        #[serde(default)]
+        nodes: Vec<String>,
+        #[serde(default)]
+        exposures: Option<Vec<Exposure>>,
+    },
     /// The stack's workloads are to run (`stopped: false`) or not.
     StackStopped { name: String, stopped: bool, at: Ms },
     /// The stack and its workloads are gone from the state; the workers' reconcile removes their containers.
@@ -455,6 +466,9 @@ pub struct Stack {
     /// What it exposes on the pool's floating addresses (G10.5), chosen outside its Compose file.
     #[serde(default)]
     pub exposures: Vec<Exposure>,
+    /// The nodes chosen for it to run on; none: any.
+    #[serde(default)]
+    pub nodes: Vec<String>,
 }
 
 /// One of a stack's services reached from outside the cluster on a pool address (G10.5): `address:port` goes to the
@@ -760,6 +774,24 @@ impl ClusterState {
         self.commands.values().filter(|c| c.status == CommandStatus::Pending && now > c.deadline + grace).map(|c| c.id.clone()).collect()
     }
 
+    /// Whether `exposures` may be stack `name`'s (with `services`): each to one of its services, over tcp or udp, on a
+    /// pool address, at a port that is not the host's own, and no address, port and protocol another stack's or twice.
+    fn check_exposures(&self, name: &str, services: &BTreeMap<String, ServiceSpec>, exposures: &[Exposure]) -> Result<(), Rejected> {
+        let mut taken: std::collections::BTreeSet<(&str, u16, &str)> = self.stacks.values().filter(|o| o.name != name).flat_map(|o| &o.exposures).map(|e| (e.address.as_str(), e.port, e.protocol.as_str())).collect();
+        for e in exposures {
+            if !services.contains_key(&e.service) || !matches!(e.protocol.as_str(), "tcp" | "udp") || e.container_port == 0 || e.port == 0 || freightdock_proto::RESERVED_PORTS.contains(&u32::from(e.port)) {
+                return Err(Rejected::BadExposure);
+            }
+            if !self.floating.contains_key(&e.address) {
+                return Err(Rejected::FloatingUnknown);
+            }
+            if !taken.insert((e.address.as_str(), e.port, e.protocol.as_str())) {
+                return Err(Rejected::ExposureTaken);
+            }
+        }
+        Ok(())
+    }
+
     /// The workloads a stack of these services has: (id, service, slot), in order.
     pub fn wanted(stack: &str, services: &BTreeMap<String, ServiceSpec>) -> Vec<(String, String, u32)> {
         services.iter().flat_map(|(svc, spec)| (1..=spec.replicas).map(move |slot| (workload_id(stack, svc, slot), svc.clone(), slot))).collect()
@@ -954,9 +986,15 @@ impl ClusterState {
                 }
                 self.commands.insert(command.id.clone(), command.clone());
             }
-            Entry::StackDeployed { name, compose, services, placements, at } => {
+            Entry::StackDeployed { name, compose, services, placements, at, nodes, exposures: given } => {
                 if !valid_stack_name(name) || !services.keys().all(|s| valid_service_name(s)) {
                     return Err(Rejected::BadName);
+                }
+                if nodes.iter().any(|n| !self.nodes.contains_key(n)) {
+                    return Err(Rejected::NodeUnknown);
+                }
+                if let Some(list) = given {
+                    self.check_exposures(name, services, list)?;
                 }
                 let wanted = Self::wanted(name, services);
                 // Checked whole first, so a refusal changes nothing.
@@ -1005,24 +1043,16 @@ impl ClusterState {
                     }
                 }
                 let created_at = self.stacks.get(name).map_or(*at, |s| s.created_at);
-                // An exposure goes with its service.
-                let exposures = self.stacks.get(name).map(|s| s.exposures.iter().filter(|e| services.contains_key(&e.service)).cloned().collect()).unwrap_or_default();
-                self.stacks.insert(name.clone(), Stack { name: name.clone(), compose: compose.clone(), services: services.clone(), stopped: false, created_at, updated_at: *at, net, exposures });
+                // An exposure goes with its service, unless the deploy gave the list.
+                let exposures = match given {
+                    Some(list) => list.clone(),
+                    None => self.stacks.get(name).map(|s| s.exposures.iter().filter(|e| services.contains_key(&e.service)).cloned().collect()).unwrap_or_default(),
+                };
+                self.stacks.insert(name.clone(), Stack { name: name.clone(), compose: compose.clone(), services: services.clone(), stopped: false, created_at, updated_at: *at, net, exposures, nodes: nodes.clone() });
             }
             Entry::StackExposed { name, exposures, at } => {
                 let st = self.stacks.get(name).ok_or(Rejected::StackUnknown)?;
-                let mut taken: std::collections::BTreeSet<(&str, u16, &str)> = self.stacks.values().filter(|o| o.name != *name).flat_map(|o| &o.exposures).map(|e| (e.address.as_str(), e.port, e.protocol.as_str())).collect();
-                for e in exposures {
-                    if !st.services.contains_key(&e.service) || !matches!(e.protocol.as_str(), "tcp" | "udp") || e.container_port == 0 || e.port == 0 || freightdock_proto::RESERVED_PORTS.contains(&u32::from(e.port)) {
-                        return Err(Rejected::BadExposure);
-                    }
-                    if !self.floating.contains_key(&e.address) {
-                        return Err(Rejected::FloatingUnknown);
-                    }
-                    if !taken.insert((e.address.as_str(), e.port, e.protocol.as_str())) {
-                        return Err(Rejected::ExposureTaken);
-                    }
-                }
+                self.check_exposures(name, &st.services, exposures)?;
                 let st = self.stacks.get_mut(name).expect("checked");
                 st.exposures = exposures.clone();
                 st.updated_at = *at;
@@ -1330,6 +1360,8 @@ pub(crate) mod tests {
             services: services.iter().map(|(k, v)| (k.to_string(), v.clone())).collect(),
             placements: placements.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
             at: 50,
+            nodes: vec![],
+            exposures: None,
         }
     }
 
@@ -1505,6 +1537,32 @@ pub(crate) mod tests {
         next(&mut s, &Entry::StackRemoved { name: "b".into(), at: 4 }).unwrap();
         next(&mut s, &set("a", vec![])).unwrap();
         next(&mut s, &Entry::FloatingRemoved { address: "192.0.2.11".into(), at: 5 }).unwrap();
+    }
+
+    #[test]
+    fn a_stack_keeps_the_nodes_chosen_for_it_and_takes_its_exposures_with_its_deploy() {
+        let mut s = with_nodes(&["n1", "n2"]);
+        next(&mut s, &Entry::FloatingAdded { address: "192.0.2.10".into(), at: 1 }).unwrap();
+        let x = |port: u16| Exposure { service: "web".into(), container_port: 80, protocol: "tcp".into(), address: "192.0.2.10".into(), port };
+        let with = |nodes: &[&str], exposures: Option<Vec<Exposure>>| match deploy("a", &[("web", spec("nginx", 1))], &[("a.web.1", "n2")]) {
+            Entry::StackDeployed { name, compose, services, placements, at, .. } => Entry::StackDeployed { name, compose, services, placements, at, nodes: nodes.iter().map(|n| n.to_string()).collect(), exposures },
+            _ => unreachable!(),
+        };
+        next(&mut s, &with(&["n2"], Some(vec![x(80)]))).unwrap();
+        assert_eq!((s.stacks["a"].nodes.clone(), s.stacks["a"].exposures.clone()), (vec!["n2".to_string()], vec![x(80)]));
+        next(&mut s, &with(&[], None)).unwrap();
+        assert_eq!((s.stacks["a"].nodes.len(), s.stacks["a"].exposures.clone()), (0, vec![x(80)]), "none chosen: any node; no list: the exposures kept");
+        assert_eq!(next(&mut s, &with(&["n9"], None)), Err(Rejected::NodeUnknown));
+        assert_eq!(next(&mut s, &with(&[], Some(vec![Exposure { address: "192.0.2.99".into(), ..x(80) }]))), Err(Rejected::FloatingUnknown), "checked as a StackExposed is");
+        assert_eq!(s.stacks["a"].exposures, vec![x(80)], "and a refusal changes nothing");
+        next(&mut s, &deploy("b", &[("web", spec("nginx", 1))], &[("b.web.1", "n1")])).unwrap();
+        let b = match with(&[], Some(vec![Exposure { ..x(80) }])) {
+            Entry::StackDeployed { services, at, nodes, exposures, .. } => Entry::StackDeployed { name: "b".into(), compose: String::new(), services, placements: Default::default(), at, nodes, exposures },
+            _ => unreachable!(),
+        };
+        assert_eq!(next(&mut s, &b), Err(Rejected::ExposureTaken), "80 on .10 is a's");
+        next(&mut s, &with(&[], Some(vec![]))).unwrap();
+        assert!(s.stacks["a"].exposures.is_empty(), "an empty list takes them all away");
     }
 
     #[test]
