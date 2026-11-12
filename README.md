@@ -90,6 +90,7 @@ All under `http://127.0.0.1:7451`, with `Authorization: Bearer <data>/admin.toke
 | `POST /v1/join-tokens` | `{"ttl_s": 86400}` gives `{"token": "FDCT1-..."}`, for a worker |
 | `POST /v1/manager-tokens` | `{"ttl_s": 3600}` gives `{"token": "FDMT1-..."}`, for a manager |
 | `GET /v1/events?after=&node=` | recent node events |
+| `GET /v1/recoveries?stack=` | the recovery history, newest first |
 | `POST /v1/nodes/{id}/commands` | `{"op": "ping"}` and the other ops; answers the command (202) |
 | `GET /v1/commands?node=`, `GET /v1/commands/{id}` | commands and their status |
 | `GET /v1/stacks`, `GET /v1/stacks/{name}` | stacks with each workload's node, status, container and last command; one with its Compose file |
@@ -137,6 +138,15 @@ file; the server's certificate is pinned by its SHA-256 fingerprint.
 | `FREIGHTDOCK_FENCE_PROXMOX_URL` | none | e.g. `https://pve:8006` |
 | `FREIGHTDOCK_FENCE_PROXMOX_TOKEN_FILE` | none | A file holding `user@realm!name=secret` |
 | `FREIGHTDOCK_FENCE_PROXMOX_FINGERPRINT` | none | The server certificate's SHA-256, `AA:BB:...` |
+| `FREIGHTDOCK_RECOVERY_DELAY_S` | `0` | How long a node stays fenced before its workloads move |
+
+### Recovery
+
+Once a node is fenced (and `FREIGHTDOCK_RECOVERY_DELAY_S` has passed), or comes back fenced, the leader places its
+stateless workloads on other nodes as a deploy would. A workload with volumes waits for its node (its data is
+there), and so does a pinned one (`x-freightdock: {ha: false}`); one with nowhere to go is tried again each second.
+When the node runs again, the workloads that moved are removed from it. `freightdock-manager recoveries [stack]`
+shows what moved where and what stayed and why.
 
 ## Build
 

@@ -9,6 +9,7 @@ pub mod grpc;
 pub mod peer;
 pub mod proxmox;
 pub mod raft;
+pub mod recovery;
 pub mod sessions;
 pub mod stacks;
 pub mod state;
@@ -359,6 +360,7 @@ pub async fn housekeeping(m: Arc<Manager>) {
         m.expire_overdue().await;
         m.fence_local().await;
         m.fence_round().await;
+        m.recover_round().await;
         m.reconcile().await;
         m.local_worker_token().await;
         let health: Vec<_> = m.store.read(|s| s.nodes.keys().cloned().collect::<Vec<_>>()).into_iter().map(|id| {

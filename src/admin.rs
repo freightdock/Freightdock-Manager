@@ -61,6 +61,7 @@ pub fn router(m: Arc<Manager>) -> Router {
         .route("/v1/manager-tokens", post(manager_token))
         .route("/v1/commands", get(commands))
         .route("/v1/events", get(events))
+        .route("/v1/recoveries", get(recoveries))
         .route("/v1/commands/{id}", get(command))
         .route("/v1/stacks", get(stacks).post(deploy_stack))
         .route("/v1/stacks/{name}", get(stack).delete(remove_stack))
@@ -243,11 +244,29 @@ async fn events(State(m): State<Arc<Manager>>, h: HeaderMap, Query(q): Query<Eve
     Ok(Json(v.into_iter().filter(|e| q.node.as_ref().is_none_or(|n| e.node_id.as_ref() == Some(n))).collect()))
 }
 
-/// The latest command per workload, for its status.
+/// The recovery history (G7), newest first; `?stack=` for one stack's.
+async fn recoveries(State(m): State<Arc<Manager>>, h: HeaderMap, Query(q): Query<std::collections::HashMap<String, String>>) -> R<Json<Value>> {
+    authed(&m, &h)?;
+    let prefix = q.get("stack").map(|s| format!("{s}."));
+    Ok(Json(m.store.read(|s| {
+        let host = |n: &Option<String>| n.as_ref().and_then(|n| s.nodes.get(n)).map(|n| n.hostname.clone());
+        json!(s
+            .recoveries
+            .iter()
+            .rev()
+            .filter(|r| prefix.as_ref().is_none_or(|p| r.workload_id.starts_with(p.as_str())))
+            .map(|r| json!({ "at": r.at, "workload_id": r.workload_id, "from": r.from, "from_hostname": host(&r.from), "to": r.to, "to_hostname": host(&r.to), "reason": r.reason }))
+            .collect::<Vec<_>>())
+    })))
+}
+
+/// The latest command per workload on the node it is placed on now, for its status (one that cleaned up after it
+/// on a node it moved off is not its status).
 fn last_commands(s: &crate::state::ClusterState) -> std::collections::HashMap<&str, &CommandRecord> {
     let mut last: std::collections::HashMap<&str, &CommandRecord> = std::collections::HashMap::new();
     for c in s.commands.values() {
         if let Some(w) = c.op.workload_id()
+            && s.workloads.get(w).is_some_and(|wl| wl.node_id.as_deref() == Some(c.node_id.as_str()))
             && last.get(w).is_none_or(|l| l.created_at <= c.created_at)
         {
             last.insert(w, c);
@@ -257,7 +276,8 @@ fn last_commands(s: &crate::state::ClusterState) -> std::collections::HashMap<&s
 }
 
 /// One word for where a workload is: running or stopped as wanted; pending while a command is open or one is due;
-/// failed when its last command failed; unplaced with no node; unknown when its node has not reported.
+/// failed when its last command failed; unplaced with no node; unknown when its node has not reported; fenced (set
+/// by the caller) while its node is in fencing.
 fn workload_status(run: bool, placed: bool, actual: Option<&freightdock_proto::v1::WorkloadState>, generation: u64, reported: bool, last: Option<&CommandRecord>) -> &'static str {
     if !placed {
         return "unplaced";
@@ -289,6 +309,7 @@ fn stack_json(m: &Manager, s: &crate::state::ClusterState, st: &crate::state::St
             let report = w.node_id.as_deref().map(|n| reports.entry(n).or_insert_with(|| m.sessions.reported(n)).clone()).unwrap_or(None);
             let actual = report.as_ref().and_then(|r| r.iter().find(|a| a.workload_id == w.id).cloned());
             let lc = last.get(w.id.as_str()).copied();
+            let fenced = w.node_id.as_ref().and_then(|n| s.nodes.get(n)).is_some_and(|n| n.fencing.state != crate::state::FenceState::None);
             json!({
                 "id": w.id,
                 "service": w.service,
@@ -297,7 +318,8 @@ fn stack_json(m: &Manager, s: &crate::state::ClusterState, st: &crate::state::St
                 "hostname": w.node_id.as_ref().and_then(|n| s.nodes.get(n)).map(|n| n.hostname.clone()),
                 "generation": w.generation,
                 "desired": if run { "running" } else { "stopped" },
-                "status": workload_status(run, w.node_id.is_some(), actual.as_ref(), w.generation, report.is_some(), lc),
+                "status": if fenced { "fenced" } else { workload_status(run, w.node_id.is_some(), actual.as_ref(), w.generation, report.is_some(), lc) },
+                "recovery": s.recovery_kind(w),
                 "actual": actual.map(|a| json!({ "state": a.state, "generation": a.generation, "exit_code": a.exit_code, "container_id": a.container_id, "image": a.image })),
                 "last_command": lc.map(|c| json!({ "id": c.id, "op": c.op, "status": c.status, "message": c.message, "at": c.updated_at })),
             })
@@ -337,7 +359,7 @@ async fn deploy_stack(State(m): State<Arc<Manager>>, h: HeaderMap, Json(b): Json
     }
     let parsed = crate::compose::parse(&b.compose).map_err(|e| ApiError(StatusCode::BAD_REQUEST, e))?;
     let placements = m.store.read(|s| {
-        let eligible: Vec<String> = s.nodes.values().filter(|n| n.report.as_ref().is_some_and(|r| r.docker) && m.sessions.liveness(&n.id).health == crate::sessions::Health::Healthy).map(|n| n.id.clone()).collect();
+        let eligible = m.eligible(s);
         crate::stacks::place(s, &name, &parsed.services, &eligible)
     });
     let placements = placements.map_err(|e| ApiError(StatusCode::CONFLICT, e))?;
@@ -396,6 +418,16 @@ fn raft_members(members: Vec<(u64, String)>, voters: &[u64], leader: Option<u64>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_workload_s_last_command_is_the_latest_on_the_node_it_is_on_now() {
+        let mut s = crate::state::tests::cluster();
+        s.workloads.insert("a.web.1".into(), crate::state::Workload { id: "a.web.1".into(), stack: "a".into(), service: "web".into(), slot: 1, node_id: Some("new".into()), spec: crate::state::tests::spec("nginx", 1), generation: 1 });
+        let on = |id: &str, node: &str, at| CommandRecord { op: crate::state::Op::RemoveContainer { workload_id: "a.web.1".into() }, created_at: at, ..crate::state::tests::command(id, node) };
+        s.commands.insert("run".into(), on("run", "new", 5));
+        s.commands.insert("cleanup".into(), on("cleanup", "old", 9));
+        assert_eq!(last_commands(&s)["a.web.1"].id, "run", "the clean-up on the node it left is not its status");
+    }
 
     fn cmd(status: CommandStatus) -> CommandRecord {
         CommandRecord { status, ..crate::state::tests::command("c", "n") }

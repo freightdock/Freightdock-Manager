@@ -41,17 +41,19 @@ pub struct FenceConfig {
     pub enabled: bool,
     /// The Proxmox provider's settings, for nodes labelled `fence.provider=proxmox`.
     pub proxmox: Option<crate::proxmox::ProxmoxConfig>,
+    /// How long a node stays fenced before its stateless workloads are started elsewhere (G7).
+    pub recovery_delay_s: u32,
 }
 
 impl Default for FenceConfig {
     fn default() -> Self {
-        FenceConfig { stop_s: 30, storage_s: 15, reboot_s: 15, auto_authorize: true, enabled: true, proxmox: None }
+        FenceConfig { stop_s: 30, storage_s: 15, reboot_s: 15, auto_authorize: true, enabled: true, proxmox: None, recovery_delay_s: 0 }
     }
 }
 
 impl FenceConfig {
     /// `FREIGHTDOCK_FENCE` (on, off), `FREIGHTDOCK_FENCE_STOP_S`, `_STORAGE_S`, `_REBOOT_S` and
-    /// `FREIGHTDOCK_FENCE_AUTO_AUTHORIZE` (on, off).
+    /// `FREIGHTDOCK_FENCE_AUTO_AUTHORIZE` (on, off), the Proxmox settings and `FREIGHTDOCK_RECOVERY_DELAY_S` (0 or more).
     pub fn from_env() -> Result<Self> {
         Self::from(|k| std::env::var(k).ok())
     }
@@ -79,6 +81,10 @@ impl FenceConfig {
             auto_authorize: onoff("FREIGHTDOCK_FENCE_AUTO_AUTHORIZE", d.auto_authorize)?,
             enabled: onoff("FREIGHTDOCK_FENCE", d.enabled)?,
             proxmox: crate::proxmox::ProxmoxConfig::from(&get)?,
+            recovery_delay_s: match get("FREIGHTDOCK_RECOVERY_DELAY_S") {
+                Some(v) => v.trim().parse::<u32>().map_err(|_| anyhow::anyhow!("FREIGHTDOCK_RECOVERY_DELAY_S is a number of seconds"))?,
+                None => d.recovery_delay_s,
+            },
         })
     }
 

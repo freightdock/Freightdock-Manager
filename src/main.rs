@@ -17,6 +17,7 @@ freightdock-manager stack deploy <name> <compose file>   make or change a stack 
 freightdock-manager stack ls                list the stacks
 freightdock-manager stack ps <name>         a stack's workloads: where they run and how they are
 freightdock-manager stack start|stop|restart|rm <name>
+freightdock-manager recoveries [stack]      workloads moved off fenced nodes, or left there and why
 
 A manager joins a cluster on its first start with FREIGHTDOCK_MANAGER_JOIN=<a manager's host:port> and
 FREIGHTDOCK_MANAGER_JOIN_TOKEN=<a manager-token>.
@@ -90,6 +91,25 @@ async fn main() -> Result<()> {
                 after.get_or_insert(0);
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             }
+        }
+        Some("recoveries") => {
+            let path = match args.get(1) {
+                Some(st) => format!("/v1/recoveries?stack={st}"),
+                None => "/v1/recoveries".into(),
+            };
+            let v = call(&config, reqwest::Method::GET, &path, None).await?;
+            let host = |h: &Value, id: &Value| match (h.as_str(), id.as_str()) {
+                (Some(h), Some(n)) => format!("{h}/{}", &n[..n.len().min(8)]),
+                (_, Some(n)) => n[..n.len().min(8)].to_string(),
+                _ => "-".into(),
+            };
+            for r in v.as_array().into_iter().flatten().rev() {
+                let at = r["at"].as_i64().unwrap_or(0);
+                let t = time::OffsetDateTime::from_unix_timestamp_nanos(at as i128 * 1_000_000).map(|t| format!("{} {:02}:{:02}:{:02}", t.date(), t.hour(), t.minute(), t.second())).unwrap_or_default();
+                let what = if r["to"].is_null() { format!("stays: {}", r["reason"].as_str().unwrap_or("")) } else { format!("to {}", host(&r["to_hostname"], &r["to"])) };
+                println!("{t} UTC  {:<32} from {:<17} {what}", r["workload_id"].as_str().unwrap_or(""), host(&r["from_hostname"], &r["from"]));
+            }
+            Ok(())
         }
         Some("command") => {
             let (Some(node), Some(op)) = (args.get(1), args.get(2)) else { bail!("{USAGE}") };

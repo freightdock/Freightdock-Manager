@@ -17,8 +17,8 @@ Status marks: **[x]** done, **[~]** in progress, **[ ]** not started.
 | 4a | G8 first slice: a Cluster page in Freightdock | Pulled forward (2026-11-11) so every goal from here is seen in the browser as it is built | G3 | **done** |
 | 5 | G5 Scheduling and labels | Workloads need placing once there is more than one worker | G4 | **done** |
 | 6 | G6 Fencing | A worker must be able to fence itself before anything is recovered elsewhere (plan rule 10, 11) | G4 | done |
-| 7 | G7 Failure detection and stateless recovery | Success criteria 4 and 5; safe only with G6 | G5, G6 | **next** |
-| 8 | G8 UI: Freightdock as the cluster's UI | Usable by people, not just the CLI; can start in parallel once G4's API settles | G4 | not started |
+| 7 | G7 Failure detection and stateless recovery | Success criteria 4 and 5; safe only with G6 | G5, G6 | done |
+| 8 | G8 UI: Freightdock as the cluster's UI | Usable by people, not just the CLI; can start in parallel once G4's API settles | G4 | **next** (first slice done) |
 | 9 | G9 Internal networking (Network repo) | Stable workload IPs across workers; postponed by the plan's first release | G7 | not started |
 | 10 | G10 External networking | Exposing services without per-deploy setup | G9 | not started |
 | 11 | G11 Shared storage | Moving stateful workloads safely; needs fencing and storage leases | G6, G7 | not started |
@@ -158,10 +158,13 @@ Ranked inside the goal:
 
 ## G7: Failure detection and stateless recovery
 
-1. [ ] Recovery scheduling for stateless workloads, after a recovery delay and only once the old node is fenced or
-       the workload type allows it.
-2. [ ] Duplicate execution prevention (a returning node is told to remove a workload that moved).
-3. [ ] Recovery event history.
+1. [x] Recovery scheduling for stateless workloads, after a recovery delay (`FREIGHTDOCK_RECOVERY_DELAY_S`, from
+       fenced) and only once the old node is fenced; placed as a deploy would. Kinds (plan 5.2): stateless moves,
+       volumes (local data) and `ha: false` (pinned) wait for their node. The state refuses a move off a node that is
+       not fenced, or of a workload that may not move. A removed node's workloads get a node too.
+2. [x] Duplicate execution prevention: the returning node's reconcile removes the containers of workloads that
+       moved (the state no longer places them there), and runs nothing before it is authorized.
+3. [x] Recovery history in the replicated state (latest 200): `GET /v1/recoveries`, CLI `recoveries`, the UI.
 
 ## G8: UI (Freightdock as the cluster's UI only)
 

@@ -52,6 +52,11 @@ pub enum Entry {
     /// The stack and its workloads are gone from the state; the workers' reconcile removes their containers.
     StackRemoved { name: String, at: Ms },
     CommandStatus { command_id: String, status: CommandStatus, message: String, result_json: String, at: Ms },
+    /// Workloads moved off `from` (a fenced node) or, with `from: None`, given a node after theirs was removed (G7).
+    /// `moves` is workload to new node; `left` is workload to why it stays, for the history. Refused, with nothing
+    /// changed, unless `from` is fenced (or back, fenced, awaiting authorization), every moved workload is still on
+    /// `from` and may be moved, and every new node is enrolled.
+    WorkloadsRecovered { from: Option<String>, moves: BTreeMap<String, String>, left: BTreeMap<String, String>, at: Ms },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -75,6 +80,8 @@ pub enum Rejected {
     FenceStep,
     /// A stack or service name that is not 1 to 40 of a-z 0-9 and - (services may have _ too), starting alphanumeric.
     BadName,
+    /// A recovery for a workload that is no longer where it said, or may not move by itself (pinned or local data).
+    NotRecoverable,
 }
 
 impl std::fmt::Display for Rejected {
@@ -93,6 +100,7 @@ impl std::fmt::Display for Rejected {
             Rejected::Unplaced => "a workload of the stack has no node to run on",
             Rejected::WorkloadBusy => "the workload has a command open already",
             Rejected::FenceStep => "the node's fencing is not at a point where that step can be taken",
+            Rejected::NotRecoverable => "the workload is not on that node any more, or may not be moved by itself",
             Rejected::BadName => "a stack or service name must be 1 to 40 of a-z, 0-9 and - (services may have _), starting with a letter or digit",
         })
     }
@@ -130,6 +138,9 @@ pub struct Node {
     /// Where the node is in fencing (G6). Separate from health: unreachable does not mean fenced (plan 7.2).
     #[serde(default)]
     pub fencing: Fencing,
+    /// Its workloads were recovered for the current fencing (G7); cleared when fencing starts again or ends.
+    #[serde(default)]
+    pub recovered: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -360,7 +371,7 @@ pub struct Placement {
 impl ServiceSpec {
     /// The spec as one workload's container runs it: the replica count, the placement and HA are the stack's
     /// business, so changing them makes no container again.
-    fn for_workload(&self) -> ServiceSpec {
+    pub fn for_workload(&self) -> ServiceSpec {
         ServiceSpec { replicas: 1, placement: Placement::default(), ha: true, ..self.clone() }
     }
 }
@@ -451,6 +462,36 @@ pub struct ClusterState {
     pub stacks: BTreeMap<String, Stack>,
     #[serde(default)]
     pub workloads: BTreeMap<String, Workload>,
+    /// The latest recoveries, oldest first, at most `RECOVERY_HISTORY` (G7).
+    #[serde(default)]
+    pub recoveries: std::collections::VecDeque<Recovery>,
+}
+
+/// How many recoveries the state keeps.
+pub const RECOVERY_HISTORY: usize = 200;
+
+/// One workload's recovery, or why it was left where it was.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Recovery {
+    pub at: Ms,
+    pub workload_id: String,
+    /// None: its node had been removed.
+    pub from: Option<String>,
+    /// None: it was left (see `reason`).
+    pub to: Option<String>,
+    pub reason: String,
+}
+
+/// What may happen to a workload when its node fails (plan 5.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryKind {
+    /// No data of its own: started again elsewhere once its node is fenced.
+    Stateless,
+    /// Has volumes, which live on its node: it waits for the node (G11 brings shared storage).
+    LocalData,
+    /// `x-freightdock: {ha: false}`: stays until someone moves it.
+    Pinned,
 }
 
 impl ClusterState {
@@ -484,6 +525,18 @@ impl ClusterState {
     }
 
     /// Whether the workload is to run: its stack is not stopped.
+    /// The workload's recovery kind, from its stack's service (a workload's own spec has no `ha`).
+    pub fn recovery_kind(&self, w: &Workload) -> RecoveryKind {
+        let sp = self.stacks.get(&w.stack).and_then(|s| s.services.get(&w.service));
+        if sp.is_some_and(|sp| !sp.ha) {
+            RecoveryKind::Pinned
+        } else if !w.spec.volumes.is_empty() {
+            RecoveryKind::LocalData
+        } else {
+            RecoveryKind::Stateless
+        }
+    }
+
     pub fn should_run(&self, w: &Workload) -> bool {
         self.stacks.get(&w.stack).is_some_and(|s| !s.stopped)
     }
@@ -540,7 +593,7 @@ impl ClusterState {
                     return Err(Rejected::NodeExists);
                 }
                 self.join_tokens.get_mut(secret_hash).expect("checked").spent_by = Some(node_id.clone());
-                self.nodes.insert(node_id.clone(), Node { id: node_id.clone(), hostname: hostname.clone(), cert_sha256: cert_sha256.clone(), enrolled_at: *at, report: None, reported_at: None, labels: BTreeMap::new(), fencing: Fencing::default() });
+                self.nodes.insert(node_id.clone(), Node { id: node_id.clone(), hostname: hostname.clone(), cert_sha256: cert_sha256.clone(), enrolled_at: *at, report: None, reported_at: None, labels: BTreeMap::new(), fencing: Fencing::default(), recovered: false });
             }
             Entry::NodeReported { node_id, report, at } => {
                 let n = self.nodes.get_mut(node_id).ok_or(Rejected::NodeUnknown)?;
@@ -558,6 +611,9 @@ impl ClusterState {
                     return Err(Rejected::FenceStep);
                 }
                 n.fencing = Fencing { state: *state, since: *at, provider: provider.clone(), message: message.clone() };
+                if matches!(state, FenceState::None | FenceState::Requested) {
+                    n.recovered = false;
+                }
             }
             Entry::NodeAuthorized { node_id, by, at } => {
                 let n = self.nodes.get_mut(node_id).ok_or(Rejected::NodeUnknown)?;
@@ -635,6 +691,41 @@ impl ClusterState {
                 let s = self.stacks.get_mut(name).ok_or(Rejected::StackUnknown)?;
                 s.stopped = *stopped;
                 s.updated_at = *at;
+            }
+            Entry::WorkloadsRecovered { from, moves, left, at } => {
+                if let Some(f) = from {
+                    let n = self.nodes.get(f).ok_or(Rejected::NodeUnknown)?;
+                    if !matches!(n.fencing.state, FenceState::Fenced | FenceState::AwaitingAuthorization) {
+                        return Err(Rejected::FenceStep);
+                    }
+                }
+                for (id, to) in moves {
+                    let w = self.workloads.get(id).ok_or(Rejected::NotRecoverable)?;
+                    if w.node_id != *from || (from.is_some() && self.recovery_kind(w) != RecoveryKind::Stateless) {
+                        return Err(Rejected::NotRecoverable);
+                    }
+                    if !self.nodes.contains_key(to) || Some(to) == from.as_ref() {
+                        return Err(Rejected::NodeUnknown);
+                    }
+                }
+                for (id, to) in moves {
+                    self.workloads.get_mut(id).expect("checked").node_id = Some(to.clone());
+                    // A command still open for it on the old node is done with.
+                    for c in self.commands.values_mut().filter(|c| !c.status.is_terminal() && c.op.workload_id() == Some(id.as_str())) {
+                        c.status = CommandStatus::Rejected;
+                        c.message = "the workload moved".into();
+                    }
+                    self.recoveries.push_back(Recovery { at: *at, workload_id: id.clone(), from: from.clone(), to: Some(to.clone()), reason: String::new() });
+                }
+                for (id, why) in left {
+                    self.recoveries.push_back(Recovery { at: *at, workload_id: id.clone(), from: from.clone(), to: None, reason: why.clone() });
+                }
+                while self.recoveries.len() > RECOVERY_HISTORY {
+                    self.recoveries.pop_front();
+                }
+                if let Some(n) = from.as_ref().and_then(|f| self.nodes.get_mut(f)) {
+                    n.recovered = true;
+                }
             }
             Entry::StackRemoved { name, .. } => {
                 self.stacks.remove(name).ok_or(Rejected::StackUnknown)?;
@@ -921,6 +1012,61 @@ pub(crate) mod tests {
 
     fn fence(s: &mut ClusterState, to: FenceState) -> Result<(), Rejected> {
         next(s, &Entry::NodeFencing { node_id: "n1".into(), state: to, provider: "self".into(), message: String::new(), at: 9 })
+    }
+
+    fn recovered(from: Option<&str>, moves: &[(&str, &str)], left: &[(&str, &str)]) -> Entry {
+        let m = |l: &[(&str, &str)]| l.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        Entry::WorkloadsRecovered { from: from.map(str::to_string), moves: m(moves), left: m(left), at: 77 }
+    }
+
+    #[test]
+    fn workloads_move_off_a_node_only_once_it_is_fenced_and_only_stateless_ones() {
+        use FenceState::*;
+        let mut s = with_nodes(&["n1", "n2"]);
+        let vol = ServiceSpec { volumes: vec!["data:/data".into()], ..spec("redis", 1) };
+        let pinned = ServiceSpec { ha: false, ..spec("cron", 1) };
+        next(&mut s, &deploy("app", &[("web", spec("nginx", 1)), ("db", vol), ("cron", pinned)], &[("app.web.1", "n1"), ("app.db.1", "n1"), ("app.cron.1", "n1")])).unwrap();
+        assert_eq!(s.recovery_kind(&s.workloads["app.web.1"]), RecoveryKind::Stateless);
+        assert_eq!(s.recovery_kind(&s.workloads["app.db.1"]), RecoveryKind::LocalData);
+        assert_eq!(s.recovery_kind(&s.workloads["app.cron.1"]), RecoveryKind::Pinned);
+        let c = CommandRecord { op: Op::RunContainer { workload_id: "app.web.1".into(), image: "nginx".into(), name: String::new(), command: vec![], env: Default::default(), labels: Default::default(), generation: 0, ports: vec![], volumes: vec![], limits: Default::default() }, ..command("c", "n1") };
+        next(&mut s, &Entry::CommandCreated { command: c }).unwrap();
+
+        let web = recovered(Some("n1"), &[("app.web.1", "n2")], &[("app.db.1", "keeps local data")]);
+        assert_eq!(next(&mut s, &web), Err(Rejected::FenceStep), "n1 is not fenced");
+        for st in [Requested, InProgress, Fenced] {
+            fence(&mut s, st).unwrap();
+        }
+        assert_eq!(next(&mut s, &recovered(Some("n1"), &[("app.db.1", "n2")], &[])), Err(Rejected::NotRecoverable), "local data stays");
+        assert_eq!(next(&mut s, &recovered(Some("n1"), &[("app.cron.1", "n2")], &[])), Err(Rejected::NotRecoverable), "pinned stays");
+        assert_eq!(next(&mut s, &recovered(Some("n1"), &[("app.web.1", "n9")], &[])), Err(Rejected::NodeUnknown));
+        next(&mut s, &web).unwrap();
+        assert_eq!(s.workloads["app.web.1"].node_id.as_deref(), Some("n2"));
+        assert_eq!(s.commands["c"].status, CommandStatus::Rejected, "its open command on n1 is done with");
+        assert!(s.nodes["n1"].recovered);
+        assert_eq!(s.recoveries.len(), 2);
+        assert_eq!(s.recoveries[1].to, Option::None);
+        assert_eq!(next(&mut s, &web), Err(Rejected::NotRecoverable), "not on n1 any more");
+    }
+
+    #[test]
+    fn a_new_fencing_clears_recovered_and_a_removed_node_s_workloads_get_a_node() {
+        use FenceState::*;
+        let mut s = with_nodes(&["n1", "n2"]);
+        next(&mut s, &deploy("app", &[("web", spec("nginx", 1))], &[("app.web.1", "n2")])).unwrap();
+        for st in [Requested, InProgress, Fenced] {
+            fence(&mut s, st).unwrap();
+        }
+        next(&mut s, &recovered(Some("n1"), &[], &[])).unwrap();
+        assert!(s.nodes["n1"].recovered);
+        fence(&mut s, AwaitingAuthorization).unwrap();
+        next(&mut s, &Entry::NodeAuthorized { node_id: "n1".into(), by: "x".into(), at: 1 }).unwrap();
+        fence(&mut s, None).unwrap();
+        assert!(!s.nodes["n1"].recovered);
+        next(&mut s, &Entry::NodeRemoved { node_id: "n2".into(), at: 1 }).unwrap();
+        assert_eq!(next(&mut s, &recovered(Some("n1"), &[("app.web.1", "n1")], &[])), Err(Rejected::FenceStep));
+        next(&mut s, &recovered(Option::None, &[("app.web.1", "n1")], &[])).unwrap();
+        assert_eq!(s.workloads["app.web.1"].node_id.as_deref(), Some("n1"));
     }
 
     #[test]
