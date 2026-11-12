@@ -6,7 +6,7 @@
 
 use freightdock_proto::v1;
 
-use crate::state::{CLUSTER_RANGE, ClusterState, Workload};
+use crate::state::{CLUSTER_RANGE, ClusterState, Entry, FenceState, Ms, Workload};
 
 /// The overlay's MTU: 1500 less WireGuard's 80 over IPv6, so nothing a container sends is fragmented.
 pub const MTU: u32 = 1420;
@@ -35,7 +35,42 @@ pub fn state_for(s: &ClusterState, node: &str, endpoint: impl Fn(&str) -> Option
             stacks.push(v1::StackNetwork { stack: w.stack.clone(), subnet, gateway: format!("{}.{}.{n}.1", CLUSTER_RANGE[0], CLUSTER_RANGE[1]) });
         }
     }
-    v1::NetworkState { version: s.applied, cluster_range: format!("{}.{}.0.0/16", CLUSTER_RANGE[0], CLUSTER_RANGE[1]), mtu: MTU, peers, stacks, node_address: s.node_address(node).unwrap_or_default(), exposures: exposures(s, down) }
+    v1::NetworkState { version: s.applied, cluster_range: format!("{}.{}.0.0/16", CLUSTER_RANGE[0], CLUSTER_RANGE[1]), mtu: MTU, peers, stacks, node_address: s.node_address(node).unwrap_or_default(), exposures: exposures(s, down), floating: floating_of(s, node) }
+}
+
+/// The floating addresses `node` holds, while it is at rest: a node the cluster starts to fence lets them go at once,
+/// before the managers may give them to another.
+fn floating_of(s: &ClusterState, node: &str) -> Vec<String> {
+    if s.nodes.get(node).is_none_or(|n| n.fencing.state != FenceState::None) {
+        return vec![];
+    }
+    s.floating.iter().filter(|(_, f)| f.holder.as_deref() == Some(node)).map(|(a, _)| a.clone()).collect()
+}
+
+/// The leader's moves of the floating addresses (G10.3): each with no holder, or whose holder is fenced, to the
+/// `healthy` node at rest that holds fewest (ties by id). One whose holder is unreachable but not yet fenced waits:
+/// that node may still answer for it.
+pub fn floating_moves(s: &ClusterState, healthy: impl Fn(&str) -> bool, at: Ms) -> Vec<Entry> {
+    let mut held: std::collections::BTreeMap<&str, usize> = s.nodes.values().filter(|n| n.fencing.state == FenceState::None && healthy(&n.id)).map(|n| (n.id.as_str(), 0)).collect();
+    for f in s.floating.values() {
+        if let Some(c) = f.holder.as_deref().and_then(|h| held.get_mut(h)) {
+            *c += 1;
+        }
+    }
+    let mut out = vec![];
+    for (address, f) in &s.floating {
+        let free = match f.holder.as_deref().and_then(|h| s.nodes.get(h)) {
+            None => true,
+            Some(n) => matches!(n.fencing.state, FenceState::Fenced | FenceState::AwaitingAuthorization),
+        };
+        if !free {
+            continue;
+        }
+        let Some((&to, _)) = held.iter().min_by_key(|(id, c)| (**c, **id)) else { break };
+        *held.get_mut(to).expect("a candidate") += 1;
+        out.push(Entry::FloatingHeld { address: address.clone(), node_id: Some(to.to_string()), at });
+    }
+    out
 }
 
 /// The cluster's published ports (G10, the routing mesh), the same for every node: each running stack's ports with
@@ -122,5 +157,46 @@ mod tests {
         assert_eq!(e[0].targets, vec![format!("{}:80", s.address("a.web.2").unwrap())], "only the one running");
         assert!(exposures(&s, |_| true)[0].targets.is_empty(), "none up: the port answers nothing");
         assert_eq!(exposures(&s, |_| false)[0].targets.len(), 2, "not known to be down: it takes its share");
+    }
+
+    #[test]
+    fn a_floating_address_goes_to_its_holder_only_while_it_is_at_rest() {
+        let mut s = with_nodes(&["n1", "n2"]);
+        next(&mut s, &Entry::FloatingAdded { address: "192.0.2.10".into(), at: 1 }).unwrap();
+        assert!(state_for(&s, "n1", |_| None, |_| false).floating.is_empty(), "nobody holds it yet");
+        next(&mut s, &Entry::FloatingHeld { address: "192.0.2.10".into(), node_id: Some("n1".into()), at: 2 }).unwrap();
+        assert_eq!(state_for(&s, "n1", |_| None, |_| false).floating, vec!["192.0.2.10".to_string()]);
+        assert!(state_for(&s, "n2", |_| None, |_| false).floating.is_empty());
+        next(&mut s, &Entry::NodeFencing { node_id: "n1".into(), state: crate::state::FenceState::Requested, provider: "self".into(), message: String::new(), at: 3 }).unwrap();
+        assert!(state_for(&s, "n1", |_| None, |_| false).floating.is_empty(), "a node being fenced lets it go at once");
+    }
+
+    #[test]
+    fn a_floating_address_without_a_holder_at_rest_goes_to_the_healthy_node_holding_fewest() {
+        use crate::state::FenceState::*;
+        let mut s = with_nodes(&["n1", "n2", "n3"]);
+        for a in ["192.0.2.10", "192.0.2.11", "192.0.2.12"] {
+            next(&mut s, &Entry::FloatingAdded { address: a.into(), at: 1 }).unwrap();
+        }
+        next(&mut s, &Entry::FloatingHeld { address: "192.0.2.10".into(), node_id: Some("n1".into()), at: 2 }).unwrap();
+        let healthy = |n: &str| n != "n3";
+        let moves = floating_moves(&s, healthy, 5);
+        assert_eq!(moves, vec![
+            Entry::FloatingHeld { address: "192.0.2.11".into(), node_id: Some("n2".into()), at: 5 },
+            Entry::FloatingHeld { address: "192.0.2.12".into(), node_id: Some("n1".into()), at: 5 },
+        ], "fewest held first, ties by id; n3 is not healthy");
+        for m in &moves {
+            next(&mut s, m).unwrap();
+        }
+        assert!(floating_moves(&s, healthy, 6).is_empty(), "all held: nothing moves");
+        for st in [Requested, InProgress] {
+            next(&mut s, &Entry::NodeFencing { node_id: "n1".into(), state: st, provider: "self".into(), message: String::new(), at: 7 }).unwrap();
+            assert!(floating_moves(&s, healthy, 7).is_empty(), "{st:?}: n1 may still answer, its addresses wait");
+        }
+        next(&mut s, &Entry::NodeFencing { node_id: "n1".into(), state: Fenced, provider: "self".into(), message: String::new(), at: 8 }).unwrap();
+        let moves = floating_moves(&s, healthy, 8);
+        assert_eq!(moves.len(), 2, "both of n1's: {moves:?}");
+        assert!(moves.iter().all(|m| matches!(m, Entry::FloatingHeld { node_id: Some(n), .. } if n == "n2")));
+        assert!(floating_moves(&s, |_| false, 8).is_empty(), "no healthy node: they wait");
     }
 }

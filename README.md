@@ -114,6 +114,7 @@ a client trusts that CA alone and checks that name. `GET /v1/health` and `GET /v
 | `GET /v1/recoveries?stack=` | the recovery history, newest first |
 | `GET /v1/api-tokens`, `POST /v1/api-tokens`, `DELETE /v1/api-tokens/{id}` | API tokens: `{"name", "role": "read" or "admin"}` gives the token once |
 | `GET /v1/ca` | the cluster CA's certificate (PEM), no token |
+| `GET /v1/floating`, `POST /v1/floating`, `DELETE /v1/floating/{address}` | floating addresses (G10.3) and each one's holder; `{"address"}` adds one (400 if not a LAN's unicast IPv4 address outside 10.240.0.0/16, 409 if there) |
 | `GET /v1/ui-db?after=` | the UI's database (admin token): its snapshot and changes, or only the changes after `after` |
 | `POST /v1/ui-db/changes`, `PUT /v1/ui-db/snapshot` | `{"seq", "data"}`: the next change only (else 409); `{"head", "data"}`: a snapshot at the latest change only |
 | `GET /v1/ui`, `PUT /v1/ui`, `DELETE /v1/ui` | the UI: on or off, its image and its stack; `{"image"}` runs it or moves it to that image; off |
@@ -127,7 +128,8 @@ a client trusts that CA alone and checks that name. `GET /v1/health` and `GET /v
 
 A stack is a Compose file. Its services become workloads, one per replica, with the id `<stack>.<service>.<n>`; the
 manager that takes the deploy places each new one on a healthy node with Docker that meets its constraints, has its
-host ports free and room for its reservation, preferring nodes that meet its preferences, then spread over a label,
+room for its reservation (and its host ports free, only for a workload off the overlay: on it, the routing mesh
+answers a published port on every node, so replicas may share one), preferring nodes that meet its preferences, then spread over a label,
 then away from its other replicas, then the least loaded. From then on the manager each worker is connected to
 compares what the worker reports in every heartbeat with what the state says and sends a command for the difference:
 run (a missing or exited container, or one made for an older spec), stop (a stopped stack), remove (a stack

@@ -29,7 +29,8 @@ impl IntoResponse for ApiError {
 impl From<ProposeError> for ApiError {
     fn from(e: ProposeError) -> Self {
         match e {
-            ProposeError::Rejected(r @ (Rejected::NodeUnknown | Rejected::CommandUnknown | Rejected::StackUnknown)) => ApiError(StatusCode::NOT_FOUND, r.to_string()),
+            ProposeError::Rejected(r @ (Rejected::NodeUnknown | Rejected::CommandUnknown | Rejected::StackUnknown | Rejected::FloatingUnknown)) => ApiError(StatusCode::NOT_FOUND, r.to_string()),
+            ProposeError::Rejected(r @ Rejected::BadAddress) => ApiError(StatusCode::BAD_REQUEST, r.to_string()),
             ProposeError::Rejected(r) => ApiError(StatusCode::CONFLICT, r.to_string()),
             e @ (ProposeError::Unavailable(_) | ProposeError::NotLeader(_)) => ApiError(StatusCode::SERVICE_UNAVAILABLE, e.to_string()),
             ProposeError::Io(e) => {
@@ -89,6 +90,8 @@ pub fn router(m: Arc<Manager>) -> Router {
         .route("/v1/ui-db/snapshot", axum::routing::put(ui_db_snapshot))
         .route("/v1/api-tokens", get(api_tokens).post(create_api_token))
         .route("/v1/api-tokens/{id}", axum::routing::delete(revoke_api_token))
+        .route("/v1/floating", get(floating).post(add_floating))
+        .route("/v1/floating/{address}", axum::routing::delete(remove_floating))
         .route("/v1/cluster", get(cluster))
         .route("/v1/nodes", get(nodes))
         .route("/v1/nodes/{id}", get(node).delete(remove_node))
@@ -309,6 +312,32 @@ async fn revoke_api_token(State(m): State<Arc<Manager>>, h: HeaderMap, Path(id):
     authed(&m, &h)?;
     m.store.propose(Entry::ApiTokenRevoked { id: id.clone(), at: now_ms() }).await?;
     m.events.push("api_token", None, format!("API token {} revoked", &id[..id.len().min(8)]));
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+struct FloatingBody {
+    address: String,
+}
+
+/// The floating addresses (G10.3), each with its holder (none while it waits for one).
+async fn floating(State(m): State<Arc<Manager>>, h: HeaderMap) -> R<Json<Value>> {
+    authed(&m, &h)?;
+    Ok(Json(m.store.read(|s| json!(s.floating.iter().map(|(a, f)| json!({ "address": a, "holder": f.holder, "since": f.since })).collect::<Vec<_>>()))))
+}
+
+async fn add_floating(State(m): State<Arc<Manager>>, h: HeaderMap, Json(b): Json<FloatingBody>) -> R<StatusCode> {
+    authed(&m, &h)?;
+    let address = b.address.trim().to_string();
+    m.store.propose(Entry::FloatingAdded { address: address.clone(), at: now_ms() }).await?;
+    m.events.push("floating", None, format!("floating address {address} added"));
+    Ok(StatusCode::CREATED)
+}
+
+async fn remove_floating(State(m): State<Arc<Manager>>, h: HeaderMap, Path(address): Path<String>) -> R<StatusCode> {
+    authed(&m, &h)?;
+    m.store.propose(Entry::FloatingRemoved { address: address.clone(), at: now_ms() }).await?;
+    m.events.push("floating", None, format!("floating address {address} removed"));
     Ok(StatusCode::NO_CONTENT)
 }
 

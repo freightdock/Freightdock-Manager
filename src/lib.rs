@@ -290,6 +290,26 @@ impl Manager {
         }
     }
 
+    /// The leader gives each floating address with no holder at rest (none yet, or its holder fenced) to the healthy
+    /// worker holding fewest (G10.3, `network::floating_moves`).
+    pub async fn float_round(&self) {
+        if self.store.leader() != Some(self.store.id) {
+            return;
+        }
+        let moves = self.store.read(|s| network::floating_moves(s, |n| self.sessions.liveness(n).health == sessions::Health::Healthy, now_ms()));
+        for e in moves {
+            let Entry::FloatingHeld { address, node_id, .. } = &e else { continue };
+            let what = format!("floating address {address} to {}", node_id.as_deref().map(|n| &n[..n.len().min(8)]).unwrap_or("nobody"));
+            match self.store.propose(e.clone()).await {
+                Ok(_) => {
+                    tracing::warn!("{what}");
+                    self.events.push("floating", node_id.as_deref(), what);
+                }
+                Err(e) => tracing::debug!("{what} not made: {e}"),
+            }
+        }
+    }
+
     /// Where the UI's connections go now: its workload's node, as [`ui::target`] reads it.
     pub fn ui_target(&self, port: u32) -> Option<String> {
         let node = self.store.read(|s| s.workloads.get(ui::WORKLOAD).and_then(|w| w.node_id.clone()))?;
@@ -414,6 +434,7 @@ pub async fn housekeeping(m: Arc<Manager>) {
         m.fence_local().await;
         m.fence_round().await;
         m.recover_round().await;
+        m.float_round().await;
         m.reconcile().await;
         m.push_network();
         m.local_worker_token().await;

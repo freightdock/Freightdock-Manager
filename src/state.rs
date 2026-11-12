@@ -70,6 +70,14 @@ pub enum Entry {
     UiDbSnapshot { head: u64, data: Arc<str>, at: Ms },
     /// One write of the UI's database: refused unless `seq` is the next number, so only one UI writes at a time.
     UiDbChange { seq: u64, data: Arc<str>, at: Ms },
+    /// A floating address given to the cluster (G10.3): a unicast IPv4 address of a LAN, outside the cluster's range.
+    FloatingAdded { address: String, at: Ms },
+    /// The address taken back; its holder lets it go at its next network state.
+    FloatingRemoved { address: String, at: Ms },
+    /// The address's holder, or none. Refused unless the address has no holder now, or its holder is fenced (or back,
+    /// fenced, awaiting authorization), or is the one named; and a node named must be at rest. So an address is never
+    /// given to a second node while the first may still answer for it.
+    FloatingHeld { address: String, node_id: Option<String>, at: Ms },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -99,6 +107,10 @@ pub enum Rejected {
     TokenExists,
     /// A UI database write or snapshot that is not the next: another UI wrote since (or none was made yet).
     UiDbStale,
+    FloatingExists,
+    FloatingUnknown,
+    /// Not an address a LAN could give the cluster.
+    BadAddress,
 }
 
 impl std::fmt::Display for Rejected {
@@ -120,6 +132,9 @@ impl std::fmt::Display for Rejected {
             Rejected::NotRecoverable => "the workload is not on that node any more, or may not be moved by itself",
             Rejected::UiDbStale => "the UI's database has moved on since: load it again",
             Rejected::TokenExists => "an API token with that id exists",
+            Rejected::FloatingExists => "the cluster has that floating address already",
+            Rejected::FloatingUnknown => "no such floating address",
+            Rejected::BadAddress => "a floating address must be a unicast IPv4 address of a LAN, outside the cluster's range 10.240.0.0/16",
             Rejected::BadName => "a stack or service name must be 1 to 40 of a-z, 0-9 and - (services may have _), starting with a letter or digit",
         })
     }
@@ -550,6 +565,24 @@ pub struct ClusterState {
     /// The UI's database (G8.1): opaque to the managers.
     #[serde(default)]
     pub ui_db: UiDb,
+    /// The floating addresses (G10.3) by address.
+    #[serde(default)]
+    pub floating: BTreeMap<String, Floating>,
+}
+
+/// A floating address: on its holder's LAN, answering the published ports as the nodes' own addresses do.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Floating {
+    pub holder: Option<String>,
+    /// When it was added or last given a holder.
+    pub since: Ms,
+}
+
+/// Whether `a` can be a floating address: a unicast IPv4 address of a LAN, outside the cluster's range.
+pub fn floating_ok(a: &str) -> bool {
+    a.parse::<std::net::Ipv4Addr>().is_ok_and(|ip| {
+        !(ip.is_unspecified() || ip.is_loopback() || ip.is_link_local() || ip.is_multicast() || ip.is_broadcast() || ip.octets()[0] == 0 || ip.octets()[..2] == CLUSTER_RANGE) && ip.to_string() == a
+    })
 }
 
 /// The UI's database as the managers keep it: a snapshot and the changes after it, both as the UI wrote them.
@@ -781,6 +814,38 @@ impl ClusterState {
                     c.status = CommandStatus::Rejected;
                     c.message = "the node was removed".into();
                 }
+                for f in self.floating.values_mut().filter(|f| f.holder.as_ref() == Some(node_id)) {
+                    f.holder = None;
+                }
+            }
+            Entry::FloatingAdded { address, at } => {
+                if !floating_ok(address) {
+                    return Err(Rejected::BadAddress);
+                }
+                if self.floating.contains_key(address) {
+                    return Err(Rejected::FloatingExists);
+                }
+                self.floating.insert(address.clone(), Floating { holder: None, since: *at });
+            }
+            Entry::FloatingRemoved { address, .. } => {
+                self.floating.remove(address).ok_or(Rejected::FloatingUnknown)?;
+            }
+            Entry::FloatingHeld { address, node_id, at } => {
+                let Some(f) = self.floating.get(address) else { return Err(Rejected::FloatingUnknown) };
+                if let Some(n) = node_id {
+                    let node = self.nodes.get(n).ok_or(Rejected::NodeUnknown)?;
+                    if node.fencing.state != FenceState::None {
+                        return Err(Rejected::FenceStep);
+                    }
+                }
+                let free = match f.holder.as_ref().and_then(|h| self.nodes.get(h).map(|n| (h, n))) {
+                    None => true,
+                    Some((h, n)) => Some(h) == node_id.as_ref() || matches!(n.fencing.state, FenceState::Fenced | FenceState::AwaitingAuthorization),
+                };
+                if !free {
+                    return Err(Rejected::FenceStep);
+                }
+                self.floating.insert(address.clone(), Floating { holder: node_id.clone(), since: *at });
             }
             Entry::NodeAddressed { node_id } => {
                 if !self.nodes.contains_key(node_id) {
@@ -1276,6 +1341,37 @@ pub(crate) mod tests {
 
     fn fence(s: &mut ClusterState, to: FenceState) -> Result<(), Rejected> {
         next(s, &Entry::NodeFencing { node_id: "n1".into(), state: to, provider: "self".into(), message: String::new(), at: 9 })
+    }
+
+    #[test]
+    fn a_floating_address_moves_only_off_a_fenced_or_removed_node_and_only_to_one_at_rest() {
+        use FenceState::*;
+        let mut s = with_nodes(&["n1", "n2", "n3"]);
+        let add = |a: &str| Entry::FloatingAdded { address: a.into(), at: 1 };
+        let held = |n: Option<&str>| Entry::FloatingHeld { address: "192.0.2.10".into(), node_id: n.map(str::to_string), at: 2 };
+        next(&mut s, &add("192.0.2.10")).unwrap();
+        assert_eq!(next(&mut s, &add("192.0.2.10")), Err(Rejected::FloatingExists));
+        for bad in ["10.240.0.9", "127.0.0.1", "224.0.0.1", "0.0.0.0", "x"] {
+            assert_eq!(next(&mut s, &add(bad)), Err(Rejected::BadAddress), "{bad}");
+        }
+        assert!(s.floating["192.0.2.10"].holder.is_none(), "added with no holder");
+        assert_eq!(next(&mut s, &Entry::FloatingHeld { address: "192.0.2.99".into(), node_id: Some("n1".into()), at: 2 }), Err(Rejected::FloatingUnknown));
+        assert_eq!(next(&mut s, &held(Some("n9"))), Err(Rejected::NodeUnknown));
+        next(&mut s, &held(Some("n1"))).unwrap();
+        assert_eq!(next(&mut s, &held(Some("n2"))), Err(Rejected::FenceStep), "n1 may still answer for it");
+        for st in [Requested, InProgress] {
+            fence(&mut s, st).unwrap();
+            assert_eq!(next(&mut s, &held(Some("n2"))), Err(Rejected::FenceStep), "{st:?}: not fenced yet");
+        }
+        fence(&mut s, Fenced).unwrap();
+        next(&mut s, &Entry::NodeFencing { node_id: "n3".into(), state: Requested, provider: "self".into(), message: String::new(), at: 9 }).unwrap();
+        assert_eq!(next(&mut s, &held(Some("n3"))), Err(Rejected::FenceStep), "not to a node being fenced");
+        next(&mut s, &held(Some("n2"))).unwrap();
+        assert_eq!(s.floating["192.0.2.10"].holder.as_deref(), Some("n2"));
+        next(&mut s, &Entry::NodeRemoved { node_id: "n2".into(), at: 3 }).unwrap();
+        assert!(s.floating["192.0.2.10"].holder.is_none(), "a removed node holds nothing");
+        next(&mut s, &Entry::FloatingRemoved { address: "192.0.2.10".into(), at: 4 }).unwrap();
+        assert_eq!(next(&mut s, &Entry::FloatingRemoved { address: "192.0.2.10".into(), at: 4 }), Err(Rejected::FloatingUnknown));
     }
 
     #[test]

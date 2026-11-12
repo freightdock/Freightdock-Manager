@@ -20,6 +20,7 @@ freightdock-manager stack start|stop|restart|rm <name>
 freightdock-manager recoveries [stack]      workloads moved off fenced nodes, or left there and why
 freightdock-manager api-token create <name> [read|admin]   a token for the API over TLS (shown once)
 freightdock-manager api-token ls|rm <id>    list or revoke the API tokens
+freightdock-manager floating ls|add|rm [address]   the floating addresses: on one worker at a time, every published port
 freightdock-manager ca                      the cluster CA's certificate (PEM), for a client of the API over TLS
 freightdock-manager ui <image>|off|status   run the Freightdock UI on the cluster, at port 7443 of every manager
 
@@ -195,6 +196,26 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Some("stack") => stack(&config, &args[1..]).await,
+        Some("floating") => {
+            use reqwest::Method;
+            match (args.get(1).map(String::as_str), args.get(2)) {
+                (Some("ls") | None, _) => {
+                    let v = call(&config, Method::GET, "/v1/floating", None).await?;
+                    println!("{:<18} {:<38} SINCE", "ADDRESS", "HOLDER");
+                    for f in v.as_array().into_iter().flatten() {
+                        println!("{:<18} {:<38} {}", f["address"].as_str().unwrap_or(""), f["holder"].as_str().unwrap_or("(waiting for a worker)"), f["since"]);
+                    }
+                }
+                (Some("add"), Some(a)) => {
+                    call(&config, Method::POST, "/v1/floating", Some(serde_json::json!({ "address": a }))).await?;
+                }
+                (Some("rm"), Some(a)) => {
+                    call(&config, Method::DELETE, &format!("/v1/floating/{a}"), None).await?;
+                }
+                _ => bail!("{USAGE}"),
+            }
+            Ok(())
+        }
         Some("ui") => {
             use reqwest::Method;
             match args.get(1).map(String::as_str) {

@@ -460,3 +460,34 @@ async fn a_worker_is_sent_its_network_when_it_connects_and_when_it_changes() {
     assert_eq!(n.peers[0].addresses, vec!["10.240.0.2/32".to_string(), "10.240.1.2/32".to_string()], "n2's own address and its workload's");
     a.server.abort();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_floating_address_is_added_given_to_a_healthy_worker_and_taken_back() {
+    use freightdock_manager::state::NodeReport;
+    let a = start(None).await;
+    until("a leader", || a.m.store.leader().is_some()).await;
+    let t = JoinToken::parse(&issue(&a.m, false).await).unwrap();
+    a.m.store.propose(Entry::NodeEnrolled { node_id: "n1".into(), hostname: "h".into(), secret_hash: t.secret_hash(), cert_sha256: "c1".into(), at: now_ms() }).await.unwrap();
+    a.m.store.propose(Entry::NodeReported { node_id: "n1".into(), report: NodeReport { docker: true, ..Default::default() }, at: now_ms() }).await.unwrap();
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap().to_string();
+    tokio::spawn(freightdock_manager::serve_admin_tls(a.m.clone(), l));
+    let admin = Some(a.m.admin_token.as_str());
+    assert_eq!(https_with(&a.m, &addr, "POST", "/v1/floating", admin, r#"{"address":"192.0.2.10"}"#).await.0, 201);
+    assert_eq!(https_with(&a.m, &addr, "POST", "/v1/floating", admin, r#"{"address":"192.0.2.10"}"#).await.0, 409);
+    assert_eq!(https_with(&a.m, &addr, "POST", "/v1/floating", admin, r#"{"address":"10.240.0.9"}"#).await.0, 400, "the cluster's own range");
+
+    a.m.float_round().await;
+    let (_, b) = https(&a.m, &addr, "GET", "/v1/floating", admin).await;
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&b).unwrap()[0]["holder"], serde_json::Value::Null, "n1 is not heard: nobody takes it");
+    let (tx, _rx) = tokio::sync::mpsc::channel(8);
+    a.m.sessions.open("n1", tx, "192.0.2.1:40000".into(), None);
+    a.m.float_round().await;
+    let (s, b) = https(&a.m, &addr, "GET", "/v1/floating", admin).await;
+    let v: serde_json::Value = serde_json::from_str(&b).unwrap();
+    assert_eq!((s, v[0]["address"].as_str(), v[0]["holder"].as_str()), (200, Some("192.0.2.10"), Some("n1")), "{b}");
+
+    assert_eq!(https(&a.m, &addr, "DELETE", "/v1/floating/192.0.2.10", admin).await.0, 204);
+    assert_eq!(https(&a.m, &addr, "DELETE", "/v1/floating/192.0.2.10", admin).await.0, 404);
+    a.server.abort();
+}
