@@ -232,9 +232,10 @@ bridge per stack that talks only to itself (nftables), names through the hosts f
 4. [x] Worker: runs the agent; workloads on their stack's network with their address and the hosts of their stack.
 5. [x] Test cluster (2026-11-12): services reaching each other across nodes by name, two stacks kept apart, a moved
        workload reached at the same address, published ports and the internet still working, the UI on the overlay.
-6. [ ] Left for later: a gratuitous ARP when an address leaves a node (a peer's stale ARP entry costs about 5 s
-       after a move); removing a stack network a node no longer needs; a container made before the worker knew of
-       the overlay is not made again by itself (only possible on a cluster that ran a G9 manager with older workers).
+6. [x] After a move, the stack's containers left on the old node forget the moved address's MAC (`nsenter ... ip
+       neigh flush`) when its container is removed there, so they reach it at once; a node removes a stack's network
+       when no container of the stack is left on it. Left: a container made before the worker knew of the overlay is
+       not made again by itself (only possible on a cluster that ran a G9 manager with older workers).
 7. [x] The network in the UI: each workload's address on the stack and node pages, each node's overlay state.
 8. [ ] Owner's wish (2026-11-12), once the network part is done: a live, interactive view of the network that shows
        the communication between workloads and nodes.
