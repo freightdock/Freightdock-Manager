@@ -46,7 +46,7 @@ product, archived later), its `feat/cluster-ui` branch local and never pushed.
 | **Freightdock-Network** | none yet | network-agent (G9). | placeholder |
 | **Freightdock-UI** | `freightdock` | The UI only, its own image, which the managers run as a workload (G8). Database replicated by the managers (G8.1). | new, local |
 | **Freightdock** | `freightdock` | The standalone product, left as it is; the Portainer import comes back from here later. Its local branch `feat/cluster-ui` holds the UI work up to G8.2 (G8.1 in a stash), now in Freightdock-UI. | kept, unchanged |
-| **Agent** | `freightdock-agent`, `freightdock-tunnel` | The single-host tunnel agent of today's Freightdock (remote Docker hosts over a tunnel). Not part of the cluster: **deprecated**, its job is the worker's. Today's Freightdock still depends on it (git tag v1.0.0) until G8.3 removes that; then it is archived. Branch `feat/cluster-worker` holds nothing now. | deprecated |
+| **Agent** | `freightdock-agent`, `freightdock-tunnel` | The single-host tunnel agent of the standalone Freightdock (remote Docker hosts over a tunnel). Not part of the cluster: **deprecated**, its job is the worker's. Freightdock-UI no longer depends on it (G8.3); only the standalone Freightdock does. Branch `feat/cluster-worker` holds nothing now. | deprecated |
 
 While nothing is published the crates point at each other by path (`../Freightdock-Contracts`), so the checkouts sit side by side.
 
@@ -189,8 +189,11 @@ same host. Each later goal adds its pages there (stacks with G4, and so on).
 2. [x] The manager API reachable from the UI: a second port (7452), TLS with the cluster CA for the managers' fixed
        name, API tokens (read or admin) in the replicated state; Freightdock takes several `https://` managers and goes
        on to the next when one cannot be reached. The users of item 1 come in front of it later.
-3. [ ] Freightdock trimmed to the UI: its server becomes a client of the manager API; its SQLite, local Docker
-       access and tunnel agent go (or stay only where they serve the UI itself). Its own image.
+3. [x] Freightdock trimmed to the UI (Freightdock-UI, 2026-11-12): no Docker of its own, no agents, no stacks,
+       templates, webhooks, registries, image updates, notifications, history, backups, MCP or Portainer import; two
+       roles (Administrator, user). Its own image: the binary alone, no socket. Set aside to come back through the
+       managers: a node's Docker pages via its worker, registries, notifications, backups of the managers' state, the
+       MCP server, the Portainer import (last).
 4. [x] A cluster section: nodes, health, stacks, events, fencing, recoveries (the Cluster and Cluster stacks pages).
 5. [ ] The managers run the UI as a system workload (G4's workloads): placed on a node, recovered when that node
        goes, on the single-node cluster too; reachable through any manager.

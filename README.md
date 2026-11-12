@@ -22,7 +22,7 @@ deploy/           static build, install over ssh, systemd unit
 ```
 
 The repositories, side by side: **Freightdock-Contracts** (the gRPC contract), **Freightdock-Manager** (this), **Freightdock-Worker** (the
-worker-agent), **Freightdock-Network** (G9), **Freightdock** (the UI, an image the managers run).
+worker-agent), **Freightdock-Network** (G9), **Freightdock-UI** (the UI, an image the managers run).
 
 ## Try it on one machine
 
