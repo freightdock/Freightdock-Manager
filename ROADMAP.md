@@ -242,7 +242,11 @@ bridge per stack that talks only to itself (nftables), names through the hosts f
        not made again by itself (only possible on a cluster that ran a G9 manager with older workers).
 7. [x] The network in the UI: each workload's address on the stack and node pages, each node's overlay state.
 8. [ ] Owner's wish (2026-11-12), once the network part is done: a live, interactive view of the network that shows
-       the communication between workloads and nodes.
+       the communication between workloads and nodes. Agreed 2026-11-12: built from the flows (who talks to whom).
+       - [x] Each worker reports its share of the traffic at every heartbeat (Freightdock-Network `traffic.rs`, from
+             conntrack, each connection counted by one node); the managers keep the latest per node, pass it between
+             them and answer `GET /v1/traffic` with its ends named.
+       - [ ] The UI's live view: the nodes, their workloads and outside, with a line per flow sized by its traffic.
 
 ### G10: external networking
 

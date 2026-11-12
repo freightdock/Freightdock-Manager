@@ -16,6 +16,7 @@ pub mod state;
 pub mod store;
 pub mod tls;
 pub mod network;
+pub mod traffic;
 pub mod ui;
 
 use std::net::SocketAddr;

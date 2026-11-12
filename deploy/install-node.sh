@@ -52,11 +52,12 @@ fi
 [ -z "$labels" ] || worker_env="$worker_env
 FREIGHTDOCK_LABELS=$labels"
 
-# The overlay (G9) drives wireguard-tools and nftables, a floating address (G10.3) arping; without them the worker
-# runs, off the overlay (or holding no floating address), and says why.
-ssh_ "$host" "command -v wg >/dev/null && command -v nft >/dev/null && command -v arping >/dev/null \
-  || { command -v apt-get >/dev/null && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq wireguard-tools nftables iputils-arping >/dev/null; } \
-  || echo 'install wireguard-tools, nftables and arping (iputils) for the overlay' >&2"
+# The overlay (G9) drives wireguard-tools and nftables, a floating address (G10.3) arping, the live view (G9.8)
+# conntrack; without them the worker runs, off the overlay (or holding no floating address, or reporting no
+# traffic), and says why.
+ssh_ "$host" "command -v wg >/dev/null && command -v nft >/dev/null && command -v arping >/dev/null && command -v conntrack >/dev/null \
+  || { command -v apt-get >/dev/null && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq wireguard-tools nftables iputils-arping conntrack >/dev/null; } \
+  || echo 'install wireguard-tools, nftables, arping (iputils) and conntrack for the overlay' >&2"
 scp -q "$here/dist/freightdock-worker" "$here/Freightdock-Worker/deploy/freightdock-worker.service" "root@$host:"
 ssh_ "$host" "install -m 755 freightdock-worker /usr/local/bin/ && mv freightdock-worker.service /etc/systemd/system/ \
   && mkdir -p /etc/freightdock && umask 077 && printf '%s\n' '$worker_env' > /etc/freightdock/worker.env \

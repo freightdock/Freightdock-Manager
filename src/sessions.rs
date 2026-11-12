@@ -47,6 +47,9 @@ pub fn health(since: Option<Duration>, t: &Thresholds) -> Health {
     }
 }
 
+/// A traffic report older than this says nothing of now (G9.8): a few heartbeats.
+pub const TRAFFIC_AGE: Duration = Duration::from_secs(15);
+
 pub struct Session {
     /// Which stream this is, so an old stream ending after a new one opened does not take the new one away.
     pub generation: u64,
@@ -66,6 +69,8 @@ pub struct Session {
     pub network: Option<freightdock_proto::v1::NetworkState>,
     /// What the worker last said of its overlay (hello, heartbeats).
     pub overlay: Option<freightdock_proto::v1::NetworkReport>,
+    /// Its latest traffic report and when it came (G9.8).
+    pub traffic: Option<(Instant, freightdock_proto::v1::TrafficReport)>,
 }
 
 /// Ends a stream with a status. Dropping the sender is not enough: the task reading the worker's side holds a clone.
@@ -112,7 +117,7 @@ impl Sessions {
         g.0 += 1;
         let generation = g.0;
         let now = Instant::now();
-        if let Some(old) = g.1.insert(node.to_string(), Session { generation, tx, last_heard: now, connected_at: now, resources: None, peer, fresh: workloads.is_some(), workloads, fenced, network: None, overlay: None }) {
+        if let Some(old) = g.1.insert(node.to_string(), Session { generation, tx, last_heard: now, connected_at: now, resources: None, peer, fresh: workloads.is_some(), workloads, fenced, network: None, overlay: None, traffic: None }) {
             end(&old, "a newer stream from this node replaced this one");
         }
         generation
@@ -161,6 +166,27 @@ impl Sessions {
         if let (Some(s), Some(r)) = (g.1.get_mut(node).filter(|s| s.generation == generation), report) {
             s.overlay = Some(r);
         }
+    }
+
+    /// The worker's traffic since its last heartbeat (G9.8); a heartbeat without it means none is known.
+    pub fn heard_traffic(&self, node: &str, generation: u64, report: Option<freightdock_proto::v1::TrafficReport>) {
+        let mut g = self.inner.lock().expect("sessions lock");
+        if let Some(s) = g.1.get_mut(node).filter(|s| s.generation == generation) {
+            s.traffic = report.map(|r| (Instant::now(), r));
+        }
+    }
+
+    /// The node's latest traffic report to any manager (this one's own session first), if it is recent.
+    pub fn traffic(&self, node: &str) -> Option<freightdock_proto::v1::TrafficReport> {
+        if let Some((at, r)) = self.inner.lock().expect("sessions lock").1.get(node).and_then(|s| s.traffic.clone()) {
+            return (at.elapsed() < TRAFFIC_AGE).then_some(r);
+        }
+        let g = self.remote.lock().expect("remote lock");
+        g.values()
+            .filter_map(|(at, nodes)| nodes.iter().find(|n| n.node_id == node).and_then(|n| Some((Duration::from_millis(n.heard_ms_ago) + at.elapsed(), n.traffic.as_ref()?))))
+            .filter(|c| c.0 < TRAFFIC_AGE)
+            .min_by_key(|c| c.0)
+            .map(|c| c.1.clone())
     }
 
     /// The node's overlay as last reported to any manager (this one's own session first).
@@ -256,7 +282,7 @@ impl Sessions {
     pub fn connected(&self) -> Vec<HeardNode> {
         let g = self.inner.lock().expect("sessions lock");
         g.1.iter()
-            .map(|(id, s)| HeardNode { node_id: id.clone(), heard_ms_ago: s.last_heard.elapsed().as_millis() as u64, connected_for_ms: s.connected_at.elapsed().as_millis() as u64, peer: s.peer.clone(), resources: s.resources, workloads: s.workloads.clone(), network: s.overlay.clone() })
+            .map(|(id, s)| HeardNode { node_id: id.clone(), heard_ms_ago: s.last_heard.elapsed().as_millis() as u64, connected_for_ms: s.connected_at.elapsed().as_millis() as u64, peer: s.peer.clone(), resources: s.resources, workloads: s.workloads.clone(), network: s.overlay.clone(), traffic: s.traffic.as_ref().filter(|(at, _)| at.elapsed() < TRAFFIC_AGE).map(|(_, r)| r.clone()) })
             .collect()
     }
 
@@ -322,7 +348,7 @@ mod tests {
     }
 
     fn heard(node: &str, ms: u64) -> HeardNode {
-        HeardNode { node_id: node.into(), heard_ms_ago: ms, connected_for_ms: 60_000, peer: "10.0.0.9:1".into(), resources: None, workloads: None, network: None }
+        HeardNode { node_id: node.into(), heard_ms_ago: ms, connected_for_ms: 60_000, peer: "10.0.0.9:1".into(), resources: None, workloads: None, network: None, traffic: None }
     }
 
     #[test]
@@ -379,6 +405,24 @@ mod tests {
         s.reports("m2:7450", vec![HeardNode { workloads: report(&["a"]), ..heard("n", 100) }]);
         assert_eq!(s.reported("n").map(|w| w[0].workload_id.clone()).as_deref(), Some("a"));
         assert!(s.fresh_reports().is_empty());
+    }
+
+    #[test]
+    fn a_node_s_traffic_is_its_latest_report_here_or_to_another_manager_and_none_when_old() {
+        let s = Sessions::default();
+        let tr = |port: u32| Some(freightdock_proto::v1::TrafficReport { flows: vec![freightdock_proto::v1::Flow { port, ..Default::default() }], over_ms: 2000 });
+        assert!(s.traffic("n").is_none());
+        s.reports("m2:7450", vec![HeardNode { traffic: tr(1), ..heard("n", 100) }]);
+        assert_eq!(s.traffic("n").map(|r| r.flows[0].port), Some(1), "another manager's word");
+        s.reports("m3:7450", vec![HeardNode { traffic: tr(9), ..heard("old", 60_000) }]);
+        assert!(s.traffic("old").is_none(), "a report a minute old says nothing of now");
+        let (tx, _rx) = mpsc::channel(1);
+        let g = s.open("n", tx, "a".into(), None);
+        s.heard_traffic("n", g, tr(2));
+        assert_eq!(s.traffic("n").map(|r| r.flows[0].port), Some(2), "its own session first");
+        assert_eq!(s.connected()[0].traffic.as_ref().map(|r| r.flows[0].port), Some(2), "and passed on to the others");
+        s.heard_traffic("n", g, None);
+        assert!(s.connected()[0].traffic.is_none(), "a heartbeat without one: no traffic known");
     }
 
     #[test]

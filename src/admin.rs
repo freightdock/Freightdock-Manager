@@ -91,6 +91,7 @@ pub fn router(m: Arc<Manager>) -> Router {
         .route("/v1/api-tokens", get(api_tokens).post(create_api_token))
         .route("/v1/api-tokens/{id}", axum::routing::delete(revoke_api_token))
         .route("/v1/floating", get(floating).post(add_floating))
+        .route("/v1/traffic", get(traffic))
         .route("/v1/floating/{address}", axum::routing::delete(remove_floating))
         .route("/v1/cluster", get(cluster))
         .route("/v1/nodes", get(nodes))
@@ -313,6 +314,14 @@ async fn revoke_api_token(State(m): State<Arc<Manager>>, h: HeaderMap, Path(id):
     m.store.propose(Entry::ApiTokenRevoked { id: id.clone(), at: now_ms() }).await?;
     m.events.push("api_token", None, format!("API token {} revoked", &id[..id.len().min(8)]));
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// The cluster's traffic now (G9.8): every node's latest report, its ends named.
+async fn traffic(State(m): State<Arc<Manager>>, h: HeaderMap) -> R<Json<Value>> {
+    authed(&m, &h)?;
+    let nodes: Vec<String> = m.store.read(|s| s.nodes.keys().cloned().collect());
+    let reports: Vec<_> = nodes.into_iter().filter_map(|n| m.sessions.traffic(&n).map(|r| (n, r))).collect();
+    Ok(Json(m.store.read(|s| crate::traffic::view(s, &reports))))
 }
 
 #[derive(Deserialize)]
