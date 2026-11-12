@@ -19,7 +19,7 @@ Status marks: **[x]** done, **[~]** in progress, **[ ]** not started.
 | 6 | G6 Fencing | A worker must be able to fence itself before anything is recovered elsewhere (plan rule 10, 11) | G4 | done |
 | 7 | G7 Failure detection and stateless recovery | Success criteria 4 and 5; safe only with G6 | G5, G6 | done |
 | 8 | G8 UI: Freightdock as the cluster's UI | Usable by people, not just the CLI; can start in parallel once G4's API settles | G4 | **done** |
-| 9 | G9 Internal networking (Network repo) | Stable workload IPs across workers; postponed by the plan's first release | G7 | **in progress** (design agreed) |
+| 9 | G9 Internal networking (Network repo) | Stable workload IPs across workers; postponed by the plan's first release | G7 | **done** (2026-11-12, small items left) |
 | 10 | G10 External networking | Exposing services without per-deploy setup | G9 | not started |
 | 11 | G11 Shared storage | Moving stateful workloads safely; needs fencing and storage leases | G6, G7 | not started |
 | 12 | G12 Advanced | Ceph, replicated storage, gateway redundancy, anti-affinity, more fencing providers | G9 to G11 | not started |
@@ -43,7 +43,7 @@ product, archived later), its `feat/cluster-ui` branch local and never pushed.
 | **Freightdock-Contracts** | `freightdock-proto` | Shared, versioned API contract: protobuf + gRPC, join tokens, shared names. Every repo depends on it and on no other repo's internals. | new, local |
 | **Freightdock-Manager** | `freightdock-manager` | manager-agent and the cluster's database: replicated state (Raft), enrolment, sessions, commands; later scheduler, IPAM, fencing coordination, users. Holds this roadmap and the install script. | new, local |
 | **Freightdock-Worker** | `freightdock-worker` | worker-agent: runs what the managers place on its host. | new, local (moved out of Agent) |
-| **Freightdock-Network** | none yet | network-agent (G9). | placeholder |
+| **Freightdock-Network** | `freightdock-network` (library) | The network-agent (G9): the node's WireGuard key, the plan and its application; the worker runs it. | local |
 | **Freightdock-UI** | `freightdock` | The UI only, its own image, which the managers run as a workload (G8). Database replicated by the managers (G8.1). | new, local |
 | **Freightdock** | `freightdock` | The standalone product, left as it is; the Portainer import comes back from here later. Its local branch `feat/cluster-ui` holds the UI work up to G8.2 (G8.1 in a stash), now in Freightdock-UI. | kept, unchanged |
 | **Agent** | `freightdock-agent`, `freightdock-tunnel` | The single-host tunnel agent of the standalone Freightdock (remote Docker hosts over a tunnel). Not part of the cluster: **deprecated**, its job is the worker's. Freightdock-UI no longer depends on it (G8.3); only the standalone Freightdock does. Branch `feat/cluster-worker` holds nothing now. | deprecated |
@@ -227,10 +227,14 @@ bridge per stack that talks only to itself (nftables), names through the hosts f
 1. [x] Contracts: the node's WireGuard key in its report, the desired network state down the session.
 2. [x] Manager: IPAM (cluster range, a /24 per stack, an address per workload kept across moves), the network state
        per node.
-3. [ ] Network: the agent (WireGuard over netlink, routes, proxy ARP, bridges, nftables), tested in a namespace.
-4. [ ] Worker: runs the agent; workloads on their stack's network with their address and the hosts of their stack.
-5. [ ] Test cluster: a service reaching another across nodes by name, two stacks kept apart, a recovered workload
-       reached at the same address.
+3. [x] Network: the agent (`ip`, `wg`, `nft`: the interface, peers, routes, proxy ARP, the table), tested against a
+       fake runner and by hand on two nodes.
+4. [x] Worker: runs the agent; workloads on their stack's network with their address and the hosts of their stack.
+5. [x] Test cluster (2026-11-12): services reaching each other across nodes by name, two stacks kept apart, a moved
+       workload reached at the same address, published ports and the internet still working, the UI on the overlay.
+6. [ ] Left for later: a gratuitous ARP when an address leaves a node (a peer's stale ARP entry costs about 5 s
+       after a move); removing a stack network a node no longer needs; a container made before the worker knew of
+       the overlay is not made again by itself (only possible on a cluster that ran a G9 manager with older workers).
 
 ## Open questions for the owner
 

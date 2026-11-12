@@ -1,6 +1,7 @@
 #!/bin/sh
 # Installs a Freightdock cluster node over ssh (as root), from the machine that holds the built binaries
-# (Freightdock-Manager/deploy/build-static.sh puts them in dist/). The host needs systemd, and Docker to run workloads.
+# (Freightdock-Manager/deploy/build-static.sh puts them in dist/). The host needs systemd, and Docker to run workloads;
+# a worker's overlay needs `wg` and `nft`, installed here with apt-get where there is one.
 #
 #   install-node.sh first  <host>                  manager + worker on one host: a whole cluster on its own
 #   install-node.sh join   <host> <manager-host>   manager + worker, joining the cluster of <manager-host>
@@ -51,6 +52,10 @@ fi
 [ -z "$labels" ] || worker_env="$worker_env
 FREIGHTDOCK_LABELS=$labels"
 
+# The overlay (G9) drives wireguard-tools and nftables; without them the worker runs, off the overlay, and says why.
+ssh_ "$host" "command -v wg >/dev/null && command -v nft >/dev/null \
+  || { command -v apt-get >/dev/null && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq wireguard-tools nftables >/dev/null; } \
+  || echo 'install wireguard-tools and nftables for the overlay' >&2"
 scp -q "$here/dist/freightdock-worker" "$here/Freightdock-Worker/deploy/freightdock-worker.service" "root@$host:"
 ssh_ "$host" "install -m 755 freightdock-worker /usr/local/bin/ && mv freightdock-worker.service /etc/systemd/system/ \
   && mkdir -p /etc/freightdock && umask 077 && printf '%s\n' '$worker_env' > /etc/freightdock/worker.env \
