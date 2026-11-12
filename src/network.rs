@@ -38,13 +38,15 @@ pub fn state_for(s: &ClusterState, node: &str, endpoint: impl Fn(&str) -> Option
     v1::NetworkState { version: s.applied, cluster_range: format!("{}.{}.0.0/16", CLUSTER_RANGE[0], CLUSTER_RANGE[1]), mtu: MTU, peers, stacks, node_address: s.node_address(node).unwrap_or_default(), exposures: exposures(s, down), floating: floating_of(s, node) }
 }
 
-/// The floating addresses `node` holds, while it is at rest: a node the cluster starts to fence lets them go at once,
-/// before the managers may give them to another.
+/// The floating addresses `node` holds and something is exposed on, while it is at rest: a node the cluster starts
+/// to fence lets them go at once, before the managers may give them to another. An address of the pool no stack uses
+/// is held but not claimed on the LAN, so a large range takes nothing from the LAN until it is used.
 fn floating_of(s: &ClusterState, node: &str) -> Vec<String> {
     if s.nodes.get(node).is_none_or(|n| n.fencing.state != FenceState::None) {
         return vec![];
     }
-    s.floating.iter().filter(|(_, f)| f.holder.as_deref() == Some(node)).map(|(a, _)| a.clone()).collect()
+    let used: std::collections::BTreeSet<&str> = s.stacks.values().flat_map(|st| &st.exposures).map(|e| e.address.as_str()).collect();
+    s.floating.iter().filter(|(a, f)| f.holder.as_deref() == Some(node) && used.contains(a.as_str())).map(|(a, _)| a.clone()).collect()
 }
 
 /// The leader's moves of the floating addresses (G10.3): each with no holder, or whose holder is fenced, to the
@@ -171,7 +173,10 @@ mod tests {
         next(&mut s, &Entry::FloatingAdded { address: "192.0.2.10".into(), at: 1 }).unwrap();
         assert!(state_for(&s, "n1", |_| None, |_| false).floating.is_empty(), "nobody holds it yet");
         next(&mut s, &Entry::FloatingHeld { address: "192.0.2.10".into(), node_id: Some("n1".into()), at: 2 }).unwrap();
-        assert_eq!(state_for(&s, "n1", |_| None, |_| false).floating, vec!["192.0.2.10".to_string()]);
+        assert!(state_for(&s, "n1", |_| None, |_| false).floating.is_empty(), "nothing exposed on it: not claimed on the LAN");
+        next(&mut s, &deploy("a", &[("web", spec("nginx", 1))], &[("a.web.1", "n2")])).unwrap();
+        next(&mut s, &Entry::StackExposed { name: "a".into(), exposures: vec![crate::state::Exposure { service: "web".into(), container_port: 80, protocol: "tcp".into(), address: "192.0.2.10".into(), port: 80 }], at: 2 }).unwrap();
+        assert_eq!(state_for(&s, "n1", |_| None, |_| false).floating, vec!["192.0.2.10".to_string()], "in use: its holder claims it");
         assert!(state_for(&s, "n2", |_| None, |_| false).floating.is_empty());
         next(&mut s, &Entry::NodeFencing { node_id: "n1".into(), state: crate::state::FenceState::Requested, provider: "self".into(), message: String::new(), at: 3 }).unwrap();
         assert!(state_for(&s, "n1", |_| None, |_| false).floating.is_empty(), "a node being fenced lets it go at once");

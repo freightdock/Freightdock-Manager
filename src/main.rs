@@ -22,7 +22,7 @@ freightdock-manager stack expose <name> [service:port=address:port[/udp] ...]   
 freightdock-manager recoveries [stack]      workloads moved off fenced nodes, or left there and why
 freightdock-manager api-token create <name> [read|admin]   a token for the API over TLS (shown once)
 freightdock-manager api-token ls|rm <id>    list or revoke the API tokens
-freightdock-manager floating ls|add|rm [address]   the floating addresses: on one worker at a time, every published port
+freightdock-manager floating ls|add|rm [address]   the address pool; add takes a range too (192.0.2.10-20, 192.0.2.8/29)
 freightdock-manager ca                      the cluster CA's certificate (PEM), for a client of the API over TLS
 freightdock-manager ui <image>|off|status   run the Freightdock UI on the cluster, at port 7443 of every manager
 

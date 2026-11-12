@@ -72,6 +72,9 @@ pub enum Entry {
     UiDbChange { seq: u64, data: Arc<str>, at: Ms },
     /// A floating address given to the cluster (G10.3): a unicast IPv4 address of a LAN, outside the cluster's range.
     FloatingAdded { address: String, at: Ms },
+    /// Addresses added to the pool at once (a range): refused whole if one is not a LAN's; those there already stay
+    /// as they are.
+    FloatingPoolAdded { addresses: Vec<String>, at: Ms },
     /// The address taken back; its holder lets it go at its next network state.
     FloatingRemoved { address: String, at: Ms },
     /// A stack's exposures on the pool (G10.5), all of them (an empty list takes them away). Refused whole unless each
@@ -606,6 +609,42 @@ pub struct Floating {
     pub since: Ms,
 }
 
+/// The most addresses one range adds to the pool.
+pub const POOL_RANGE_MAX: u32 = 1024;
+
+/// The addresses a pool entry is written as: one address, `a.b.c.d-e` (the last byte), `a.b.c.d-e.f.g.h`, or a CIDR
+/// prefix written from its first address (without its network and broadcast addresses, but for a /31 or /32). None
+/// when it is none of those, runs backwards or holds more than [`POOL_RANGE_MAX`]. Whether each is a LAN's address is
+/// checked when it is added.
+pub fn pool_range(s: &str) -> Option<Vec<String>> {
+    use std::net::Ipv4Addr;
+    let s = s.trim();
+    let (from, to) = if let Some((ip, len)) = s.split_once('/') {
+        let (ip, len): (Ipv4Addr, u32) = (ip.parse().ok()?, len.parse().ok()?);
+        if len > 32 {
+            return None;
+        }
+        let mask = if len == 0 { 0 } else { u32::MAX << (32 - len) };
+        let net = u32::from(ip);
+        if net & !mask != 0 {
+            return None;
+        }
+        let last = net | !mask;
+        if len >= 31 { (net, last) } else { (net + 1, last - 1) }
+    } else if let Some((a, b)) = s.split_once('-') {
+        let a: Ipv4Addr = a.parse().ok()?;
+        let b: Ipv4Addr = if b.contains('.') { b.parse().ok()? } else { let o = a.octets(); Ipv4Addr::new(o[0], o[1], o[2], b.parse().ok()?) };
+        (u32::from(a), u32::from(b))
+    } else {
+        let a: Ipv4Addr = s.parse().ok()?;
+        (u32::from(a), u32::from(a))
+    };
+    if to < from || to - from >= POOL_RANGE_MAX {
+        return None;
+    }
+    Some((from..=to).map(|i| Ipv4Addr::from(i).to_string()).collect())
+}
+
 /// Whether `a` can be a floating address: a unicast IPv4 address of a LAN, outside the cluster's range.
 pub fn floating_ok(a: &str) -> bool {
     a.parse::<std::net::Ipv4Addr>().is_ok_and(|ip| {
@@ -854,6 +893,14 @@ impl ClusterState {
                     return Err(Rejected::FloatingExists);
                 }
                 self.floating.insert(address.clone(), Floating { holder: None, since: *at });
+            }
+            Entry::FloatingPoolAdded { addresses, at } => {
+                if !addresses.iter().all(|a| floating_ok(a)) {
+                    return Err(Rejected::BadAddress);
+                }
+                for a in addresses {
+                    self.floating.entry(a.clone()).or_insert(Floating { holder: None, since: *at });
+                }
             }
             Entry::FloatingRemoved { address, .. } => {
                 if !self.floating.contains_key(address) {
@@ -1395,6 +1442,34 @@ pub(crate) mod tests {
 
     fn fence(s: &mut ClusterState, to: FenceState) -> Result<(), Rejected> {
         next(s, &Entry::NodeFencing { node_id: "n1".into(), state: to, provider: "self".into(), message: String::new(), at: 9 })
+    }
+
+    #[test]
+    fn a_pool_range_is_written_three_ways_and_kept_small() {
+        assert_eq!(pool_range("192.0.2.10"), Some(vec!["192.0.2.10".to_string()]));
+        assert_eq!(pool_range("192.0.2.10-12"), Some(vec!["192.0.2.10".to_string(), "192.0.2.11".into(), "192.0.2.12".into()]));
+        assert_eq!(pool_range("192.0.2.254-198.51.100.0").map(|v| v.len()), None, "a range across networks this far is too big");
+        assert_eq!(pool_range("192.0.2.250-192.0.3.1").map(|v| v.len()), Some(8), "across a /24 boundary, written whole");
+        assert_eq!(pool_range("192.0.2.8/29"), Some((9..=14).map(|i| format!("192.0.2.{i}")).collect()), "without the network and broadcast");
+        assert_eq!(pool_range("192.0.2.9/32").map(|v| v.len()), Some(1));
+        assert_eq!(pool_range("192.0.2.8/31").map(|v| v.len()), Some(2));
+        assert_eq!(pool_range("10.0.0.0/22").map(|v| v.len()), Some(1022), "1024 at most");
+        for bad in ["10.0.0.0/21", "192.0.2.12-10", "192.0.2.10-", "192.0.2.10-300", "192.0.2.9/29", "x", "", "192.0.2.1/33"] {
+            assert_eq!(pool_range(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_pool_range_is_added_whole_or_not_at_all_and_what_is_there_stays() {
+        let mut s = with_nodes(&["n1"]);
+        next(&mut s, &Entry::FloatingAdded { address: "192.0.2.11".into(), at: 1 }).unwrap();
+        next(&mut s, &Entry::FloatingHeld { address: "192.0.2.11".into(), node_id: Some("n1".into()), at: 2 }).unwrap();
+        let add = |a: &[&str]| Entry::FloatingPoolAdded { addresses: a.iter().map(|x| x.to_string()).collect(), at: 3 };
+        assert_eq!(next(&mut s, &add(&["192.0.2.12", "10.240.0.9"])), Err(Rejected::BadAddress));
+        assert!(!s.floating.contains_key("192.0.2.12"), "nothing of a refused range");
+        next(&mut s, &add(&["192.0.2.10", "192.0.2.11", "192.0.2.12"])).unwrap();
+        assert_eq!(s.floating.len(), 3);
+        assert_eq!(s.floating["192.0.2.11"].holder.as_deref(), Some("n1"), "one already there kept as it was");
     }
 
     #[test]

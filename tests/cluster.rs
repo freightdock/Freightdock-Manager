@@ -476,6 +476,15 @@ async fn a_floating_address_is_added_given_to_a_healthy_worker_and_taken_back() 
     assert_eq!(https_with(&a.m, &addr, "POST", "/v1/floating", admin, r#"{"address":"192.0.2.10"}"#).await.0, 201);
     assert_eq!(https_with(&a.m, &addr, "POST", "/v1/floating", admin, r#"{"address":"192.0.2.10"}"#).await.0, 409);
     assert_eq!(https_with(&a.m, &addr, "POST", "/v1/floating", admin, r#"{"address":"10.240.0.9"}"#).await.0, 400, "the cluster's own range");
+    let (s, b) = https_with(&a.m, &addr, "POST", "/v1/floating", admin, r#"{"address":"192.0.2.20-22"}"#).await;
+    assert_eq!((s, serde_json::from_str::<serde_json::Value>(&b).unwrap()["added"].as_u64()), (201, Some(3)), "a range: {b}");
+    assert_eq!(https_with(&a.m, &addr, "POST", "/v1/floating", admin, r#"{"address":"192.0.2.0/30"}"#).await.0, 201, "a prefix, .20 to .22 left as they are");
+    assert_eq!(https_with(&a.m, &addr, "POST", "/v1/floating", admin, r#"{"address":"10.0.0.0/16"}"#).await.0, 400, "too big");
+    let (_, b) = https(&a.m, &addr, "GET", "/v1/floating", admin).await;
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&b).unwrap().as_array().map(Vec::len), Some(6), "{b}");
+    for x in ["192.0.2.1", "192.0.2.2", "192.0.2.20", "192.0.2.21", "192.0.2.22"] {
+        assert_eq!(https(&a.m, &addr, "DELETE", &format!("/v1/floating/{x}"), admin).await.0, 204);
+    }
 
     a.m.float_round().await;
     let (_, b) = https(&a.m, &addr, "GET", "/v1/floating", admin).await;

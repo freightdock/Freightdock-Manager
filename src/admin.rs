@@ -360,12 +360,23 @@ async fn floating(State(m): State<Arc<Manager>>, h: HeaderMap) -> R<Json<Value>>
     })))
 }
 
-async fn add_floating(State(m): State<Arc<Manager>>, h: HeaderMap, Json(b): Json<FloatingBody>) -> R<StatusCode> {
+/// One address (409 if the pool has it), or a range of them (`crate::state::pool_range`), added whole; answers how
+/// many were new.
+async fn add_floating(State(m): State<Arc<Manager>>, h: HeaderMap, Json(b): Json<FloatingBody>) -> R<(StatusCode, Json<Value>)> {
     authed(&m, &h)?;
-    let address = b.address.trim().to_string();
-    m.store.propose(Entry::FloatingAdded { address: address.clone(), at: now_ms() }).await?;
-    m.events.push("floating", None, format!("floating address {address} added"));
-    Ok(StatusCode::CREATED)
+    let written = b.address.trim().to_string();
+    if !written.contains(['-', '/']) {
+        m.store.propose(Entry::FloatingAdded { address: written.clone(), at: now_ms() }).await?;
+        m.events.push("floating", None, format!("floating address {written} added"));
+        return Ok((StatusCode::CREATED, Json(json!({ "added": 1 }))));
+    }
+    let Some(addresses) = crate::state::pool_range(&written) else {
+        return Err(ApiError(StatusCode::BAD_REQUEST, format!("{written:?} is not an address, a range (192.0.2.10-20) or a prefix (192.0.2.8/29) of at most {} addresses", crate::state::POOL_RANGE_MAX)));
+    };
+    let added = m.store.read(|s| addresses.iter().filter(|a| !s.floating.contains_key(*a)).count());
+    m.store.propose(Entry::FloatingPoolAdded { addresses, at: now_ms() }).await?;
+    m.events.push("floating", None, format!("floating addresses {written} added to the pool"));
+    Ok((StatusCode::CREATED, Json(json!({ "added": added }))))
 }
 
 async fn remove_floating(State(m): State<Arc<Manager>>, h: HeaderMap, Path(address): Path<String>) -> R<StatusCode> {

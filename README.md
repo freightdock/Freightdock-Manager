@@ -114,7 +114,7 @@ a client trusts that CA alone and checks that name. `GET /v1/health` and `GET /v
 | `GET /v1/recoveries?stack=` | the recovery history, newest first |
 | `GET /v1/api-tokens`, `POST /v1/api-tokens`, `DELETE /v1/api-tokens/{id}` | API tokens: `{"name", "role": "read" or "admin"}` gives the token once |
 | `GET /v1/ca` | the cluster CA's certificate (PEM), no token |
-| `GET /v1/floating`, `POST /v1/floating`, `DELETE /v1/floating/{address}` | the pool of floating addresses (G10.3), each with its holder and what stacks expose on it; `{"address"}` adds one (400 if not a LAN's unicast IPv4 address outside 10.240.0.0/16, 409 if there); one in use is not removed (409) |
+| `GET /v1/floating`, `POST /v1/floating`, `DELETE /v1/floating/{address}` | the pool of floating addresses (G10.3), each with its holder and what stacks expose on it; `{"address"}` adds one (400 if not a LAN's unicast IPv4 address outside 10.240.0.0/16, 409 if there) or a range, `192.0.2.10-20` or `192.0.2.8/29` (at most 1024, those already there kept), answering `{"added": n}`; an address is announced on the LAN only once a stack exposes on it; one in use is not removed (409) |
 | `PUT /v1/stacks/{name}/exposures` | `{"exposures": [{"service", "container_port", "protocol", "address", "port"}]}`: what the stack exposes on the pool (G10.5), all of it; a port is unique per address and protocol; answers the stack |
 | `GET /v1/ui-db?after=` | the UI's database (admin token): its snapshot and changes, or only the changes after `after` |
 | `POST /v1/ui-db/changes`, `PUT /v1/ui-db/snapshot` | `{"seq", "data"}`: the next change only (else 409); `{"head", "data"}`: a snapshot at the latest change only |
