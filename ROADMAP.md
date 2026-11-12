@@ -20,7 +20,7 @@ Status marks: **[x]** done, **[~]** in progress, **[ ]** not started.
 | 7 | G7 Failure detection and stateless recovery | Success criteria 4 and 5; safe only with G6 | G5, G6 | done |
 | 8 | G8 UI: Freightdock as the cluster's UI | Usable by people, not just the CLI; can start in parallel once G4's API settles | G4 | **done** |
 | 9 | G9 Internal networking (Network repo) | Stable workload IPs across workers; postponed by the plan's first release | G7 | **done** (2026-11-12, small items left) |
-| 10 | G10 External networking | Exposing services without per-deploy setup | G9 | **in progress** (the mesh and floating addresses done; the client's address across nodes later) |
+| 10 | G10 External networking | Exposing services without per-deploy setup | G9 | done but item 4 (the client's address across nodes), agreed for later |
 | 11 | G11 Shared storage | Moving stateful workloads safely; needs fencing and storage leases | G6, G7 | not started |
 | 12 | G12 Advanced | Ceph, replicated storage, gateway redundancy, anti-affinity, more fencing providers | G9 to G11 | not started |
 
@@ -262,7 +262,8 @@ address across nodes later.
        `/v1/floating`), held by one worker at a time (`FloatingHeld`, refused while the holder may still answer),
        given by the leader to the healthy worker at rest holding fewest, moved only once its holder is fenced. The
        worker puts it on `fd-ext` and announces it with a gratuitous ARP; a node being fenced is sent none, and a
-       worker that fences itself takes them off first. Every published port answers on it.
+       worker that fences itself takes them off first. Every published port answers on it. In the UI (`freightdock:cluster-ui-10`):
+       a card on the Cluster page, each address with its holder, added and removed by an Administrator.
 4. [ ] Later: the client's address kept for connections forwarded to another node (policy routing on the replies).
 
 ## Open questions for the owner
