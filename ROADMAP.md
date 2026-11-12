@@ -18,7 +18,7 @@ Status marks: **[x]** done, **[~]** in progress, **[ ]** not started.
 | 5 | G5 Scheduling and labels | Workloads need placing once there is more than one worker | G4 | **done** |
 | 6 | G6 Fencing | A worker must be able to fence itself before anything is recovered elsewhere (plan rule 10, 11) | G4 | done |
 | 7 | G7 Failure detection and stateless recovery | Success criteria 4 and 5; safe only with G6 | G5, G6 | done |
-| 8 | G8 UI: Freightdock as the cluster's UI | Usable by people, not just the CLI; can start in parallel once G4's API settles | G4 | **next** (first slice done) |
+| 8 | G8 UI: Freightdock as the cluster's UI | Usable by people, not just the CLI; can start in parallel once G4's API settles | G4 | **done** |
 | 9 | G9 Internal networking (Network repo) | Stable workload IPs across workers; postponed by the plan's first release | G7 | not started |
 | 10 | G10 External networking | Exposing services without per-deploy setup | G9 | not started |
 | 11 | G11 Shared storage | Moving stateful workloads safely; needs fencing and storage leases | G6, G7 | not started |
@@ -195,8 +195,22 @@ same host. Each later goal adds its pages there (stacks with G4, and so on).
        managers: a node's Docker pages via its worker, registries, notifications, backups of the managers' state, the
        MCP server, the Portainer import (last).
 4. [x] A cluster section: nodes, health, stacks, events, fencing, recoveries (the Cluster and Cluster stacks pages).
-5. [ ] The managers run the UI as a system workload (G4's workloads): placed on a node, recovered when that node
-       goes, on the single-node cluster too; reachable through any manager.
+5. [x] The managers run the UI as a system workload (G4's workloads): placed on a node, recovered when that node
+       goes, on the single-node cluster too; reachable through any manager. How (2026-11-12):
+       - A reserved stack, `freightdock`, with one service `ui` (workload `freightdock.ui.1`): `PUT /v1/ui {"image"}`,
+         `DELETE /v1/ui`, CLI `freightdock-manager ui <image>|off|status`, `install-node.sh` with `UI_IMAGE`. A user's
+         stack may not take the name. No volume: the UI's database is the managers' (item 1), so it is stateless and
+         G7 moves it like any stateless workload.
+       - Its secrets are never in the replicated state. The spec holds placeholders (`@freightdock:token`, `:ca`,
+         `:managers`, `:names`); the manager that sends the run command fills them (`Manager::wire`), and only for
+         the `freightdock` stack's workloads. The API token is derived from the cluster CA's key, which every manager
+         holds, so each fills in the same one; the state keeps its hash only (API token `freightdock-ui`, admin).
+       - Every manager forwards 7443 (`FREIGHTDOCK_MANAGER_UI_BIND`) as plain TCP to the UI's node at 7453, looked up
+         at each connection from where its worker connected from; the UI's TLS goes end to end. The UI's certificate
+         names every manager's host (`FREIGHTDOCK_TLS_NAMES` filled in), and its CA travels in the UI's database
+         snapshot, so the certificate a browser trusted once is still trusted after a move.
+       - A worker whose pull fails runs the image already on its node, if there is one (images built or loaded on
+         the node, never pushed).
 
 ## G9 to G12
 

@@ -168,7 +168,7 @@ impl WorkerSession for SessionSvc {
 
         // What it has not finished, again: it knows each command by id and runs none twice.
         for c in m.store.read(|s| s.open_commands(&node_id).into_iter().cloned().collect::<Vec<_>>()) {
-            let _ = tx.send(Ok(command_to_proto(&c))).await;
+            let _ = tx.send(Ok(m.wire(&c))).await;
         }
 
         tokio::spawn(async move {

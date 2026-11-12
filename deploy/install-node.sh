@@ -7,7 +7,8 @@
 #   install-node.sh worker <host> <manager-host>   a worker only, for the cluster of <manager-host>
 #
 # <host> is the address the others reach it at (it is advertised as <host>:7450). Set LABELS=key=value,... for the
-# worker's labels. A cluster starts with `first` on one node; add managers in twos (1, 3, 5): with two, losing either
+# worker's labels, and UI_IMAGE=<image> with `first` to run the Freightdock UI on the new cluster (at port 7443 of
+# every manager; `freightdock-manager ui <image>` does it later, or on another cluster). A cluster starts with `first` on one node; add managers in twos (1, 3, 5): with two, losing either
 # stops every change.
 set -eu
 here=$(cd "$(dirname "$0")/../.." && pwd)
@@ -15,6 +16,7 @@ role=${1:?first, join or worker}
 host=${2:?the host to install on}
 via=${3:-}
 labels=${LABELS:-}
+ui_image=${UI_IMAGE:-}
 ssh_() { ssh -o BatchMode=no "root@$1" "$2"; }
 fdm() { ssh_ "$via" "FREIGHTDOCK_MANAGER_DATA=/var/lib/freightdock-manager freightdock-manager $1"; }
 
@@ -54,3 +56,11 @@ ssh_ "$host" "install -m 755 freightdock-worker /usr/local/bin/ && mv freightdoc
   && mkdir -p /etc/freightdock && umask 077 && printf '%s\n' '$worker_env' > /etc/freightdock/worker.env \
   && systemctl daemon-reload && systemctl enable freightdock-worker && systemctl restart freightdock-worker"
 echo "worker on $host"
+
+if [ "$role" = first ] && [ -n "$ui_image" ]; then
+  # The UI needs a node to run on: wait for the worker to be heard, then ask for it.
+  for _ in $(seq 30); do
+    ssh_ "$host" "FREIGHTDOCK_MANAGER_DATA=/var/lib/freightdock-manager freightdock-manager ui '$ui_image'" && break
+    sleep 2
+  done
+fi

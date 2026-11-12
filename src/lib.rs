@@ -15,6 +15,7 @@ pub mod stacks;
 pub mod state;
 pub mod store;
 pub mod tls;
+pub mod ui;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -43,6 +44,8 @@ pub struct Config {
     pub api_bind: Option<SocketAddr>,
     /// The same API over TLS for the network (G8.2), for API tokens: the UI on another node, a remote CLI.
     pub api_tls_bind: Option<SocketAddr>,
+    /// Where this manager answers for the UI (G8.5), forwarding to the node it runs on; `None` turns it off.
+    pub ui_bind: Option<SocketAddr>,
     /// The manager endpoints handed to workers (host:port), this one's first.
     pub advertise: Vec<String>,
     pub thresholds: Thresholds,
@@ -82,6 +85,8 @@ impl Config {
         let api_bind = if api == "off" { None } else { Some(api.parse().context("FREIGHTDOCK_MANAGER_API_BIND")?) };
         let api_tls = get("FREIGHTDOCK_MANAGER_API_TLS_BIND", "0.0.0.0:7452");
         let api_tls_bind = if api_tls == "off" { None } else { Some(api_tls.parse().context("FREIGHTDOCK_MANAGER_API_TLS_BIND")?) };
+        let ui = get("FREIGHTDOCK_MANAGER_UI_BIND", "0.0.0.0:7443");
+        let ui_bind = if ui == "off" { None } else { Some(ui.parse().context("FREIGHTDOCK_MANAGER_UI_BIND")?) };
         let advertise = match std::env::var("FREIGHTDOCK_MANAGER_ADVERTISE") {
             Ok(v) => v.split(',').map(str::trim).filter(|s| !s.is_empty()).map(freightdock_proto::with_default_port).collect(),
             Err(_) => {
@@ -101,7 +106,7 @@ impl Config {
             (Err(_), Err(_)) => None,
             _ => anyhow::bail!("FREIGHTDOCK_MANAGER_JOIN and FREIGHTDOCK_MANAGER_JOIN_TOKEN go together"),
         };
-        Ok(Config { data_dir: get("FREIGHTDOCK_MANAGER_DATA", "/var/lib/freightdock-manager").into(), bind, api_bind, api_tls_bind, advertise, thresholds, bootstrap: join.is_none(), join, local_worker_token: std::env::var("FREIGHTDOCK_MANAGER_LOCAL_WORKER_TOKEN").ok().filter(|p| !p.trim().is_empty()).map(PathBuf::from), fencing: fencing::FenceConfig::from_env()? })
+        Ok(Config { data_dir: get("FREIGHTDOCK_MANAGER_DATA", "/var/lib/freightdock-manager").into(), bind, api_bind, api_tls_bind, ui_bind, advertise, thresholds, bootstrap: join.is_none(), join, local_worker_token: std::env::var("FREIGHTDOCK_MANAGER_LOCAL_WORKER_TOKEN").ok().filter(|p| !p.trim().is_empty()).map(PathBuf::from), fencing: fencing::FenceConfig::from_env()? })
     }
 }
 
@@ -264,11 +269,27 @@ impl Manager {
         }
     }
 
+    /// Where the UI's connections go now: its workload's node, as [`ui::target`] reads it.
+    pub fn ui_target(&self, port: u32) -> Option<String> {
+        let node = self.store.read(|s| s.workloads.get(ui::WORKLOAD).and_then(|w| w.node_id.clone()))?;
+        let l = self.sessions.liveness(&node);
+        ui::target(l.peer.as_deref()?, l.via.as_deref(), port)
+    }
+
+    /// A command as it goes to its worker: the UI's placeholders filled here, never in the state (`ui::fill`).
+    pub fn wire(&self, c: &CommandRecord) -> freightdock_proto::v1::ManagerMessage {
+        let mut c = c.clone();
+        if c.op.workload_id().is_some_and(|w| w.starts_with(&format!("{}.", ui::STACK))) {
+            ui::fill(&mut c.op, &ui::Fill { token: ui::token(&self.ca.key_pem()), ca_pem: self.ca.cert_pem.clone(), managers: self.managers() });
+        }
+        grpc::command_to_proto(&c)
+    }
+
     /// Sends a command to its node if the node is connected to this manager. If not, it waits as pending and is sent
     /// when the node connects.
     pub fn deliver(&self, c: &CommandRecord) {
         if let Some(tx) = self.sessions.sender(&c.node_id)
-            && tx.try_send(Ok(grpc::command_to_proto(c))).is_err()
+            && tx.try_send(Ok(self.wire(c))).is_err()
         {
             tracing::warn!(node = %c.node_id, command = %c.id, "the stream is full or closed; the command is sent again at the next connect");
         }
@@ -392,6 +413,35 @@ pub async fn serve_workers(m: Arc<Manager>, listener: tokio::net::TcpListener) -
         .serve_with_incoming(tls::incoming(listener, tls))
         .await?;
     Ok(())
+}
+
+/// Forwards the UI's port (G8.5) to the node the UI runs on, at `port` there ([`ui::HOST_PORT`]), as plain TCP: the
+/// TLS is the UI's own. Where it runs is looked up for every connection, so a UI that moved is found at once; with no UI
+/// placed, or its node not heard, the connection is closed.
+pub async fn serve_ui(m: Arc<Manager>, listener: tokio::net::TcpListener, port: u32) -> Result<()> {
+    loop {
+        let (mut tcp, addr) = match listener.accept().await {
+            Ok(x) => x,
+            Err(e) => {
+                tracing::warn!("accept: {e}");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+        };
+        let Some(to) = m.ui_target(port) else {
+            tracing::debug!("UI connection from {addr}: no UI placed or its node unheard");
+            continue;
+        };
+        tokio::spawn(async move {
+            let mut up = match tokio::time::timeout(Duration::from_secs(5), tokio::net::TcpStream::connect(&to)).await {
+                Ok(Ok(c)) => c,
+                _ => return tracing::debug!("UI connection from {addr}: {to} did not answer"),
+            };
+            let _ = tcp.set_nodelay(true);
+            let _ = up.set_nodelay(true);
+            let _ = tokio::io::copy_bidirectional(&mut tcp, &mut up).await;
+        });
+    }
 }
 
 pub async fn serve_admin(m: Arc<Manager>, listener: tokio::net::TcpListener) -> Result<()> {

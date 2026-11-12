@@ -53,12 +53,27 @@ Freightdock-Manager/deploy/install-node.sh join   10.0.0.13 10.0.0.11    # a thi
 Freightdock-Manager/deploy/install-node.sh worker 10.0.0.21 10.0.0.11    # a worker only
 ```
 
-The script works over `ssh root@<host>`; `LABELS=key=value,...` sets the worker's labels. It writes
+The script works over `ssh root@<host>`; `LABELS=key=value,...` sets the worker's labels, and `UI_IMAGE=<image>`
+with `first` runs the Freightdock UI on the new cluster (below). It writes
 `/etc/freightdock/manager.env` and `worker.env`, which are the whole configuration (below). By hand: a worker join
 token from `freightdock-manager join-token`, a manager one from `freightdock-manager manager-token`, each good once.
 
 With two managers, losing either stops every change (a majority of two is two), so grow from one manager to three.
 Port 7450/tcp must be open between managers and from workers to managers; nothing needs to be open on a worker.
+
+## The UI
+
+`freightdock-manager ui <image>` runs the Freightdock UI (the Freightdock-UI repository's image) as the managers' own
+stack, `freightdock`: one workload, placed on a node like any other and moved when that node fails, on a one-node
+cluster too once it is back. Every manager answers for it at port 7443, forwarding the connection as plain TCP to the
+node it runs on (port 7453 there), so the UI's own TLS goes end to end and any manager's address reaches it.
+`ui status` shows where it runs, `ui off` removes it.
+
+It needs no volume and no token copied by hand: its database is kept by the managers, and its API token is derived
+from the cluster CA's key, which every manager holds; the state keeps only the token's hash (API token
+`freightdock-ui`, admin). The token, the CA and the managers' addresses reach the UI only in the command that starts
+it, filled in by the manager that sends it, never written to the cluster's state. A stack of one's own cannot be called
+`freightdock`, and its environment is never filled.
 
 ## Settings
 
@@ -68,6 +83,7 @@ Port 7450/tcp must be open between managers and from workers to managers; nothin
 | `FREIGHTDOCK_MANAGER_BIND` | `0.0.0.0:7450` | The worker API (gRPC, mutual TLS) |
 | `FREIGHTDOCK_MANAGER_API_BIND` | `127.0.0.1:7451` | The admin HTTP API, or `off` |
 | `FREIGHTDOCK_MANAGER_API_TLS_BIND` | `0.0.0.0:7452` | The same API over TLS for the network (API tokens), or `off` |
+| `FREIGHTDOCK_MANAGER_UI_BIND` | `0.0.0.0:7443` | Where this manager answers for the UI, forwarded to its node, or `off` |
 | `FREIGHTDOCK_MANAGER_ADVERTISE` | `<hostname>:7450` | Where the others reach this manager, comma separated (the first is its Raft address) |
 | `FREIGHTDOCK_MANAGER_JOIN` | | First start only: join the cluster of the manager at `host[:port]` |
 | `FREIGHTDOCK_MANAGER_JOIN_TOKEN` | | With it: a token from `manager-token` (`FDMT1-...`) |
@@ -100,6 +116,7 @@ a client trusts that CA alone and checks that name. `GET /v1/health` and `GET /v
 | `GET /v1/ca` | the cluster CA's certificate (PEM), no token |
 | `GET /v1/ui-db?after=` | the UI's database (admin token): its snapshot and changes, or only the changes after `after` |
 | `POST /v1/ui-db/changes`, `PUT /v1/ui-db/snapshot` | `{"seq", "data"}`: the next change only (else 409); `{"head", "data"}`: a snapshot at the latest change only |
+| `GET /v1/ui`, `PUT /v1/ui`, `DELETE /v1/ui` | the UI: on or off, its image and its stack; `{"image"}` runs it or moves it to that image; off |
 | `POST /v1/nodes/{id}/commands` | `{"op": "ping"}` and the other ops; answers the command (202) |
 | `GET /v1/commands?node=`, `GET /v1/commands/{id}` | commands and their status |
 | `GET /v1/stacks`, `GET /v1/stacks/{name}` | stacks with each workload's node, status, container and last command; one with its Compose file |

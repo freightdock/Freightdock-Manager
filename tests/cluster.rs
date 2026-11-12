@@ -26,7 +26,7 @@ async fn start(join: Option<(&str, String)>) -> Running {
     let port = free_port();
     let addr = format!("127.0.0.1:{port}");
     let join = join.map(|(a, token)| Join { addr: a.to_string(), token });
-    let config = Config { data_dir: dir.path().into(), bind: addr.parse().unwrap(), api_bind: None, api_tls_bind: None, advertise: vec![addr.clone()], thresholds: Default::default(), bootstrap: join.is_none(), join: join.clone(), local_worker_token: None, fencing: Default::default() };
+    let config = Config { data_dir: dir.path().into(), bind: addr.parse().unwrap(), api_bind: None, api_tls_bind: None, ui_bind: None, advertise: vec![addr.clone()], thresholds: Default::default(), bootstrap: join.is_none(), join: join.clone(), local_worker_token: None, fencing: Default::default() };
     let m = Manager::open(&config).await.unwrap();
     let l = tokio::net::TcpListener::bind(config.bind).await.unwrap();
     let server = tokio::spawn({
@@ -205,7 +205,7 @@ async fn a_manager_leaves_a_token_for_the_worker_on_its_own_node() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("local-worker.token");
     let addr = format!("127.0.0.1:{}", free_port());
-    let config = Config { data_dir: dir.path().join("data"), bind: addr.parse().unwrap(), api_bind: None, api_tls_bind: None, advertise: vec![addr], thresholds: Default::default(), bootstrap: true, join: None, local_worker_token: Some(path.clone()), fencing: Default::default() };
+    let config = Config { data_dir: dir.path().join("data"), bind: addr.parse().unwrap(), api_bind: None, api_tls_bind: None, ui_bind: None, advertise: vec![addr], thresholds: Default::default(), bootstrap: true, join: None, local_worker_token: Some(path.clone()), fencing: Default::default() };
     let m = Manager::open(&config).await.unwrap();
     m.local_worker_token().await;
     let t = JoinToken::parse(&std::fs::read_to_string(&path).unwrap()).expect("a worker's join token");
@@ -324,5 +324,102 @@ async fn the_api_over_tls_takes_api_tokens_by_role() {
     let (_, b) = https(&a.m, &addr, "GET", "/v1/ui-db", admin).await;
     let v: serde_json::Value = serde_json::from_str(&b).unwrap();
     assert_eq!(v["snapshot"].as_str().map(str::len), Some(5 << 20));
+    a.server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_ui_is_the_managers_own_stack_and_only_its_command_carries_the_token() {
+    use freightdock_manager::state::NodeReport;
+    use freightdock_manager::ui;
+    use freightdock_proto::v1::manager_message::Body;
+    let a = start(None).await;
+    until("a leader", || a.m.store.leader().is_some()).await;
+    let t = JoinToken::parse(&issue(&a.m, false).await).unwrap();
+    a.m.store.propose(Entry::NodeEnrolled { node_id: "n1".into(), hostname: "h".into(), secret_hash: t.secret_hash(), cert_sha256: "c".into(), at: now_ms() }).await.unwrap();
+    a.m.store.propose(Entry::NodeReported { node_id: "n1".into(), report: NodeReport { docker: true, ..Default::default() }, at: now_ms() }).await.unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+    a.m.sessions.open("n1", tx, "192.0.2.7:50000".into(), Some(Default::default()));
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap().to_string();
+    tokio::spawn(freightdock_manager::serve_admin_tls(a.m.clone(), l));
+    let admin = Some(a.m.admin_token.as_str());
+
+    let (s, b) = https(&a.m, &addr, "GET", "/v1/ui", admin).await;
+    assert_eq!(s, 200, "{b}");
+    assert!(b.contains(r#""enabled":false"#), "{b}");
+    let compose = r#"{"name":"freightdock","compose":"services:\n  web:\n    image: nginx\n"}"#;
+    assert_eq!(https_with(&a.m, &addr, "POST", "/v1/stacks", admin, compose).await.0, 400, "the name is the managers'");
+    assert_eq!(https_with(&a.m, &addr, "PUT", "/v1/ui", admin, r#"{"image":""}"#).await.0, 400);
+
+    let (s, b) = https_with(&a.m, &addr, "PUT", "/v1/ui", admin, r#"{"image":"freightdock:test"}"#).await;
+    assert_eq!(s, 201, "{b}");
+    let v: serde_json::Value = serde_json::from_str(&b).unwrap();
+    assert_eq!((v["enabled"].as_bool(), v["image"].as_str()), (Some(true), Some("freightdock:test")));
+    let (w, kept) = a.m.store.read(|s| (s.workloads.get(ui::WORKLOAD).cloned(), s.api_tokens.get(ui::TOKEN_ID).cloned()));
+    let w = w.expect("its workload");
+    assert_eq!(w.node_id.as_deref(), Some("n1"));
+    assert!(w.spec.env.values().all(|v| v.starts_with("@freightdock:")), "no secret in the state");
+    let token = ui::token(&a.m.ca.key_pem());
+    assert_eq!(kept.expect("its API token").secret_hash, freightdock_proto::sha256_hex(&token));
+    assert_eq!(https(&a.m, &addr, "GET", "/v1/nodes", Some(&token)).await.0, 200, "the token works");
+    assert_eq!(https_with(&a.m, &addr, "PUT", "/v1/ui", admin, r#"{"image":"freightdock:test2"}"#).await.0, 200, "again: a new image");
+    assert_eq!(https(&a.m, &addr, "DELETE", "/v1/stacks/freightdock", admin).await.0, 400);
+
+    // The run that reaches the worker has them filled.
+    a.m.reconcile().await;
+    let got = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await.expect("a run").unwrap().unwrap();
+    let Some(Body::Command(c)) = got.body else { panic!("{got:?}") };
+    let Some(freightdock_proto::v1::command::Op::RunContainer(r)) = &c.op else { panic!("{c:?}") };
+    assert_eq!(r.image, "freightdock:test2");
+    assert_eq!(r.env.get("FREIGHTDOCK_CLUSTER_TOKEN"), Some(&token));
+    assert!(r.env["FREIGHTDOCK_CLUSTER_CA"].contains("BEGIN CERTIFICATE"));
+    assert_eq!(r.env["FREIGHTDOCK_CLUSTER_API"], "https://127.0.0.1:7452");
+
+    // Off: the stack and the token go.
+    assert_eq!(https(&a.m, &addr, "DELETE", "/v1/ui", admin).await.0, 204);
+    assert!(a.m.store.read(|s| !s.stacks.contains_key(ui::STACK) && !s.api_tokens.contains_key(ui::TOKEN_ID)));
+    assert_eq!(https(&a.m, &addr, "GET", "/v1/nodes", Some(&token)).await.0, 401);
+    a.server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn every_manager_forwards_the_ui_s_port_to_the_node_it_runs_on() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let a = start(None).await;
+    until("a leader", || a.m.store.leader().is_some()).await;
+    let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let paddr = proxy.local_addr().unwrap();
+    // The UI on its node: an echo server.
+    let ui = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = ui.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        loop {
+            let (mut c, _) = ui.accept().await.unwrap();
+            tokio::spawn(async move {
+                let (mut r, mut w) = c.split();
+                let _ = tokio::io::copy(&mut r, &mut w).await;
+            });
+        }
+    });
+    tokio::spawn(freightdock_manager::serve_ui(a.m.clone(), proxy, port as u32));
+
+    // No UI deployed: the connection is closed at once.
+    let mut c = tokio::net::TcpStream::connect(paddr).await.unwrap();
+    let mut buf = [0u8; 8];
+    assert_eq!(tokio::time::timeout(Duration::from_secs(5), c.read(&mut buf)).await.unwrap().unwrap(), 0);
+
+    // Deployed on n1, which connected over loopback to this manager: its host.
+    let t = JoinToken::parse(&issue(&a.m, false).await).unwrap();
+    a.m.store.propose(Entry::NodeEnrolled { node_id: "n1".into(), hostname: "h".into(), secret_hash: t.secret_hash(), cert_sha256: "c".into(), at: now_ms() }).await.unwrap();
+    let (tx, _rx) = tokio::sync::mpsc::channel(8);
+    a.m.sessions.open("n1", tx, "127.0.0.1:50000".into(), None);
+    let services: std::collections::BTreeMap<_, _> = [(freightdock_manager::ui::SERVICE.to_string(), freightdock_manager::ui::spec("i"))].into();
+    let placements = [(freightdock_manager::ui::WORKLOAD.to_string(), "n1".to_string())].into();
+    a.m.store.propose(Entry::StackDeployed { name: freightdock_manager::ui::STACK.into(), compose: String::new(), services, placements, at: now_ms() }).await.unwrap();
+    let mut c = tokio::net::TcpStream::connect(paddr).await.unwrap();
+    c.write_all(b"hello").await.unwrap();
+    let mut buf = [0u8; 5];
+    tokio::time::timeout(Duration::from_secs(5), c.read_exact(&mut buf)).await.unwrap().unwrap();
+    assert_eq!(&buf, b"hello");
     a.server.abort();
 }

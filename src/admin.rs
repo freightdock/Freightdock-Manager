@@ -101,6 +101,7 @@ pub fn router(m: Arc<Manager>) -> Router {
         .route("/v1/events", get(events))
         .route("/v1/recoveries", get(recoveries))
         .route("/v1/commands/{id}", get(command))
+        .route("/v1/ui", get(ui_status).put(ui_deploy).delete(ui_remove))
         .route("/v1/stacks", get(stacks).post(deploy_stack))
         .route("/v1/stacks/{name}", get(stack).delete(remove_stack))
         .route("/v1/stacks/{name}/{action}", post(stack_action))
@@ -473,6 +474,55 @@ async fn stack(State(m): State<Arc<Manager>>, h: HeaderMap, Path(name): Path<Str
     m.store.read(|s| s.stacks.get(&name).map(|st| stack_json(&m, s, st, true))).map(Json).ok_or(ApiError(StatusCode::NOT_FOUND, "no such stack".into()))
 }
 
+/// The UI as the managers run it (G8.5): its image, where it is and how it is, or `{"enabled": false}`.
+async fn ui_status(State(m): State<Arc<Manager>>, h: HeaderMap) -> R<Json<Value>> {
+    authed(&m, &h)?;
+    Ok(Json(m.store.read(|s| match s.stacks.get(crate::ui::STACK) {
+        None => json!({ "enabled": false, "port": crate::ui::UI_PORT }),
+        Some(st) => json!({ "enabled": true, "port": crate::ui::UI_PORT, "image": st.services.get(crate::ui::SERVICE).map(|sp| sp.image.clone()), "stack": stack_json(&m, s, st, false) }),
+    })))
+}
+
+#[derive(Deserialize)]
+struct UiBody {
+    image: String,
+}
+
+/// Runs the UI from `image`, or moves it to another image: its API token first (derived, so the same on every
+/// manager; only its hash in the state), then the managers' own stack.
+async fn ui_deploy(State(m): State<Arc<Manager>>, h: HeaderMap, Json(b): Json<UiBody>) -> R<(StatusCode, Json<Value>)> {
+    authed(&m, &h)?;
+    let image = b.image.trim().to_string();
+    if image.is_empty() || image.len() > 256 || image.chars().any(char::is_whitespace) {
+        return Err(ApiError(StatusCode::BAD_REQUEST, "an image, as docker pull takes it".into()));
+    }
+    let hash = freightdock_proto::sha256_hex(crate::ui::token(&m.ca.key_pem()));
+    if m.store.read(|s| s.api_token(&hash).is_none()) {
+        m.store.propose(Entry::ApiTokenIssued { id: crate::ui::TOKEN_ID.into(), name: crate::ui::TOKEN_NAME.into(), role: ApiRole::Admin, secret_hash: hash, at: now_ms() }).await?;
+    }
+    let services: std::collections::BTreeMap<String, crate::state::ServiceSpec> = [(crate::ui::SERVICE.to_string(), crate::ui::spec(&image))].into();
+    let compose = format!("# The managers' own stack: the Freightdock UI (PUT /v1/ui).\nservices:\n  {}:\n    image: {image}\n", crate::ui::SERVICE);
+    let placements = m.store.read(|s| crate::stacks::place(s, crate::ui::STACK, &services, &m.eligible(s))).map_err(|e| ApiError(StatusCode::CONFLICT, e))?;
+    let existed = m.store.read(|s| s.stacks.contains_key(crate::ui::STACK));
+    m.store.propose(Entry::StackDeployed { name: crate::ui::STACK.into(), compose, services, placements, at: now_ms() }).await?;
+    m.events.push("ui", None, format!("the UI {} ({image})", if existed { "updated" } else { "deployed" }));
+    let (code, Json(v)) = (if existed { StatusCode::OK } else { StatusCode::CREATED }, ui_status(State(m), h).await?);
+    Ok((code, Json(v)))
+}
+
+/// Stops running the UI: its stack and its token go.
+async fn ui_remove(State(m): State<Arc<Manager>>, h: HeaderMap) -> R<StatusCode> {
+    authed(&m, &h)?;
+    if m.store.read(|s| s.stacks.contains_key(crate::ui::STACK)) {
+        m.store.propose(Entry::StackRemoved { name: crate::ui::STACK.into(), at: now_ms() }).await?;
+    }
+    if m.store.read(|s| s.api_tokens.contains_key(crate::ui::TOKEN_ID)) {
+        m.store.propose(Entry::ApiTokenRevoked { id: crate::ui::TOKEN_ID.into(), at: now_ms() }).await?;
+    }
+    m.events.push("ui", None, "the UI removed".to_string());
+    Ok(StatusCode::NO_CONTENT)
+}
+
 #[derive(Deserialize)]
 struct DeployBody {
     name: String,
@@ -486,6 +536,9 @@ async fn deploy_stack(State(m): State<Arc<Manager>>, h: HeaderMap, Json(b): Json
     let name = b.name.trim().to_string();
     if !crate::state::valid_stack_name(&name) {
         return Err(ApiError(StatusCode::BAD_REQUEST, Rejected::BadName.to_string()));
+    }
+    if name == crate::ui::STACK {
+        return Err(ApiError(StatusCode::BAD_REQUEST, format!("{} is the managers' own stack, for the UI: PUT /v1/ui", crate::ui::STACK)));
     }
     let parsed = crate::compose::parse(&b.compose).map_err(|e| ApiError(StatusCode::BAD_REQUEST, e))?;
     let placements = m.store.read(|s| {
@@ -502,6 +555,9 @@ async fn deploy_stack(State(m): State<Arc<Manager>>, h: HeaderMap, Json(b): Json
 
 async fn remove_stack(State(m): State<Arc<Manager>>, h: HeaderMap, Path(name): Path<String>) -> R<StatusCode> {
     authed(&m, &h)?;
+    if name == crate::ui::STACK {
+        return Err(ApiError(StatusCode::BAD_REQUEST, format!("{} is the managers' own stack, for the UI: DELETE /v1/ui", crate::ui::STACK)));
+    }
     m.store.propose(Entry::StackRemoved { name: name.clone(), at: now_ms() }).await?;
     m.events.push("stack_removed", None, format!("stack {name} removed"));
     Ok(StatusCode::NO_CONTENT)
