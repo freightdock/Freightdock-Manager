@@ -30,6 +30,22 @@ fn host_ports(spec: &ServiceSpec) -> BTreeSet<(u32, String)> {
     spec.ports.iter().filter(|p| p.host_port != 0).map(|p| (p.host_port, p.protocol.clone())).collect()
 }
 
+/// Why `services` cannot be deployed as stack `name` for their published ports, if they cannot (G10): every node
+/// answers a published port, so it is one stack's in the whole cluster, and never one the host keeps for itself.
+pub fn port_conflict(s: &ClusterState, name: &str, services: &BTreeMap<String, ServiceSpec>) -> Option<String> {
+    for (svc, spec) in services {
+        for (port, proto) in host_ports(spec) {
+            if freightdock_proto::RESERVED_PORTS.contains(&port) {
+                return Some(format!("service {svc}: port {port} is the cluster's own (ssh, the managers, WireGuard)"));
+            }
+            if let Some(other) = s.stacks.values().find(|o| o.name != name && o.services.values().any(|os| host_ports(os).contains(&(port, proto.clone())))) {
+                return Some(format!("service {svc}: port {port}/{proto} is published by stack {} already, and every node answers it", other.name));
+            }
+        }
+    }
+    None
+}
+
 /// Whether `need` fits beside `held` on `n`. A node that did not report its size takes anything.
 fn fits(n: &Node, held: &Resources, need: &Resources) -> bool {
     let (cpus, mem) = n.report.as_ref().map_or((0, 0), |r| (r.cpu_count as u64 * 1000, r.memory_total_bytes));
@@ -253,9 +269,28 @@ mod tests {
     fn state_with(nodes: &[&str]) -> ClusterState {
         let mut s = cluster();
         for n in nodes {
-            s.nodes.insert(n.to_string(), crate::state::Node { id: n.to_string(), hostname: n.to_string(), cert_sha256: String::new(), prev_cert_sha256: None, enrolled_at: 0, report: None, reported_at: None, labels: Default::default(), fencing: Default::default(), recovered: false });
+            s.nodes.insert(n.to_string(), crate::state::Node { id: n.to_string(), hostname: n.to_string(), cert_sha256: String::new(), prev_cert_sha256: None, enrolled_at: 0, report: None, reported_at: None, labels: Default::default(), fencing: Default::default(), recovered: false, overlay: None });
         }
         s
+    }
+
+    #[test]
+    fn a_published_port_is_the_cluster_s_once_and_never_the_host_s_own() {
+        let mut s = state_with(&["n1"]);
+        let with = |port: u32, proto: &str| {
+            let mut w = spec("nginx", 1);
+            w.ports = vec![Port { host_port: port, container_port: 80, protocol: proto.into(), host_ip: String::new() }];
+            BTreeMap::from([("web".to_string(), w)])
+        };
+        assert_eq!(port_conflict(&s, "a", &with(8088, "tcp")), None);
+        deploy(&mut s, "a", &with(8088, "tcp"), BTreeMap::from([("a.web.1".to_string(), "n1".to_string())]));
+        assert!(port_conflict(&s, "b", &with(8088, "tcp")).unwrap().contains("stack a"), "every node answers it: one stack's");
+        assert_eq!(port_conflict(&s, "a", &with(8088, "tcp")), None, "its own again, redeployed");
+        assert_eq!(port_conflict(&s, "b", &with(8088, "udp")), None, "another protocol");
+        for p in [22, 7450, 7451, 7452, 51820] {
+            assert!(port_conflict(&s, "b", &with(p, "tcp")).is_some(), "{p}");
+        }
+        assert_eq!(port_conflict(&s, "b", &with(0, "tcp")), None, "not published");
     }
 
     fn deploy(s: &mut ClusterState, stack: &str, services: &BTreeMap<String, ServiceSpec>, placements: BTreeMap<String, String>) {

@@ -34,6 +34,8 @@ pub enum Entry {
     /// What a worker said of itself in its hello, recorded when it differs from what is known.
     NodeReported { node_id: String, report: NodeReport, at: Ms },
     NodeRemoved { node_id: String, at: Ms },
+    /// The node is given its overlay address (G10) if it has none: nodes enrolled before G10 get theirs so.
+    NodeAddressed { node_id: String },
     /// A worker's new certificate (G2.7), asked for with its current one; that one stays good until the next.
     NodeCertRenewed { node_id: String, cert_sha256: String, at: Ms },
     /// A step of the node's fencing. Only a step the state machine allows is applied (`FenceState::allows`).
@@ -164,6 +166,9 @@ pub struct Node {
     /// Its workloads were recovered for the current fencing (G7); cleared when fencing starts again or ends.
     #[serde(default)]
     pub recovered: bool,
+    /// Its overlay address's last byte (G10), `<range>.0.<n>`: given at enrolment (the lowest free), kept for its life.
+    #[serde(default)]
+    pub overlay: Option<u8>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -619,6 +624,24 @@ impl ClusterState {
         self.join_tokens.values().any(|t| t.spent_by.as_deref() == Some(who.as_str()))
     }
 
+    /// Gives `node_id` the lowest free overlay address if it has none (a full /24 leaves it without: off the mesh).
+    fn give_overlay(&mut self, node_id: &str) {
+        if self.nodes.get(node_id).is_none_or(|n| n.overlay.is_some()) {
+            return;
+        }
+        let used: std::collections::BTreeSet<u8> = self.nodes.values().filter_map(|n| n.overlay).collect();
+        let free = (1..=254u8).find(|h| !used.contains(h));
+        if let Some(n) = self.nodes.get_mut(node_id) {
+            n.overlay = free;
+        }
+    }
+
+    /// The node's overlay address, `10.240.0.7`.
+    pub fn node_address(&self, node_id: &str) -> Option<String> {
+        let h = self.nodes.get(node_id)?.overlay?;
+        Some(format!("{}.{}.0.{h}", CLUSTER_RANGE[0], CLUSTER_RANGE[1]))
+    }
+
     pub fn node_by_cert(&self, cert_sha256: &str) -> Option<&Node> {
         self.nodes.values().find(|n| n.cert_sha256 == cert_sha256 || n.prev_cert_sha256.as_deref() == Some(cert_sha256))
     }
@@ -716,7 +739,8 @@ impl ClusterState {
                     return Err(Rejected::NodeExists);
                 }
                 self.join_tokens.get_mut(secret_hash).expect("checked").spent_by = Some(node_id.clone());
-                self.nodes.insert(node_id.clone(), Node { id: node_id.clone(), hostname: hostname.clone(), cert_sha256: cert_sha256.clone(), prev_cert_sha256: None, enrolled_at: *at, report: None, reported_at: None, labels: BTreeMap::new(), fencing: Fencing::default(), recovered: false });
+                self.nodes.insert(node_id.clone(), Node { id: node_id.clone(), hostname: hostname.clone(), cert_sha256: cert_sha256.clone(), prev_cert_sha256: None, enrolled_at: *at, report: None, reported_at: None, labels: BTreeMap::new(), fencing: Fencing::default(), recovered: false, overlay: None });
+                self.give_overlay(node_id);
             }
             Entry::NodeReported { node_id, report, at } => {
                 let n = self.nodes.get_mut(node_id).ok_or(Rejected::NodeUnknown)?;
@@ -757,6 +781,12 @@ impl ClusterState {
                     c.status = CommandStatus::Rejected;
                     c.message = "the node was removed".into();
                 }
+            }
+            Entry::NodeAddressed { node_id } => {
+                if !self.nodes.contains_key(node_id) {
+                    return Err(Rejected::NodeUnknown);
+                }
+                self.give_overlay(node_id);
             }
             Entry::NodeCertRenewed { node_id, cert_sha256, .. } => {
                 let n = self.nodes.get_mut(node_id).ok_or(Rejected::NodeUnknown)?;
@@ -1081,6 +1111,23 @@ pub(crate) mod tests {
         assert_eq!(s.apply_at(6, &Entry::NodeCertRenewed { node_id: "n9".into(), cert_sha256: "x".into(), at: 40 }), Err(Rejected::NodeUnknown));
         s.apply_at(7, &Entry::NodeRemoved { node_id: "n1".into(), at: 50 }).unwrap();
         assert!(s.node_by_cert("cert-2").is_none(), "nor any of a removed node's");
+    }
+
+    #[test]
+    fn every_node_has_an_overlay_address_of_its_own_kept_for_its_life() {
+        let mut s = with_nodes(&["n1", "n2"]);
+        assert_eq!((s.node_address("n1").as_deref(), s.node_address("n2").as_deref()), (Some("10.240.0.1"), Some("10.240.0.2")));
+        next(&mut s, &Entry::NodeRemoved { node_id: "n1".into(), at: 5 }).unwrap();
+        with_token(&mut s, "t9", 1000);
+        next(&mut s, &enrol("n3", "t9", 6)).unwrap();
+        assert_eq!(s.node_address("n3").as_deref(), Some("10.240.0.1"), "the lowest free one");
+        assert_eq!(s.node_address("n2").as_deref(), Some("10.240.0.2"), "the others keep theirs");
+        // A node enrolled before G10 has none until it is given one.
+        s.nodes.get_mut("n2").unwrap().overlay = None;
+        next(&mut s, &Entry::NodeAddressed { node_id: "n2".into() }).unwrap();
+        assert_eq!(s.node_address("n2").as_deref(), Some("10.240.0.2"));
+        next(&mut s, &Entry::NodeAddressed { node_id: "n2".into() }).unwrap();
+        assert_eq!(s.node_address("n2").as_deref(), Some("10.240.0.2"), "once given, kept");
     }
 
     #[test]

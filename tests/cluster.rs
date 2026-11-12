@@ -457,6 +457,6 @@ async fn a_worker_is_sent_its_network_when_it_connects_and_when_it_changes() {
     a.m.store.propose(Entry::StackDeployed { name: "app".into(), compose: String::new(), services: parsed.services, placements: [("app.web.1".to_string(), "n2".to_string())].into(), at: now_ms() }).await.unwrap();
     a.m.push_network();
     let n = network(&mut rx).expect("a workload on n2: a route to it");
-    assert_eq!(n.peers[0].addresses, vec!["10.240.1.2/32".to_string()]);
+    assert_eq!(n.peers[0].addresses, vec!["10.240.0.2/32".to_string(), "10.240.1.2/32".to_string()], "n2's own address and its workload's");
     a.server.abort();
 }

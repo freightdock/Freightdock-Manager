@@ -140,7 +140,7 @@ mod tests {
     use crate::state::{Fencing, ServiceSpec, Stack, Workload};
 
     fn node(id: &str, state: FenceState, since: Ms) -> Node {
-        Node { id: id.into(), hostname: id.into(), cert_sha256: String::new(), prev_cert_sha256: None, enrolled_at: 0, report: None, reported_at: None, labels: Default::default(), fencing: Fencing { state, since, provider: "self".into(), message: String::new() }, recovered: false }
+        Node { id: id.into(), hostname: id.into(), cert_sha256: String::new(), prev_cert_sha256: None, enrolled_at: 0, report: None, reported_at: None, labels: Default::default(), fencing: Fencing { state, since, provider: "self".into(), message: String::new() }, recovered: false, overlay: None }
     }
 
     /// Nodes a, b, c; stack `app` with web x2 (a, b), db with a volume (a), cron pinned (a), and `solo` on port 80 x1 (a).

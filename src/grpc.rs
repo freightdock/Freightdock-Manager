@@ -186,6 +186,12 @@ impl WorkerSession for SessionSvc {
         let fenced = hello.fencing_state == v1::FencingState::AwaitingAuthorization as i32;
         let generation = m.sessions.open_fenced(&node_id, tx.clone(), peer.addr.to_string(), hello.workloads.clone(), fenced);
         m.sessions.heard_network(&node_id, generation, hello.network.clone());
+        // A node enrolled before G10 is given its overlay address now.
+        if m.store.read(|s| s.nodes.get(&node_id).is_some_and(|n| n.overlay.is_none()))
+            && let Err(e) = m.store.propose(Entry::NodeAddressed { node_id: node_id.clone() }).await
+        {
+            tracing::warn!(node = %node_id, "giving it its overlay address: {e}");
+        }
         tracing::info!(node = %node_id, hostname = %hello.hostname, peer = %peer.addr, in_flight = hello.in_flight.len(), "worker connected");
         m.events.push("connected", Some(&node_id), format!("connected from {}", peer.addr));
 

@@ -20,7 +20,7 @@ Status marks: **[x]** done, **[~]** in progress, **[ ]** not started.
 | 7 | G7 Failure detection and stateless recovery | Success criteria 4 and 5; safe only with G6 | G5, G6 | done |
 | 8 | G8 UI: Freightdock as the cluster's UI | Usable by people, not just the CLI; can start in parallel once G4's API settles | G4 | **done** |
 | 9 | G9 Internal networking (Network repo) | Stable workload IPs across workers; postponed by the plan's first release | G7 | **done** (2026-11-12, small items left) |
-| 10 | G10 External networking | Exposing services without per-deploy setup | G9 | not started |
+| 10 | G10 External networking | Exposing services without per-deploy setup | G9 | **in progress** (the mesh done) |
 | 11 | G11 Shared storage | Moving stateful workloads safely; needs fencing and storage leases | G6, G7 | not started |
 | 12 | G12 Advanced | Ceph, replicated storage, gateway redundancy, anti-affinity, more fencing providers | G9 to G11 | not started |
 
@@ -243,6 +243,21 @@ bridge per stack that talks only to itself (nftables), names through the hosts f
 7. [x] The network in the UI: each workload's address on the stack and node pages, each node's overlay state.
 8. [ ] Owner's wish (2026-11-12), once the network part is done: a live, interactive view of the network that shows
        the communication between workloads and nodes.
+
+### G10: external networking
+
+Agreed 2026-11-12 (Freightdock-Network's DESIGN.md): a routing mesh first, floating external IPs next; the client's
+address across nodes later.
+
+1. [x] The routing mesh: every node answers each published port (`table inet freightdock`, before Docker's rules)
+       and forwards it over the overlay to the workloads behind it, spread at random; a node's overlay address
+       (`10.240.0.<n>`, in Raft, `NodeAddressed` for nodes from before); a published port is one stack's in the
+       cluster and never the host's own (22, 7450 to 7452, 51820), refused at deploy.
+2. [ ] Docker no longer publishes a stack workload's port itself (the mesh does), so a service's replicas are not
+       held to one per node by their port; loopback access to a port (and the UI's target on a one-node cluster)
+       goes through the node's own address instead.
+3. [ ] Floating external IPs: an address given to the cluster, held by one worker at a time, moved when it is fenced.
+4. [ ] Later: the client's address kept for connections forwarded to another node (policy routing on the replies).
 
 ## Open questions for the owner
 

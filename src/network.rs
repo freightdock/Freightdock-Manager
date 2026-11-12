@@ -22,7 +22,7 @@ pub fn state_for(s: &ClusterState, node: &str, endpoint: impl Fn(&str) -> Option
         .filter(|n| n.id != node)
         .filter_map(|n| {
             let key = n.report.as_ref().map(|r| r.wg_public_key.clone()).filter(|k| !k.is_empty())?;
-            let addresses = s.workloads_on(&n.id).filter_map(|w| s.address(&w.id)).map(|a| format!("{a}/32")).collect();
+            let addresses = s.node_address(&n.id).into_iter().chain(s.workloads_on(&n.id).filter_map(|w| s.address(&w.id))).map(|a| format!("{a}/32")).collect();
             Some(v1::NetworkPeer { node_id: n.id.clone(), public_key: key, endpoint: endpoint(&n.id).unwrap_or_default(), addresses })
         })
         .collect();
@@ -35,7 +35,23 @@ pub fn state_for(s: &ClusterState, node: &str, endpoint: impl Fn(&str) -> Option
             stacks.push(v1::StackNetwork { stack: w.stack.clone(), subnet, gateway: format!("{}.{}.{n}.1", CLUSTER_RANGE[0], CLUSTER_RANGE[1]) });
         }
     }
-    v1::NetworkState { version: s.applied, cluster_range: format!("{}.{}.0.0/16", CLUSTER_RANGE[0], CLUSTER_RANGE[1]), mtu: MTU, peers, stacks }
+    v1::NetworkState { version: s.applied, cluster_range: format!("{}.{}.0.0/16", CLUSTER_RANGE[0], CLUSTER_RANGE[1]), mtu: MTU, peers, stacks, node_address: s.node_address(node).unwrap_or_default(), exposures: exposures(s) }
+}
+
+/// The cluster's published ports (G10, the routing mesh), the same for every node: each running stack's ports with
+/// a host port, to its placed workloads' addresses at the container's port.
+pub fn exposures(s: &ClusterState) -> Vec<v1::Exposure> {
+    let mut out = vec![];
+    for st in s.stacks.values().filter(|st| !st.stopped) {
+        for (svc, spec) in &st.services {
+            for p in spec.ports.iter().filter(|p| p.host_port != 0) {
+                let mut targets: Vec<String> = s.workloads.values().filter(|w| w.stack == st.name && &w.service == svc && w.node_id.is_some()).filter_map(|w| s.address(&w.id)).map(|a| format!("{a}:{}", p.container_port)).collect();
+                targets.sort();
+                out.push(v1::Exposure { stack: st.name.clone(), protocol: p.protocol.clone(), port: p.host_port, targets });
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -57,7 +73,7 @@ mod tests {
         assert_eq!(n1.peers.len(), 1, "n3 has no key yet: no peer");
         let p = &n1.peers[0];
         assert_eq!((p.node_id.as_str(), p.public_key.as_str(), p.endpoint.as_str()), ("n2", "K2", "n2:51820"));
-        let mut want = vec![format!("{}/32", s.address("a.web.2").unwrap()), format!("{}/32", s.address("b.db.1").unwrap())];
+        let mut want = vec![format!("{}/32", s.node_address("n2").unwrap()), format!("{}/32", s.address("a.web.2").unwrap()), format!("{}/32", s.address("b.db.1").unwrap())];
         want.sort();
         let mut got = p.addresses.clone();
         got.sort();
@@ -66,8 +82,29 @@ mod tests {
         assert_eq!((n1.stacks[0].stack.as_str(), n1.stacks[0].subnet.as_str(), n1.stacks[0].gateway.as_str()), ("a", "10.240.1.0/24", "10.240.1.1"));
         assert_eq!((n1.cluster_range.as_str(), n1.mtu, n1.version), ("10.240.0.0/16", MTU, s.applied));
 
+        assert_eq!(n1.node_address, s.node_address("n1").unwrap(), "its own overlay address");
+        assert!(state_for(&s, "n3", |_| None).peers.iter().any(|p| p.node_id == "n1" && p.addresses.contains(&format!("{}/32", s.node_address("n1").unwrap()))), "and the others route to it");
+
         let n3 = state_for(&s, "n3", |_| None);
         assert_eq!(n3.peers.len(), 2, "n3 still reaches the others");
         assert!(n3.stacks.is_empty());
+    }
+
+    #[test]
+    fn every_node_answers_every_published_port_for_the_workloads_behind_it() {
+        let mut s = with_nodes(&["n1", "n2"]);
+        let mut web = spec("nginx", 2);
+        web.ports = vec![crate::state::Port { host_port: 8088, container_port: 80, protocol: "tcp".into(), host_ip: String::new() }, crate::state::Port { host_port: 0, container_port: 9000, protocol: "tcp".into(), host_ip: String::new() }];
+        next(&mut s, &deploy("a", &[("web", web)], &[("a.web.1", "n1"), ("a.web.2", "n2")])).unwrap();
+        for n in ["n1", "n2"] {
+            let e = state_for(&s, n, |_| None).exposures;
+            assert_eq!(e.len(), 1, "a published port only, on every node: {e:?}");
+            assert_eq!((e[0].stack.as_str(), e[0].protocol.as_str(), e[0].port), ("a", "tcp", 8088));
+            let mut want = vec![format!("{}:80", s.address("a.web.1").unwrap()), format!("{}:80", s.address("a.web.2").unwrap())];
+            want.sort();
+            assert_eq!(e[0].targets, want);
+        }
+        next(&mut s, &Entry::StackStopped { name: "a".into(), stopped: true, at: 9 }).unwrap();
+        assert!(state_for(&s, "n1", |_| None).exposures.is_empty(), "a stopped stack answers on nothing");
     }
 }

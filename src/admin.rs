@@ -555,6 +555,9 @@ async fn deploy_stack(State(m): State<Arc<Manager>>, h: HeaderMap, Json(b): Json
         return Err(ApiError(StatusCode::BAD_REQUEST, format!("{} is the managers' own stack, for the UI: PUT /v1/ui", crate::ui::STACK)));
     }
     let parsed = crate::compose::parse(&b.compose).map_err(|e| ApiError(StatusCode::BAD_REQUEST, e))?;
+    if let Some(why) = m.store.read(|s| crate::stacks::port_conflict(s, &name, &parsed.services)) {
+        return Err(ApiError(StatusCode::CONFLICT, why));
+    }
     let placements = m.store.read(|s| {
         let eligible = m.eligible(s);
         crate::stacks::place(s, &name, &parsed.services, &eligible)
