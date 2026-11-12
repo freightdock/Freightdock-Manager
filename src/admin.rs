@@ -153,7 +153,11 @@ async fn nodes(State(m): State<Arc<Manager>>, h: HeaderMap) -> R<Json<Value>> {
 
 async fn node(State(m): State<Arc<Manager>>, h: HeaderMap, Path(id): Path<String>) -> R<Json<Value>> {
     authed(&m, &h)?;
-    m.store.read(|s| s.nodes.get(&id).map(|n| node_json(&m, n))).map(Json).ok_or(ApiError(StatusCode::NOT_FOUND, "no such node".into()))
+    let mut v = m.store.read(|s| s.nodes.get(&id).map(|n| node_json(&m, n))).ok_or(ApiError(StatusCode::NOT_FOUND, "no such node".into()))?;
+    // What runs there as the node last said (any manager's word), for a page of the node.
+    let containers: Option<Vec<Value>> = m.sessions.reported(&id).map(|l| l.iter().map(|w| json!({ "workload_id": w.workload_id, "container_id": w.container_id, "state": w.state, "image": w.image, "generation": w.generation, "exit_code": w.exit_code })).collect());
+    v["containers"] = json!(containers);
+    Ok(Json(v))
 }
 
 async fn remove_node(State(m): State<Arc<Manager>>, h: HeaderMap, Path(id): Path<String>) -> R<StatusCode> {

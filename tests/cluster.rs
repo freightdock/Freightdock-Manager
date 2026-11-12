@@ -345,6 +345,8 @@ async fn the_ui_is_the_managers_own_stack_and_only_its_command_carries_the_token
     tokio::spawn(freightdock_manager::serve_admin_tls(a.m.clone(), l));
     let admin = Some(a.m.admin_token.as_str());
 
+    let (s, b) = https(&a.m, &addr, "GET", "/v1/nodes/n1", admin).await;
+    assert!(s == 200 && b.contains(r#""containers":[]"#), "a node's containers as it reports them: {b}");
     let (s, b) = https(&a.m, &addr, "GET", "/v1/ui", admin).await;
     assert_eq!(s, 200, "{b}");
     assert!(b.contains(r#""enabled":false"#), "{b}");
