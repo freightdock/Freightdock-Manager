@@ -313,7 +313,8 @@ Built 2026-11-13 (plan 4.6, 5.2, 7.1, 8), the first slice; the README's "Shared 
        was fenced, its writer stopped and run on the other worker 45 s after its last write.
 6. [ ] The owner's NFS share on the test cluster: needs the workers to see it (a Proxmox bind mount into each worker
        as a `path` storage, or NFS mounting allowed), the owner's call.
-7. [ ] The UI: storage on the Cluster page, volumes on the stack pages and the deployer.
+7. [x] The UI (`freightdock:cluster-ui-17`): storage on the Cluster page (added and removed by an Administrator),
+       volumes and their holders on the stacks page, the volumes on storage in the deployer ("Cluster" 21).
 8. [ ] Left for later: storage health reported by the workers, read-only remounts, SMB, block storage and the
        cluster filesystems (plan 8.2), replicated storage (G12).
 
