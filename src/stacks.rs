@@ -152,7 +152,21 @@ pub fn place(s: &ClusterState, stack: &str, services: &BTreeMap<String, ServiceS
 pub fn replacements(s: &ClusterState, eligible: &[String]) -> Vec<(String, BTreeMap<String, String>)> {
     let mut out = vec![];
     for st in s.stacks.values() {
-        let Ok(p) = place(s, &st.name, &st.services, eligible, &st.nodes) else { continue };
+        // A service with a workload that has nowhere to go is left out (its workloads stay), and the rest tried again.
+        let mut services = st.services.clone();
+        let p = loop {
+            match place(s, &st.name, &services, eligible, &st.nodes) {
+                Ok(p) => break Some(p),
+                Err(e) => {
+                    let stuck = e.strip_prefix("no node can take ").and_then(|r| r.split(':').next()).and_then(|id| s.workloads.get(id)).map(|w| w.service.clone());
+                    match stuck {
+                        Some(svc) if services.remove(&svc).is_some() && !services.is_empty() => {}
+                        _ => break None,
+                    }
+                }
+            }
+        };
+        let Some(p) = p else { continue };
         let moves: BTreeMap<String, String> = p.into_iter().filter(|(id, n)| s.workloads.get(id).and_then(|w| w.node_id.as_ref()).is_some_and(|on| on != n)).collect();
         if !moves.is_empty() {
             out.push((st.name.clone(), moves));
@@ -526,6 +540,20 @@ mod tests {
         assert_eq!(replacements(&s, &all), vec![("st".to_string(), [("st.x.1".to_string(), "b".to_string())].into())], "x follows its label; y stays");
         s.nodes.get_mut("b").unwrap().labels.insert("zone".into(), "3".into());
         assert!(replacements(&s, &all).is_empty(), "nowhere to go: it stays where it is");
+    }
+
+    #[test]
+    fn one_workload_with_nowhere_to_go_does_not_hold_back_the_others() {
+        let mut s = sized(&[("a", &["zone=1"], 4, 1024), ("b", &["zone=2"], 4, 256)]);
+        let all = eligible(&["a", "b"]);
+        let zone1 = |sp: ServiceSpec| with(sp, |x| x.placement.constraints = vec![c("node.labels.zone==1")]);
+        let big = with(zone1(spec("z", 1)), |x| x.placement.reserve = Resources { cpu_millis: 0, memory_bytes: 512 << 20 });
+        let two = svc(&[("x", zone1(spec("x", 1))), ("z", big)]);
+        let p = place(&s, "st", &two, &all, &[]).unwrap();
+        deploy(&mut s, "st", &two, p);
+        s.nodes.get_mut("a").unwrap().labels.insert("zone".into(), "2".into());
+        s.nodes.get_mut("b").unwrap().labels.insert("zone".into(), "1".into());
+        assert_eq!(replacements(&s, &all), vec![("st".to_string(), [("st.x.1".to_string(), "b".to_string())].into())], "z has no room on b and stays; x moves");
     }
 
     #[test]
