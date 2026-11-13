@@ -131,6 +131,11 @@ pub fn place(s: &ClusterState, stack: &str, services: &BTreeMap<String, ServiceS
 /// The op that brings one workload from what its node reported to what the state wants, if one is needed.
 fn op_for(w: &Workload, net: Option<crate::state::Attach>, storage: Vec<crate::state::StorageMount>, run: bool, actual: Option<&WorkloadState>) -> Option<Op> {
     let up = actual.is_some_and(|a| matches!(a.state.as_str(), "running" | "restarting" | "paused" | "removing"));
+    // One that exited at this generation is run again only as its restart policy says.
+    let exited = actual.filter(|a| matches!(a.state.as_str(), "exited" | "dead") && a.generation == w.generation);
+    if run && exited.is_some_and(|a| !w.spec.restart.again_after(a.exit_code)) {
+        return None;
+    }
     // A container not on its overlay address (made before its node knew the overlay) is made again; one whose worker
     // reports no addresses says nothing either way.
     let placed_right = actual.is_none_or(|a| a.addresses.is_empty() || net.as_ref().is_none_or(|n| a.addresses.contains(&n.address)));
@@ -204,31 +209,38 @@ pub fn releasable(s: &ClusterState, node: &str, actual: &[WorkloadState]) -> Vec
         .collect()
 }
 
-/// How soon a workload is acted on again: 5s after one action, doubling for each one in a row, to 5 minutes, so a
-/// container that dies at once is not started again in a tight loop.
-pub fn backoff(in_a_row: u32) -> Duration {
-    Duration::from_secs(5).saturating_mul(1 << in_a_row.min(6)).min(Duration::from_secs(300))
+/// How soon a workload is acted on again: its restart policy's delay (`delay_ms`, 5s by default) after one action,
+/// doubling for each one in a row, to 5 minutes (or the delay, when longer), so a container that dies at once is not
+/// started again in a tight loop.
+pub fn backoff(in_a_row: u32, delay_ms: u64) -> Duration {
+    let base = Duration::from_millis(delay_ms);
+    base.saturating_mul(1 << in_a_row.min(16)).min(Duration::from_secs(300).max(base))
 }
 
-/// What this manager did lately per workload, in memory only.
+/// What this manager did lately per workload, in memory only: when, how many times in a row, for which generation.
 #[derive(Default)]
-pub struct Paced(Mutex<HashMap<String, (Instant, u32)>>);
+pub struct Paced(Mutex<HashMap<String, (Instant, u32, u64)>>);
 
 impl Paced {
-    /// Whether the workload may be acted on now.
-    fn ready(&self, id: &str) -> bool {
-        self.0.lock().expect("paced lock").get(id).is_none_or(|(at, n)| at.elapsed() >= backoff(n.saturating_sub(1)))
+    /// Whether the workload may be acted on now for `generation`: its backoff passed and its attempts not spent. A new
+    /// generation (a deploy) is tried at once.
+    fn ready(&self, id: &str, generation: u64, r: &crate::state::Restart) -> bool {
+        self.0.lock().expect("paced lock").get(id).is_none_or(|(at, n, g)| *g != generation || ((r.max_attempts == 0 || *n < r.max_attempts) && at.elapsed() >= backoff(n.saturating_sub(1), r.delay_ms)))
     }
 
-    fn acted(&self, id: &str) {
+    fn acted(&self, id: &str, generation: u64) {
         let mut g = self.0.lock().expect("paced lock");
-        let e = g.entry(id.to_string()).or_insert((Instant::now(), 0));
-        *e = (Instant::now(), e.1.saturating_add(1));
+        let e = g.entry(id.to_string()).or_insert((Instant::now(), 0, generation));
+        *e = (Instant::now(), if e.2 == generation { e.1.saturating_add(1) } else { 1 }, generation);
     }
 
-    /// The workload is as wanted: its next action, whenever, starts the count again.
-    fn settled(&self, id: &str) {
-        self.0.lock().expect("paced lock").remove(id);
+    /// The workload is as wanted: once it has been so for `window_ms` since it was last acted on (its restart
+    /// policy's window), its next action starts the count again. One that dies within the window still counts.
+    fn settled(&self, id: &str, window_ms: u64) {
+        let mut g = self.0.lock().expect("paced lock");
+        if g.get(id).is_some_and(|(at, ..)| at.elapsed() >= Duration::from_millis(window_ms)) {
+            g.remove(id);
+        }
     }
 }
 
@@ -252,13 +264,14 @@ impl Manager {
                 let ops = reconcile(s, node, actual, &busy);
                 for w in s.workloads_on(node) {
                     if !busy.contains(&w.id) && !ops.iter().any(|(id, _)| *id == w.id) {
-                        self.paced.settled(&w.id);
+                        self.paced.settled(&w.id, w.spec.restart.window_ms);
                     }
                 }
                 todo.extend(ops.into_iter().map(|(id, op)| {
+                    let (generation, restart) = s.workloads.get(&id).map(|w| (w.generation, w.spec.restart)).unwrap_or_default();
                     // A volume for one writer is leased to the node before its workload runs there (G11).
                     let leases = if matches!(op, Op::RunContainer { .. }) { s.workloads.get(&id).map(|w| s.exclusive_volumes(w)).unwrap_or_default().into_iter().filter(|v| s.leases.get(v).is_none_or(|l| l.node_id != *node)).collect() } else { vec![] };
-                    (node.clone(), id, op, leases)
+                    (node.clone(), id, op, leases, generation, restart)
                 }));
             }
         });
@@ -270,26 +283,28 @@ impl Manager {
         }
         // Stops and removals first: a run on one node may be waiting for a lease the other lets go once its own
         // container of the workload is gone.
-        todo.sort_by_key(|(_, _, op, _)| matches!(op, Op::RunContainer { .. }));
-        'next: for (node, id, op, leases) in todo {
-            if !self.paced.ready(&id) {
+        todo.sort_by_key(|(_, _, op, ..)| matches!(op, Op::RunContainer { .. }));
+        'next: for (node, id, op, leases, generation, restart) in todo {
+            // Its attempts count only against running it again; a stop or a removal is never held back by them.
+            let paced = if matches!(op, Op::RunContainer { .. }) { restart } else { crate::state::Restart { max_attempts: 0, ..restart } };
+            if !self.paced.ready(&id, generation, &paced) {
                 continue;
             }
             // A run waiting for a lease is paced on its own, so it never holds back what the other node has to do.
             let waiting = format!("lease:{node}:{id}");
-            if !leases.is_empty() && !self.paced.ready(&waiting) {
+            if !leases.is_empty() && !self.paced.ready(&waiting, 0, &crate::state::Restart::default()) {
                 continue;
             }
             for volume in leases {
                 if let Err(e) = self.store.propose(Entry::LeaseTaken { volume: volume.clone(), node_id: node.clone(), at: now_ms() }).await {
                     let holder = self.store.read(|s| s.leases.get(&volume).map(|l| l.node_id.clone())).unwrap_or_default();
                     tracing::info!(node = %node, workload = %id, volume = %volume, holder = %holder, "storage: waits for the volume ({e})");
-                    self.paced.acted(&waiting);
+                    self.paced.acted(&waiting, 0);
                     continue 'next;
                 }
             }
-            self.paced.settled(&waiting);
-            self.paced.acted(&id);
+            self.paced.settled(&waiting, 0);
+            self.paced.acted(&id, generation);
             let now = now_ms();
             let what = match &op {
                 Op::RunContainer { .. } => "run",
@@ -564,6 +579,41 @@ mod tests {
     }
 
     #[test]
+    fn an_exited_container_is_run_again_as_its_restart_policy_says() {
+        use crate::state::{Restart, RestartWhen};
+        let exited = |code: i32, g: u64| WorkloadState { state: "exited".into(), exit_code: code, ..running("web.x.1", g) };
+        for (when, ok, failed) in [(RestartWhen::Any, true, true), (RestartWhen::OnFailure, false, true), (RestartWhen::Never, false, false)] {
+            let mut s = state_with(&["a"]);
+            placed(&mut s, &[("x", ServiceSpec { restart: Restart { condition: when, ..Restart::default() }, ..spec("nginx", 1) })]);
+            let g = s.workloads["web.x.1"].generation;
+            assert_eq!(!reconcile(&s, "a", &[exited(0, g)], &BTreeSet::new()).is_empty(), ok, "{when:?} after exit 0");
+            assert_eq!(!reconcile(&s, "a", &[exited(1, g)], &BTreeSet::new()).is_empty(), failed, "{when:?} after exit 1");
+            assert!(!reconcile(&s, "a", &[exited(0, g + 1)], &BTreeSet::new()).is_empty(), "{when:?}: a new spec runs whatever the last one did");
+            assert!(!reconcile(&s, "a", &[], &BTreeSet::new()).is_empty(), "{when:?}: a missing one is run");
+        }
+    }
+
+    #[test]
+    fn the_backoff_starts_at_the_policy_s_delay_and_stops_at_its_attempts() {
+        assert_eq!(backoff(0, 2000), Duration::from_secs(2));
+        assert_eq!(backoff(3, 2000), Duration::from_secs(16));
+        assert_eq!(backoff(20, 2000), Duration::from_secs(300), "at most five minutes");
+        assert_eq!(backoff(20, 600_000), Duration::from_secs(600), "or the delay itself when it is longer");
+        let p = Paced::default();
+        let r = crate::state::Restart { max_attempts: 2, delay_ms: 0, ..Default::default() };
+        assert!(p.ready("w", 1, &r));
+        p.acted("w", 1);
+        p.acted("w", 1);
+        assert!(!p.ready("w", 1, &r), "two attempts made");
+        assert!(p.ready("w", 2, &r), "a new spec is tried whatever the last one did");
+        p.settled("w", 0);
+        assert!(p.ready("w", 1, &r), "settled: counted again from none");
+        p.acted("w", 1);
+        p.settled("w", 60_000);
+        assert!(!p.ready("w", 1, &crate::state::Restart { max_attempts: 1, ..r }), "not settled before its window passed");
+    }
+
+    #[test]
     fn a_running_container_off_its_overlay_address_is_made_again_and_one_that_says_nothing_is_left() {
         let mut s = state_with(&["a"]);
         placed(&mut s, &[("x", spec("nginx", 1))]);
@@ -615,8 +665,8 @@ mod tests {
 
     #[test]
     fn the_backoff_doubles_to_five_minutes() {
-        assert_eq!(backoff(0), Duration::from_secs(5));
-        assert_eq!(backoff(1), Duration::from_secs(10));
-        assert_eq!(backoff(30), Duration::from_secs(300));
+        assert_eq!(backoff(0, 5000), Duration::from_secs(5));
+        assert_eq!(backoff(1, 5000), Duration::from_secs(10));
+        assert_eq!(backoff(30, 5000), Duration::from_secs(300));
     }
 }

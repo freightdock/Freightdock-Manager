@@ -56,6 +56,7 @@ pub fn spec(image: &str) -> ServiceSpec {
         limits: Default::default(),
         placement: Default::default(),
         ha: true,
+        restart: Default::default(),
     }
 }
 

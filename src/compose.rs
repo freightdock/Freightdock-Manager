@@ -1,14 +1,14 @@
 //! Compose files, read on the manager into the services of a stack (G4.3). Only the part of Compose that maps onto
 //! what a worker runs (`RunContainer`) is taken: image, command, environment, labels, ports, volumes and
 //! `deploy.replicas`. A key that would change what runs and is not supported yet is refused by name, so a file never
-//! deploys as something other than it says; a key that only concerns how Compose itself behaves (`restart`,
-//! `depends_on`) is set aside with a warning.
+//! deploys as something other than it says; a key that only concerns how Compose itself behaves (`depends_on`,
+//! `healthcheck`) is set aside with a warning. `restart` and `deploy.restart_policy` are the cluster's restart policy.
 
 use std::collections::BTreeMap;
 
 use yaml_serde::Value;
 
-use crate::state::{Access, Constraint, Port, Resources, ServiceSpec, StackVolume, valid_service_name};
+use crate::state::{Access, Constraint, Port, Resources, Restart, RestartWhen, ServiceSpec, StackVolume, valid_service_name};
 
 /// A Compose file is at most this long.
 pub const MAX_LEN: usize = 256 * 1024;
@@ -23,7 +23,7 @@ pub struct Parsed {
 }
 
 const TOP_IGNORED: &[&str] = &["version", "name"];
-const SERVICE_IGNORED: &[&str] = &["restart", "depends_on", "healthcheck"];
+const SERVICE_IGNORED: &[&str] = &["depends_on", "healthcheck"];
 
 pub fn parse(text: &str) -> Result<Parsed, String> {
     if text.len() > MAX_LEN {
@@ -119,7 +119,7 @@ fn scalar(v: &Value) -> Option<String> {
 
 fn service(name: &str, v: &Value, warnings: &mut Vec<String>) -> Result<ServiceSpec, String> {
     let m = v.as_mapping().ok_or("a service is a mapping")?;
-    let mut spec = ServiceSpec { image: String::new(), command: vec![], env: BTreeMap::new(), labels: BTreeMap::new(), ports: vec![], volumes: vec![], replicas: 1, limits: Resources::default(), placement: Default::default(), ha: true };
+    let mut spec = ServiceSpec { image: String::new(), command: vec![], env: BTreeMap::new(), labels: BTreeMap::new(), ports: vec![], volumes: vec![], replicas: 1, limits: Resources::default(), placement: Default::default(), ha: true, restart: Default::default() };
     for (k, v) in m {
         let k = key(k)?;
         match k.as_str() {
@@ -129,6 +129,7 @@ fn service(name: &str, v: &Value, warnings: &mut Vec<String>) -> Result<ServiceS
             "labels" => spec.labels = pairs(v, "labels", warnings, name)?,
             "ports" => spec.ports = v.as_sequence().ok_or("ports is a list")?.iter().map(port).collect::<Result<_, _>>()?,
             "volumes" => spec.volumes = v.as_sequence().ok_or("volumes is a list")?.iter().map(volume).collect::<Result<_, _>>()?,
+            "restart" => spec.restart = restart(v)?,
             "deploy" => deploy(v, &mut spec)?,
             "x-freightdock" => freightdock(v, &mut spec)?,
             k if k.starts_with("x-") => {}
@@ -370,10 +371,75 @@ fn deploy(v: &Value, spec: &mut ServiceSpec) -> Result<(), String> {
                     }
                 }
             }
+            "restart_policy" => {
+                for (k, v) in mapping(v, "deploy.restart_policy")? {
+                    let text = scalar(v).unwrap_or_default();
+                    let ms = |what: &str| duration_ms(&text).ok_or_else(|| format!("deploy.restart_policy.{what}: {text:?} is not a duration (5s, 1m30s, 500ms)"));
+                    match key(k)?.as_str() {
+                        "condition" => {
+                            spec.restart.condition = match text.as_str() {
+                                "any" => RestartWhen::Any,
+                                "on-failure" => RestartWhen::OnFailure,
+                                "none" => RestartWhen::Never,
+                                c => return Err(format!("deploy.restart_policy.condition: {c:?} is none, on-failure or any")),
+                            }
+                        }
+                        "delay" => spec.restart.delay_ms = ms("delay")?,
+                        "window" => spec.restart.window_ms = ms("window")?,
+                        "max_attempts" => spec.restart.max_attempts = v.as_u64().and_then(|n| u32::try_from(n).ok()).ok_or("deploy.restart_policy.max_attempts is a number")?,
+                        k => return Err(format!("deploy.restart_policy.{k} is not known")),
+                    }
+                }
+            }
             k => return Err(format!("deploy.{k} is not supported yet")),
         }
     }
     Ok(())
+}
+
+/// `restart`: `no`, `always`, `unless-stopped` (the same here: a stack stopped stays stopped), `on-failure[:N]`.
+fn restart(v: &Value) -> Result<Restart, String> {
+    let text = match v {
+        Value::Bool(false) => "no".to_string(),
+        v => scalar(v).unwrap_or_default(),
+    };
+    let condition = match text.split_once(':').map_or(text.as_str(), |(c, _)| c) {
+        "no" => RestartWhen::Never,
+        "always" | "unless-stopped" => RestartWhen::Any,
+        "on-failure" => RestartWhen::OnFailure,
+        _ => return Err(format!("restart: {text:?} is no, always, unless-stopped or on-failure[:N]")),
+    };
+    let max_attempts = match text.split_once(':') {
+        Some(("on-failure", n)) => n.parse().map_err(|_| format!("restart: {n:?} is not a number of attempts"))?,
+        Some(_) => return Err(format!("restart: {text:?}: only on-failure takes a number")),
+        None => 0,
+    };
+    Ok(Restart { condition, max_attempts, ..Restart::default() })
+}
+
+/// `1h2m3s`, `90s`, `500ms`, `1.5s`: milliseconds, as Compose writes durations. A number needs its unit.
+pub fn duration_ms(s: &str) -> Option<u64> {
+    let mut rest = s.trim();
+    if rest.is_empty() {
+        return None;
+    }
+    let mut total = 0f64;
+    while !rest.is_empty() {
+        let n = rest.find(|c: char| !(c.is_ascii_digit() || c == '.')).filter(|&i| i > 0)?;
+        let num: f64 = rest[..n].parse().ok()?;
+        rest = &rest[n..];
+        let u = rest.find(|c: char| c.is_ascii_digit() || c == '.').unwrap_or(rest.len());
+        let mul = match &rest[..u] {
+            "ms" => 1.0,
+            "s" => 1000.0,
+            "m" => 60_000.0,
+            "h" => 3_600_000.0,
+            _ => return None,
+        };
+        total += num * mul;
+        rest = &rest[u..];
+    }
+    Some(total as u64)
 }
 
 /// `x-freightdock`: what Compose has no word for. `ha: false` pins a service's workloads to their nodes (plan 5.3).
@@ -464,6 +530,7 @@ services:
     volumes: ["data:/var/lib/data", "/srv/conf:/etc/conf:ro", {type: bind, source: /x, target: /y, read_only: true}]
     deploy: {replicas: 3}
     restart: always
+    healthcheck: {test: [CMD, "true"]}
 volumes:
   data:
 "#,
@@ -480,7 +547,33 @@ volumes:
         assert_eq!((a.ports[3].host_port, a.ports[3].container_port), (8081, 81));
         assert_eq!(a.volumes, vec!["data:/var/lib/data", "/srv/conf:/etc/conf:ro", "/x:/y:ro"]);
         assert_eq!(a.replicas, 3);
-        assert_eq!(p.warnings.len(), 1, "restart is set aside: {:?}", p.warnings);
+        assert_eq!(p.warnings.len(), 1, "healthcheck is set aside: {:?}", p.warnings);
+    }
+
+    #[test]
+    fn the_restart_policy_reads_from_restart_and_from_deploy_restart_policy() {
+        use crate::state::{Restart, RestartWhen};
+        let r = |y: &str| parse(&format!("services:\n  a:\n    image: x\n{y}")).map(|p| p.services["a"].restart);
+        assert_eq!(r("").unwrap(), Restart::default());
+        assert_eq!(Restart::default(), Restart { condition: RestartWhen::Any, delay_ms: 5000, max_attempts: 0, window_ms: 10_000 });
+        assert_eq!(r("    restart: \"no\"\n").unwrap().condition, RestartWhen::Never);
+        assert_eq!(r("    restart: no\n").unwrap().condition, RestartWhen::Never, "YAML 1.1's no is false");
+        assert_eq!(r("    restart: unless-stopped\n").unwrap().condition, RestartWhen::Any);
+        assert_eq!(r("    restart: on-failure:3\n").unwrap(), Restart { condition: RestartWhen::OnFailure, max_attempts: 3, ..Restart::default() });
+        let d = r("    deploy:\n      restart_policy: {condition: on-failure, delay: 1m30s, max_attempts: 5, window: 500ms}\n").unwrap();
+        assert_eq!(d, Restart { condition: RestartWhen::OnFailure, delay_ms: 90_000, max_attempts: 5, window_ms: 500 });
+        assert!(r("    restart: sometimes\n").unwrap_err().contains("restart"));
+        assert!(r("    deploy:\n      restart_policy: {delay: soon}\n").unwrap_err().contains("delay"));
+    }
+
+    #[test]
+    fn durations_read_as_compose_writes_them() {
+        assert_eq!(duration_ms("5s"), Some(5000));
+        assert_eq!(duration_ms("1h2m3s"), Some(3_723_000));
+        assert_eq!(duration_ms("250ms"), Some(250));
+        assert_eq!(duration_ms("1.5s"), Some(1500));
+        assert_eq!(duration_ms("10"), None, "a unit is needed");
+        assert_eq!(duration_ms(""), None);
     }
 
     #[test]

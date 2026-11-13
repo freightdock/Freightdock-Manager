@@ -412,10 +412,52 @@ pub struct ServiceSpec {
     /// pinned, and stays stopped with its node until someone moves it.
     #[serde(default = "yes")]
     pub ha: bool,
+    /// When a workload of it that exited is run again, and how soon (Compose `restart`, `deploy.restart_policy`).
+    #[serde(default)]
+    pub restart: Restart,
 }
 
 fn yes() -> bool {
     true
+}
+
+/// When an exited workload is run again (G4.5): after any exit, after a failure only, or never.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RestartWhen {
+    #[default]
+    Any,
+    OnFailure,
+    Never,
+}
+
+/// A service's restart policy: the condition; the first wait (`delay_ms`, doubling for each run in a row, to five
+/// minutes); how many runs in a row at most (`max_attempts`, 0 for no end); and how long it must run to count as
+/// started (`window_ms`), so one that dies within it still counts against the attempts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Restart {
+    pub condition: RestartWhen,
+    pub delay_ms: u64,
+    pub max_attempts: u32,
+    pub window_ms: u64,
+}
+
+impl Default for Restart {
+    fn default() -> Self {
+        Restart { condition: RestartWhen::Any, delay_ms: 5000, max_attempts: 0, window_ms: 10_000 }
+    }
+}
+
+impl Restart {
+    /// Whether a workload that exited with `code` is run again.
+    pub fn again_after(&self, code: i32) -> bool {
+        match self.condition {
+            RestartWhen::Any => true,
+            RestartWhen::OnFailure => code != 0,
+            RestartWhen::Never => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1624,7 +1666,7 @@ pub(crate) mod tests {
     }
 
     pub fn spec(image: &str, replicas: u32) -> ServiceSpec {
-        ServiceSpec { image: image.into(), command: vec![], env: Default::default(), labels: Default::default(), ports: vec![], volumes: vec![], replicas, limits: Default::default(), placement: Default::default(), ha: true }
+        ServiceSpec { image: image.into(), command: vec![], env: Default::default(), labels: Default::default(), ports: vec![], volumes: vec![], replicas, limits: Default::default(), placement: Default::default(), ha: true, restart: Default::default() }
     }
 
     pub fn with_nodes(nodes: &[&str]) -> ClusterState {
