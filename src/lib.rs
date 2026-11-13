@@ -362,6 +362,23 @@ pub const EXPIRY_GRACE_MS: i64 = 5_000;
 
 impl Manager {
     /// Marks pending commands past their deadline as expired. Run every second by `housekeeping`.
+    /// The leader drops finished commands (`ClusterState::prunable`): kept an hour, and at most [`COMMANDS_KEPT`],
+    /// so the state does not grow with every run. In batches, so no one entry is large.
+    pub async fn prune_commands(&self) {
+        if self.store.leader() != Some(self.store.id) {
+            return;
+        }
+        let ids = self.store.read(|s| s.prunable(now_ms(), COMMANDS_KEEP_MS, COMMANDS_KEPT));
+        for chunk in ids.chunks(500) {
+            if let Err(e) = self.store.propose(Entry::CommandsPruned { ids: chunk.to_vec(), at: now_ms() }).await {
+                return tracing::debug!("finished commands not pruned: {e}");
+            }
+        }
+        if !ids.is_empty() {
+            tracing::info!("{} finished commands pruned", ids.len());
+        }
+    }
+
     pub async fn expire_overdue(&self) {
         for id in self.store.read(|s| s.overdue(now_ms(), EXPIRY_GRACE_MS)) {
             let e = Entry::CommandStatus { command_id: id.clone(), status: state::CommandStatus::Expired, message: "its deadline passed before its node was reached".into(), result_json: String::new(), at: now_ms() };
@@ -375,6 +392,10 @@ impl Manager {
         }
     }
 }
+
+/// How long a finished command is kept in the state, and how many at most.
+pub const COMMANDS_KEEP_MS: state::Ms = 60 * 60 * 1000;
+pub const COMMANDS_KEPT: usize = 1000;
 
 /// Delivers each command as this manager applies it, to its node if the node is connected here. Wherever the command
 /// was made, the manager its worker is connected to sends it. Ends with the manager.
@@ -415,8 +436,13 @@ async fn join_cluster(j: &Join, raft_id: u64, addr: &str, ca_dir: &std::path::Pa
 pub async fn housekeeping(m: Arc<Manager>) {
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut pruned = std::time::Instant::now();
     loop {
         tick.tick().await;
+        if pruned.elapsed() >= Duration::from_secs(60) {
+            pruned = std::time::Instant::now();
+            m.prune_commands().await;
+        }
         m.quorum_guard();
         m.gather_heard().await;
         m.expire_overdue().await;

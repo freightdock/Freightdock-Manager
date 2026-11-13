@@ -109,6 +109,8 @@ pub enum Entry {
     LeaseTaken { volume: String, node_id: String, at: Ms },
     /// Its holder lets the volume go: nothing of it runs there any more.
     LeaseReleased { volume: String, node_id: String, at: Ms },
+    /// Finished commands dropped from the state (`ClusterState::prunable`); one not finished, or not there, is left.
+    CommandsPruned { ids: Vec<String>, at: Ms },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -908,6 +910,32 @@ impl ClusterState {
         self.commands.values().filter(|c| c.status == CommandStatus::Pending && now > c.deadline + grace).map(|c| c.id.clone()).collect()
     }
 
+    /// The finished commands to drop, oldest first: those finished more than `keep_ms` before `now`, and past the
+    /// newest `max` finished ones. Each workload's latest command stays, since its status is read from it; an open
+    /// command always stays.
+    pub fn prunable(&self, now: Ms, keep_ms: Ms, max: usize) -> Vec<String> {
+        let mut latest: BTreeMap<&str, &CommandRecord> = BTreeMap::new();
+        for c in self.commands.values() {
+            if let Some(w) = c.op.workload_id()
+                && latest.get(w).is_none_or(|l| (l.created_at, l.id.as_str()) <= (c.created_at, c.id.as_str()))
+            {
+                latest.insert(w, c);
+            }
+        }
+        let finished: Vec<&CommandRecord> = self.commands.values().filter(|c| c.status.is_terminal()).collect();
+        let mut over = finished.len().saturating_sub(max);
+        let mut candidates: Vec<&CommandRecord> = finished.into_iter().filter(|c| c.op.workload_id().is_none_or(|w| latest.get(w).is_none_or(|l| l.id != c.id))).collect();
+        candidates.sort_by(|a, b| (a.updated_at, &a.id).cmp(&(b.updated_at, &b.id)));
+        let mut out = vec![];
+        for c in candidates {
+            if c.updated_at.saturating_add(keep_ms) < now || over > 0 {
+                over = over.saturating_sub(1);
+                out.push(c.id.clone());
+            }
+        }
+        out
+    }
+
     /// Whether `exposures` may be stack `name`'s (with `services`): each to one of its services, over tcp or udp, on a
     /// pool address, at a port that is not the host's own, and no address, port and protocol another stack's or twice.
     fn check_exposures(&self, name: &str, services: &BTreeMap<String, ServiceSpec>, exposures: &[Exposure]) -> Result<(), Rejected> {
@@ -1351,6 +1379,13 @@ impl ClusterState {
                 self.stacks.remove(name).ok_or(Rejected::StackUnknown)?;
                 self.workloads.retain(|_, w| w.stack != *name);
             }
+            Entry::CommandsPruned { ids, .. } => {
+                for id in ids {
+                    if self.commands.get(id).is_some_and(|c| c.status.is_terminal()) {
+                        self.commands.remove(id);
+                    }
+                }
+            }
             Entry::CommandStatus { command_id, status, message, result_json, at } => {
                 let c = self.commands.get_mut(command_id).ok_or(Rejected::CommandUnknown)?;
                 // A status only moves forward, and a finished command stays as it finished: a late or repeated report
@@ -1467,6 +1502,33 @@ pub(crate) mod tests {
         next(&mut s, &Entry::StackRemoved { name: "a".into(), at: 60 }).unwrap();
         next(&mut s, &deploy("c", &[("x", spec("i", 1))], &[("c.x.1", "n1")])).unwrap();
         assert_eq!(s.subnet("c").as_deref(), Some("10.240.1.0/24"));
+    }
+
+    #[test]
+    fn finished_commands_are_pruned_past_an_age_or_a_count_but_each_workload_keeps_its_latest() {
+        let mut s = cluster();
+        with_token(&mut s, "t", 1000);
+        s.apply_at(3, &enrol("n1", "t", 10)).unwrap();
+        let mut i = 4;
+        let mut add = |s: &mut ClusterState, id: &str, op: Op, at: Ms, st: CommandStatus| {
+            let c = CommandRecord { op, created_at: at, updated_at: at, status: st, ..command(id, "n1") };
+            s.apply_at(i, &Entry::CommandCreated { command: c }).unwrap();
+            i += 1;
+        };
+        let run = |w: &str| Op::StopContainer { workload_id: w.into(), timeout_s: 0 };
+        add(&mut s, "old-ping", Op::Ping, 100, CommandStatus::Succeeded);
+        add(&mut s, "old-w1", run("a.web.1"), 100, CommandStatus::Succeeded);
+        add(&mut s, "new-w1", run("a.web.1"), 200, CommandStatus::Failed);
+        add(&mut s, "only-w2", run("a.web.2"), 100, CommandStatus::Succeeded);
+        add(&mut s, "open", Op::Ping, 100, CommandStatus::Pending);
+        add(&mut s, "recent", Op::Ping, 950, CommandStatus::Succeeded);
+        let mut p = s.prunable(1000, 500, 100);
+        p.sort();
+        assert_eq!(p, vec!["old-ping", "old-w1"], "old and finished; a workload's latest and an open one stay");
+        assert_eq!(s.prunable(1000, 5000, 4), vec!["old-ping"], "5 finished, 4 kept: the oldest goes, sparing each workload's latest");
+        s.apply_at(20, &Entry::CommandsPruned { ids: vec!["old-ping".into(), "open".into(), "gone".into()], at: 1000 }).unwrap();
+        assert!(!s.commands.contains_key("old-ping"));
+        assert!(s.commands.contains_key("open"), "an open command is never pruned, whatever the list says");
     }
 
     #[test]
