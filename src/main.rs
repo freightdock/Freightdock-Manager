@@ -451,6 +451,11 @@ async fn main() -> Result<()> {
                     for st in v.as_array().into_iter().flatten() {
                         let vols: Vec<String> = st["volumes"].as_array().into_iter().flatten().map(|v| format!("{}/{} ({}{})", v["stack"].as_str().unwrap_or(""), v["volume"].as_str().unwrap_or(""), v["access"].as_str().unwrap_or(""), v["holder"].as_str().map(|h| format!(", on {h}")).unwrap_or_default())).collect();
                         println!("{:<16} {:<6} {:<40} {}", st["name"].as_str().unwrap_or(""), st["driver"].as_str().unwrap_or(""), st["source"].as_str().unwrap_or(""), if vols.is_empty() { "-".to_string() } else { vols.join(", ") });
+                        for h in st["health"].as_array().into_iter().flatten() {
+                            let gib = |k: &str| h[k].as_u64().unwrap_or(0) as f64 / (1u64 << 30) as f64;
+                            let said = if h["ok"] == true { format!("ok, {:.1} of {:.1} GiB free, {} ms", gib("free_bytes"), gib("total_bytes"), h["probe_ms"]) } else { format!("FAILING: {}", h["error"].as_str().unwrap_or("")) };
+                            println!("{:<16} on {}: {said}", "", h["node"].as_str().unwrap_or(""));
+                        }
                     }
                 }
                 (Some("add"), Some(name), Some(driver @ ("nfs" | "path")), Some(source)) => {

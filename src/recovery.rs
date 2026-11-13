@@ -23,7 +23,7 @@ pub struct Plan {
     pub left: BTreeMap<String, String>,
 }
 
-pub fn plan(s: &ClusterState, from: Option<&str>, eligible: &[String]) -> Plan {
+pub fn plan(s: &ClusterState, from: Option<&str>, eligible: &[String], sick: &[(String, String)]) -> Plan {
     let mut out = Plan::default();
     let mut s = s.clone();
     let mut go: BTreeSet<String> = BTreeSet::new();
@@ -47,7 +47,8 @@ pub fn plan(s: &ClusterState, from: Option<&str>, eligible: &[String]) -> Plan {
     let stacks: BTreeSet<String> = go.iter().map(|id| s.workloads[id].stack.clone()).collect();
     for stack in stacks {
         let (services, only) = (s.stacks[&stack].services.clone(), s.stacks[&stack].nodes.clone());
-        match crate::stacks::place(&s, &stack, &services, eligible, &only) {
+        let eligible = crate::stacks::sound_for(eligible, s.stacks[&stack].volumes.values().map(|v| v.storage.as_str()), sick);
+        match crate::stacks::place(&s, &stack, &services, &eligible, &only) {
             Ok(p) => {
                 for (id, node) in p.into_iter().filter(|(id, _)| go.contains(id)) {
                     s.workloads.get_mut(&id).expect("placed").node_id = Some(node.clone());
@@ -83,6 +84,11 @@ impl Manager {
             .collect()
     }
 
+    /// Each node's shared storage that says it fails there (G11.8): (node, storage).
+    pub fn sick_storage(&self, s: &ClusterState) -> Vec<(String, String)> {
+        s.nodes.keys().flat_map(|id| self.sessions.storage(id).map(|r| r.storages).unwrap_or_default().into_iter().filter(|h| !h.ok).map(move |h| (id.clone(), h.name))).collect()
+    }
+
     /// The leader's recovery round (see the module), each second after fencing's.
     pub async fn recover_round(&self) {
         if self.store.leader() != Some(self.store.id) || self.started.elapsed() < crate::fencing::STARTUP_GRACE {
@@ -92,12 +98,13 @@ impl Manager {
         let now = now_ms();
         let todo: Vec<(Option<String>, Plan)> = self.store.read(|s| {
             let eligible = self.eligible(s);
+            let sick = self.sick_storage(s);
             let mut todo = vec![];
             for n in s.nodes.values().filter(|n| due(n, now, delay)) {
                 if s.workloads_on(&n.id).next().is_none() {
                     continue;
                 }
-                let mut p = plan(s, Some(&n.id), &eligible);
+                let mut p = plan(s, Some(&n.id), &eligible, &sick);
                 // The first time says what stays and why; after that only a move is worth an entry (one that had
                 // nowhere to go is tried again each round).
                 if n.recovered {
@@ -108,7 +115,7 @@ impl Manager {
                 }
             }
             if s.workloads.values().any(|w| w.node_id.is_none()) {
-                let p = plan(s, None, &eligible);
+                let p = plan(s, None, &eligible, &sick);
                 if !p.moves.is_empty() {
                     todo.push((None, Plan { moves: p.moves, left: BTreeMap::new() }));
                 }
@@ -170,7 +177,7 @@ mod tests {
 
     #[test]
     fn stateless_workloads_move_to_where_a_deploy_would_put_them_and_the_rest_stay_with_why() {
-        let p = plan(&cluster(), Some("a"), &eligible());
+        let p = plan(&cluster(), Some("a"), &eligible(), &[]);
         assert_eq!(p.moves, BTreeMap::from([("app.web.1".to_string(), "c".to_string())]), "away from its other replica on b");
         assert_eq!(p.left.keys().collect::<Vec<_>>(), ["app.cron.1", "app.db.1"]);
         assert!(p.left["app.cron.1"].contains("pinned"));
@@ -179,7 +186,7 @@ mod tests {
 
     #[test]
     fn a_workload_with_nowhere_to_go_stays_with_the_reason() {
-        let p = plan(&cluster(), Some("a"), &[]);
+        let p = plan(&cluster(), Some("a"), &[], &[]);
         assert!(p.moves.is_empty());
         assert!(p.left["app.web.1"].contains("no node can take app.web.1"), "{:?}", p.left);
     }
@@ -190,7 +197,7 @@ mod tests {
         for w in s.workloads.values_mut().filter(|w| w.node_id.as_deref() == Some("a")) {
             w.node_id = None;
         }
-        let p = plan(&s, None, &eligible());
+        let p = plan(&s, None, &eligible(), &[]);
         assert_eq!(p.moves.keys().collect::<Vec<_>>(), ["app.cron.1", "app.db.1", "app.web.1"], "the node is gone: nothing to wait for");
         assert!(p.left.is_empty());
     }

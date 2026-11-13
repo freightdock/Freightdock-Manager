@@ -366,8 +366,14 @@ Built 2026-11-13 (plan 4.6, 5.2, 7.1, 8), the first slice; the README's "Shared 
        powered off and verified 14 s after the cut, its last write at 12 s.
 7. [x] The UI (`freightdock:cluster-ui-17`): storage on the Cluster page (added and removed by an Administrator),
        volumes and their holders on the stacks page, the volumes on storage in the deployer ("Cluster" 21).
-8. [ ] Left for later: storage health reported by the workers, read-only remounts, SMB, block storage and the
-       cluster filesystems (plan 8.2), replicated storage (G12).
+8. [x] Storage health (2026-11-13): each worker probes the storage it made ready every 15 s on a thread of its own
+       (an NFS export mounted at its root, else a write would land on the node's own disk; its space; a small file
+       written, synced, read back and removed), a probe stuck past 10 s said as such and never piled on, and reports it
+       in its heartbeat (`StorageReport`); the managers pass it on, `GET /v1/storage` shows it per node, the leader
+       tells `storage.unhealthy` and `storage.back`, and a node whose storage fails takes no new workload with volumes
+       on it (one there already stays, so a passing hiccup moves nothing).
+9. [ ] Left for later: read-only remounts, SMB, block storage and the cluster filesystems (plan 8.2), replicated
+       storage (G12).
 
 ## Open questions for the owner
 

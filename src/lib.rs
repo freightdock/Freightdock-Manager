@@ -486,7 +486,7 @@ impl Manager {
         if self.store.leader() != Some(self.store.id) {
             return;
         }
-        let todo = self.store.read(|s| stacks::replacements(s, &self.eligible(s)));
+        let todo = self.store.read(|s| stacks::replacements(s, &self.eligible(s), &self.sick_storage(s)));
         for (name, placements) in todo {
             let what = placements.iter().map(|(w, n)| format!("{w} to {}", &n[..n.len().min(8)])).collect::<Vec<_>>().join(", ");
             match self.store.propose(Entry::StackPlaced { name: name.clone(), placements, at: now_ms() }).await {

@@ -147,11 +147,19 @@ pub fn place(s: &ClusterState, stack: &str, services: &BTreeMap<String, ServiceS
     Ok(out)
 }
 
+/// The eligible nodes a stack's new placements may go to (G11.8): none that says one of the storages the stack keeps
+/// volumes on fails there. A workload already on such a node stays (`place` keeps it), so a passing hiccup moves nothing.
+pub fn sound_for<'a>(eligible: &[String], storages: impl IntoIterator<Item = &'a str>, sick: &[(String, String)]) -> Vec<String> {
+    let uses: BTreeSet<&str> = storages.into_iter().collect();
+    eligible.iter().filter(|n| !sick.iter().any(|(sn, st)| sn == *n && uses.contains(st.as_str()))).cloned().collect()
+}
+
 /// The workloads to put on other nodes: of each stack, those on a node that no longer qualifies (its labels changed,
 /// or it is no longer one chosen for the stack) and that `place` has another for. One with nowhere to go stays.
-pub fn replacements(s: &ClusterState, eligible: &[String]) -> Vec<(String, BTreeMap<String, String>)> {
+pub fn replacements(s: &ClusterState, eligible: &[String], sick: &[(String, String)]) -> Vec<(String, BTreeMap<String, String>)> {
     let mut out = vec![];
     for st in s.stacks.values() {
+        let eligible = &sound_for(eligible, st.volumes.values().map(|v| v.storage.as_str()), sick);
         // A service with a workload that has nowhere to go is left out (its workloads stay), and the rest tried again.
         let mut services = st.services.clone();
         let p = loop {
@@ -468,6 +476,14 @@ mod tests {
         ServiceSpec { ports: vec![Port { host_port, container_port: 80, protocol: "tcp".into(), host_ip: String::new() }], ..spec(image, replicas) }
     }
 
+    #[test]
+    fn a_node_whose_storage_fails_takes_no_new_workload_with_volumes_on_it() {
+        let all = eligible(&["a", "b", "c"]);
+        let sick = vec![("b".to_string(), "nas".to_string()), ("c".to_string(), "other".to_string())];
+        assert_eq!(sound_for(&all, ["nas"], &sick), eligible(&["a", "c"]));
+        assert_eq!(sound_for(&all, [], &sick), all, "a stack with no volumes on storage minds none");
+    }
+
     fn eligible(n: &[&str]) -> Vec<String> {
         n.iter().map(|s| s.to_string()).collect()
     }
@@ -585,12 +601,12 @@ mod tests {
         let one = svc(&[("x", with(spec("x", 1), |x| x.placement.constraints = vec![c("node.labels.zone==1")])), ("y", spec("y", 1))]);
         let p = place(&s, "st", &one, &all, &[]).unwrap();
         deploy(&mut s, "st", &one, p);
-        assert!(replacements(&s, &all).is_empty(), "every workload where it may be");
+        assert!(replacements(&s, &all, &[]).is_empty(), "every workload where it may be");
         s.nodes.get_mut("a").unwrap().labels.insert("zone".into(), "2".into());
         s.nodes.get_mut("b").unwrap().labels.insert("zone".into(), "1".into());
-        assert_eq!(replacements(&s, &all), vec![("st".to_string(), [("st.x.1".to_string(), "b".to_string())].into())], "x follows its label; y stays");
+        assert_eq!(replacements(&s, &all, &[]), vec![("st".to_string(), [("st.x.1".to_string(), "b".to_string())].into())], "x follows its label; y stays");
         s.nodes.get_mut("b").unwrap().labels.insert("zone".into(), "3".into());
-        assert!(replacements(&s, &all).is_empty(), "nowhere to go: it stays where it is");
+        assert!(replacements(&s, &all, &[]).is_empty(), "nowhere to go: it stays where it is");
     }
 
     #[test]
@@ -604,7 +620,7 @@ mod tests {
         deploy(&mut s, "st", &two, p);
         s.nodes.get_mut("a").unwrap().labels.insert("zone".into(), "2".into());
         s.nodes.get_mut("b").unwrap().labels.insert("zone".into(), "1".into());
-        assert_eq!(replacements(&s, &all), vec![("st".to_string(), [("st.x.1".to_string(), "b".to_string())].into())], "z has no room on b and stays; x moves");
+        assert_eq!(replacements(&s, &all, &[]), vec![("st".to_string(), [("st.x.1".to_string(), "b".to_string())].into())], "z has no room on b and stays; x moves");
     }
 
     #[test]

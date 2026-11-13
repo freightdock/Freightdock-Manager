@@ -459,8 +459,22 @@ async fn remove_floating(State(m): State<Arc<Manager>>, h: HeaderMap, Path(addre
 
 /// The cluster's shared storage (G11): each with what its driver can do, the stacks keeping volumes on it, and the
 /// volumes for one writer with the node each is leased to.
+/// How each node says a storage answers it (G11.8): the nodes that made it ready, by name.
+fn storage_health(s: &crate::state::ClusterState, reports: &[(String, freightdock_proto::v1::StorageReport)], storage: &str) -> Vec<Value> {
+    reports
+        .iter()
+        .filter_map(|(node, r)| {
+            let h = r.storages.iter().find(|h| h.name == storage)?;
+            let name = s.nodes.get(node).map_or_else(|| node.clone(), |n| n.display_name());
+            Some(json!({ "node_id": node, "node": name, "ok": h.ok, "error": h.error, "total_bytes": h.total_bytes, "free_bytes": h.free_bytes, "probe_ms": h.probe_ms, "at": h.at_ms }))
+        })
+        .collect()
+}
+
 async fn storage(State(m): State<Arc<Manager>>, h: HeaderMap) -> R<Json<Value>> {
     authed(&m, &h)?;
+    let ids: Vec<String> = m.store.read(|s| s.nodes.keys().cloned().collect());
+    let reports: Vec<(String, freightdock_proto::v1::StorageReport)> = ids.into_iter().filter_map(|id| Some((id.clone(), m.sessions.storage(&id)?))).collect();
     Ok(Json(m.store.read(|s| {
         Value::Array(
             s.storage
@@ -472,7 +486,7 @@ async fn storage(State(m): State<Arc<Manager>>, h: HeaderMap) -> R<Json<Value>> 
                         .flat_map(|stack| stack.volumes.iter().filter(|(_, v)| v.storage == st.name).map(move |(name, v)| (stack, name, v)))
                         .map(|(stack, name, v)| json!({ "stack": stack.name, "volume": name, "access": v.access, "holder": s.leases.get(&format!("{}/{name}", stack.name)).map(|l| &l.node_id) }))
                         .collect();
-                    json!({ "name": st.name, "driver": st.driver, "source": st.source, "options": st.options, "added_at": st.added_at, "capabilities": st.driver.capabilities(), "volumes": volumes })
+                    json!({ "name": st.name, "driver": st.driver, "source": st.source, "options": st.options, "added_at": st.added_at, "capabilities": st.driver.capabilities(), "volumes": volumes, "health": storage_health(s, &reports, &st.name) })
                 })
                 .collect(),
         )
@@ -1086,7 +1100,8 @@ fn ready(m: &Manager, b: &DeployBody) -> R<(String, Ready)> {
                 ids
             }
         };
-        let placements = crate::stacks::place(s, &name, &parsed.services, &m.eligible(s), &nodes);
+        let eligible = crate::stacks::sound_for(&m.eligible(s), parsed.volumes.values().map(|v| v.storage.as_str()), &m.sick_storage(s));
+        let placements = crate::stacks::place(s, &name, &parsed.services, &eligible, &nodes);
         Ok((name.clone(), Ready { parsed, options, nodes, placements }))
     })
 }
@@ -1181,6 +1196,20 @@ fn node_by(s: &crate::state::ClusterState, n: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_storage_s_health_is_each_node_s_that_made_it_ready_by_name() {
+        use freightdock_proto::v1::{StorageHealth, StorageReport};
+        let mut s = crate::state::ClusterState::default();
+        let mut n = crate::state::Node { id: "a".into(), hostname: "docker".into(), cert_sha256: String::new(), prev_cert_sha256: None, enrolled_at: 0, report: None, reported_at: None, labels: Default::default(), fencing: Default::default(), recovered: false, overlay: None };
+        n.labels.insert("name".into(), "w3".into());
+        s.nodes.insert("a".into(), n);
+        let r = |name: &str, ok: bool| StorageReport { storages: vec![StorageHealth { name: name.into(), ok, error: if ok { String::new() } else { "nas is not mounted".into() }, free_bytes: 5, total_bytes: 9, ..Default::default() }] };
+        let reports = vec![("a".to_string(), r("nas", false)), ("b".to_string(), r("other", true))];
+        let h = super::storage_health(&s, &reports, "nas");
+        assert_eq!(h.len(), 1, "only the nodes that made it ready: {h:?}");
+        assert_eq!((h[0]["node"].as_str(), h[0]["ok"].as_bool(), h[0]["error"].as_str(), h[0]["free_bytes"].as_u64()), (Some("w3"), Some(false), Some("nas is not mounted"), Some(5)));
+    }
+
     #[test]
     fn a_node_is_found_by_id_by_a_name_label_it_was_given_or_reports_or_by_hostname() {
         let node = |id: &str, host: &str, set: &[(&str, &str)], reported: &[(&str, &str)]| crate::state::Node {

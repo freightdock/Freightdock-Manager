@@ -16,7 +16,7 @@ use crate::settings::Secret;
 use crate::state::{FenceState, Ms, Recovery};
 
 /// What the cluster tells about, and how the UI says it.
-pub const EVENTS: [(&str, &str); 12] = [
+pub const EVENTS: [(&str, &str); 14] = [
     ("node.down", "A node stops answering the managers"),
     ("node.back", "A node that was down answers again"),
     ("node.fenced", "A node was fenced, so its workloads may run elsewhere"),
@@ -26,6 +26,8 @@ pub const EVENTS: [(&str, &str); 12] = [
     ("workloads.stranded", "Workloads that could not be started anywhere else"),
     ("container.died", "A workload's container stopped on its own: it crashed, or was killed"),
     ("deploy.failed", "A workload could not be started: its image could not be pulled, or Docker refused it"),
+    ("storage.unhealthy", "A node's shared storage stops answering, is not mounted, or cannot be written"),
+    ("storage.back", "A node's shared storage answers again"),
     ("manager.down", "A manager stops answering the others"),
     ("manager.back", "A manager that was down answers again"),
     ("backup.failed", "A manager's scheduled backup could not be written"),
@@ -383,6 +385,8 @@ pub struct View {
     /// The workloads that should run: id to (node, generation), none of a stopped stack.
     pub wanted: HashMap<String, (String, u64)>,
     pub failed: Vec<FailedRun>,
+    /// Each node's shared storage as it last said: node, storage, whether it answers, why not.
+    pub storage: Vec<(String, String, bool, String)>,
 }
 
 /// What the leader saw last, to tell what changed since. The first look only records (a manager that just became
@@ -396,6 +400,7 @@ pub struct Watch {
     containers: HashMap<String, String>,
     failed: HashSet<String>,
     managers: HashMap<String, bool>,
+    storage: HashMap<(String, String), bool>,
 }
 
 fn stopped(state: &str) -> bool {
@@ -483,6 +488,18 @@ impl Watch {
         }
         self.failed.retain(|id| v.failed.iter().any(|f| &f.command_id == id));
 
+        for (node, name, ok, why) in &v.storage {
+            let before = self.storage.insert((node.clone(), name.clone()), *ok);
+            let place = name_of(node);
+            let target = format!("{node}/{name}");
+            match (before, ok) {
+                (None | Some(true), false) => out.push(Event { kind: "storage.unhealthy", title: format!("Storage {name} fails on {place}"), message: format!("{why}. A workload with volumes on it may not run there."), node: Some(place), target }),
+                (Some(false), true) => out.push(Event { kind: "storage.back", title: format!("Storage {name} answers again on {place}"), message: format!("{place} reads and writes {name} again."), node: Some(place), target }),
+                _ => {}
+            }
+        }
+        self.storage.retain(|(n, s), _| v.storage.iter().any(|(vn, vs, _, _)| vn == n && vs == s));
+
         for (addr, online) in &v.managers {
             match (self.managers.insert(addr.clone(), *online), online) {
                 (Some(true), false) => out.push(Event { kind: "manager.down", title: format!("The manager at {addr} is down"), message: format!("The manager at {addr} stopped answering the others."), node: None, target: addr.clone() }),
@@ -527,6 +544,9 @@ impl crate::Manager {
         });
         for n in &mut v.nodes {
             n.health = self.sessions.liveness(&n.id).health;
+            for h in self.sessions.storage(&n.id).map(|r| r.storages).unwrap_or_default() {
+                v.storage.push((n.id.clone(), h.name, h.ok, h.error));
+            }
             for w in self.sessions.reported(&n.id).unwrap_or_default() {
                 v.containers.push(ContainerView { node_id: n.id.clone(), workload_id: w.workload_id, container_id: w.container_id, state: w.state, generation: w.generation, exit_code: w.exit_code });
             }
@@ -694,6 +714,23 @@ mod tests {
         assert_eq!(e[0].message, "pull access denied (ghcr.io/x/y:1)");
         v.managers[0].1 = true;
         assert_eq!(kinds(&w.look(&v)), ["manager.back"]);
+    }
+
+    #[test]
+    fn a_node_s_storage_failing_and_answering_again_is_told() {
+        let mut w = Watch::default();
+        let mut v = View { nodes: vec![node("a", Health::Healthy, FenceState::None)], storage: vec![("a".into(), "nas".into(), true, String::new())], ..Default::default() };
+        w.look(&v);
+        assert!(w.look(&v).is_empty());
+        v.storage[0] = ("a".into(), "nas".into(), false, "nas is not mounted at /x".into());
+        let e = w.look(&v);
+        assert_eq!(kinds(&e), ["storage.unhealthy"]);
+        assert_eq!((e[0].title.as_str(), e[0].target.as_str()), ("Storage nas fails on a-host", "a/nas"));
+        assert!(e[0].message.starts_with("nas is not mounted"));
+        v.storage[0].2 = true;
+        assert_eq!(kinds(&w.look(&v)), ["storage.back"]);
+        v.storage.push(("a".into(), "nfs2".into(), false, "write failed".into()));
+        assert_eq!(kinds(&w.look(&v)), ["storage.unhealthy"], "a storage first heard failing is news after the first look");
     }
 
     #[test]

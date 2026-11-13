@@ -138,7 +138,8 @@ freightdock-manager registry test ghcr.io
 Channels (a webhook, e-mail over SMTP, an ntfy topic, a Gotify server) kept with the cluster's state, each telling the
 events it chose: a node down or back, fenced, fencing failed, a node waiting to be let back, workloads moved or
 stranded, a workload's container that died on its own (not a stop, not a job that ended with 0), a run that failed (a
-pull refused, Docker's error), a manager down or back, a scheduled backup that failed. The Raft leader watches and
+pull refused, Docker's error), a node's shared storage failing or answering again, a manager down or back, a scheduled
+backup that failed. The Raft leader watches and
 tells each change once; the same event about the same thing is told at most once in ten minutes (in memory, so a new
 leader may tell once more). A webhook's body is JSON (`event, title, message, node, target, at, freightdock`), signed
 with its key when it has one: `X-Freightdock-Signature: sha256=<hex HMAC-SHA256 of the body>`. Each channel's one
@@ -216,7 +217,7 @@ a client trusts that CA alone and checks that name. `GET /v1/health` and `GET /v
 | `POST /v1/stacks` | `{"name", "compose", "nodes"?, "exposures"?}`: make or change a stack, on the nodes named (ids, `name` labels or hostnames; `[]` any, left out as it was) with its exposures on the pool (left out: as they were); answers it and the file's warnings |
 | `POST /v1/stack-check` | the same body, changing nothing: the services with the ports the file asks for, the warnings, the nodes resolved, and where the new workloads would go (`placements`) or why not (`unplaced`) |
 | `POST /v1/stacks/{name}/start`, `/stop`, `/restart`; `DELETE /v1/stacks/{name}` | run, stop, restart (stop, and the reconcile starts it) or remove |
-| `GET /v1/storage` | the cluster's shared storage (G11): each with its driver's capabilities and the volumes on it, with the node holding each volume for one writer |
+| `GET /v1/storage` | the cluster's shared storage (G11): each with its driver's capabilities and the volumes on it, with the node holding each volume for one writer, and `health`: each node that made it ready, by name, with `ok`, `error`, `free_bytes`, `total_bytes`, `probe_ms` and `at` |
 | `POST /v1/storage`, `DELETE /v1/storage/{name}` | `{"name", "driver": "nfs"\|"path", "source", "options"?}`: add storage; take it away (refused while a stack keeps a volume on it) |
 
 ### Stacks
@@ -345,6 +346,13 @@ is fenced. `access: many` is for what the application itself keeps safe to share
 `nfs` storage once its workloads are stopped (`FREIGHTDOCK_FENCE_STORAGE_S` after); a `path` storage is the host's to
 take away, so with one a provider such as Proxmox is what makes a fenced node let go of it. A plain named volume
 stays local to each node, as before.
+
+Each worker probes the storage it has made ready every 15 seconds: an `nfs` export must still be mounted at its root
+(else a write would land on the node's own disk), its free space is read, and a small file is written, synced, read
+back and removed. A probe that hangs (an NFS server gone) is reported after 10 seconds and no second one is started
+beside it. `storage ls` and the UI show each node's answer; a node whose storage fails takes no new workload with
+volumes on it, while those already there stay, and the leader tells `storage.unhealthy` and `storage.back` through the
+notification channels.
 
 Workers in unprivileged Proxmox LXCs cannot mount NFS. Mount the export on the Proxmox host (a systemd mount unit,
 so nothing in the cluster-wide `storage.cfg` changes), bind it into each worker and add it as a `path` storage:

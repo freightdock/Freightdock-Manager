@@ -71,6 +71,8 @@ pub struct Session {
     pub overlay: Option<freightdock_proto::v1::NetworkReport>,
     /// Its latest traffic report and when it came (G9.8).
     pub traffic: Option<(Instant, freightdock_proto::v1::TrafficReport)>,
+    /// How its shared storage last answered (G11.8).
+    pub storage: Option<freightdock_proto::v1::StorageReport>,
 }
 
 /// Ends a stream with a status. Dropping the sender is not enough: the task reading the worker's side holds a clone.
@@ -126,7 +128,7 @@ impl Sessions {
         g.0 += 1;
         let generation = g.0;
         let now = Instant::now();
-        if let Some(old) = g.1.insert(node.to_string(), Session { generation, tx, last_heard: now, connected_at: now, resources: None, peer, fresh: workloads.is_some(), workloads, fenced, network: None, overlay: None, traffic: None }) {
+        if let Some(old) = g.1.insert(node.to_string(), Session { generation, tx, last_heard: now, connected_at: now, resources: None, peer, fresh: workloads.is_some(), workloads, fenced, network: None, overlay: None, traffic: None, storage: None }) {
             end(&old, "a newer stream from this node replaced this one");
         }
         generation
@@ -183,6 +185,23 @@ impl Sessions {
         if let Some(s) = g.1.get_mut(node).filter(|s| s.generation == generation) {
             s.traffic = report.map(|r| (Instant::now(), r));
         }
+    }
+
+    /// How the node's shared storage answers (G11.8); a heartbeat without it keeps the last word.
+    pub fn heard_storage(&self, node: &str, generation: u64, report: Option<freightdock_proto::v1::StorageReport>) {
+        let mut g = self.inner.lock().expect("sessions lock");
+        if let (Some(s), Some(r)) = (g.1.get_mut(node).filter(|s| s.generation == generation), report) {
+            s.storage = Some(r);
+        }
+    }
+
+    /// The node's shared storage as it last reported it to any manager (this one's own session first).
+    pub fn storage(&self, node: &str) -> Option<freightdock_proto::v1::StorageReport> {
+        if let Some(r) = self.inner.lock().expect("sessions lock").1.get(node).and_then(|s| s.storage.clone()) {
+            return Some(r);
+        }
+        let g = self.remote.lock().expect("remote lock");
+        g.values().filter_map(|(at, nodes)| nodes.iter().find(|n| n.node_id == node).and_then(|n| Some((Duration::from_millis(n.heard_ms_ago) + at.elapsed(), n.storage.as_ref()?)))).min_by_key(|c| c.0).map(|c| c.1.clone())
     }
 
     /// The node's latest traffic report to any manager (this one's own session first), if it is recent.
@@ -291,7 +310,7 @@ impl Sessions {
     pub fn connected(&self) -> Vec<HeardNode> {
         let g = self.inner.lock().expect("sessions lock");
         g.1.iter()
-            .map(|(id, s)| HeardNode { node_id: id.clone(), heard_ms_ago: s.last_heard.elapsed().as_millis() as u64, connected_for_ms: s.connected_at.elapsed().as_millis() as u64, peer: s.peer.clone(), resources: s.resources, workloads: s.workloads.clone(), network: s.overlay.clone(), traffic: s.traffic.as_ref().filter(|(at, _)| at.elapsed() < TRAFFIC_AGE).map(|(_, r)| r.clone()) })
+            .map(|(id, s)| HeardNode { node_id: id.clone(), heard_ms_ago: s.last_heard.elapsed().as_millis() as u64, connected_for_ms: s.connected_at.elapsed().as_millis() as u64, peer: s.peer.clone(), resources: s.resources, workloads: s.workloads.clone(), network: s.overlay.clone(), traffic: s.traffic.as_ref().filter(|(at, _)| at.elapsed() < TRAFFIC_AGE).map(|(_, r)| r.clone()), storage: s.storage.clone() })
             .collect()
     }
 
@@ -357,7 +376,7 @@ mod tests {
     }
 
     fn heard(node: &str, ms: u64) -> HeardNode {
-        HeardNode { node_id: node.into(), heard_ms_ago: ms, connected_for_ms: 60_000, peer: "192.0.2.9:1".into(), resources: None, workloads: None, network: None, traffic: None }
+        HeardNode { node_id: node.into(), heard_ms_ago: ms, connected_for_ms: 60_000, peer: "192.0.2.9:1".into(), resources: None, workloads: None, network: None, traffic: None, storage: None }
     }
 
     #[test]
@@ -432,6 +451,22 @@ mod tests {
         assert_eq!(s.connected()[0].traffic.as_ref().map(|r| r.flows[0].port), Some(2), "and passed on to the others");
         s.heard_traffic("n", g, None);
         assert!(s.connected()[0].traffic.is_none(), "a heartbeat without one: no traffic known");
+    }
+
+    #[test]
+    fn a_node_s_storage_health_is_its_last_word_here_or_to_another_manager() {
+        use freightdock_proto::v1::{StorageHealth, StorageReport};
+        let s = Sessions::default();
+        let rep = |ok: bool| Some(StorageReport { storages: vec![StorageHealth { name: "nas".into(), ok, ..Default::default() }] });
+        assert!(s.storage("n").is_none());
+        s.reports("m2:7450", vec![HeardNode { storage: rep(false), ..heard("n", 100) }]);
+        assert_eq!(s.storage("n").map(|r| r.storages[0].ok), Some(false), "another manager's word");
+        let (tx, _rx) = mpsc::channel(1);
+        let g = s.open("n", tx, "a".into(), None);
+        s.heard_storage("n", g, rep(true));
+        s.heard_storage("n", g, None);
+        assert_eq!(s.storage("n").map(|r| r.storages[0].ok), Some(true), "its own session first, kept over a heartbeat without one");
+        assert_eq!(s.connected()[0].storage.as_ref().map(|r| r.storages[0].ok), Some(true), "and passed on to the others");
     }
 
     #[test]
