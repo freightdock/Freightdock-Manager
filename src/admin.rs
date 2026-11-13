@@ -102,6 +102,7 @@ pub fn router(m: Arc<Manager>) -> Router {
         .route("/v1/registries", get(registries))
         .route("/v1/registries/{host}", axum::routing::put(set_registry).delete(remove_registry))
         .route("/v1/registries/{host}/test", post(test_registry))
+        .route("/v1/metrics", get(metrics))
         .route("/v1/notifications", get(notifications))
         .route("/v1/notifications/{name}", axum::routing::put(set_channel).delete(remove_channel))
         .route("/v1/notifications/{name}/test", post(test_channel))
@@ -567,6 +568,13 @@ async fn test_registry(State(m): State<Arc<Manager>>, h: HeaderMap, Path(host): 
     let (Some(user), Some(pass)) = (user, pass) else { return Err(ApiError(StatusCode::BAD_REQUEST, "a login to try needs a user and a password".into())) };
     let said = crate::registry::test(&host, &user, &pass).await.map_err(|e| ApiError(StatusCode::BAD_GATEWAY, format!("{e:#}")))?;
     Ok(Json(json!({ "ok": true, "message": said })))
+}
+
+/// The cluster's metrics in Prometheus' text format (`metrics.rs`); a read token is enough.
+async fn metrics(State(m): State<Arc<Manager>>, h: HeaderMap) -> R<impl axum::response::IntoResponse> {
+    authed(&m, &h)?;
+    let text = crate::metrics::render(&crate::metrics::families(&m.metrics_snapshot()));
+    Ok(([(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")], text))
 }
 
 /// The notification channels, without their secrets, and the events and kinds there are.

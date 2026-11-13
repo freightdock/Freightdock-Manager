@@ -133,6 +133,30 @@ freightdock-manager registry add ghcr.io my-bot          # the token from stdin 
 freightdock-manager registry test ghcr.io
 ```
 
+### Metrics
+
+`GET /v1/metrics` answers in Prometheus' text format, from any manager, for the whole cluster as it knows it: the
+managers and the leader, each node's health, fencing state, CPU, memory and containers, each stack's workloads wanted
+and running, each storage's health and space per node, the floating addresses, the notification channels that fail.
+A read token is enough; scrape the TLS API with the cluster CA:
+
+```sh
+freightdock-manager api-token create prometheus read     # the token once
+freightdock-manager ca > /etc/prometheus/freightdock-ca.pem
+```
+
+```yaml
+scrape_configs:
+  - job_name: freightdock
+    scheme: https
+    authorization: {credentials_file: /etc/prometheus/freightdock.token}
+    tls_config: {ca_file: /etc/prometheus/freightdock-ca.pem, server_name: manager.freightdock.internal}
+    static_configs: [{targets: ["manager-1.example:7452"]}]
+```
+
+Each manager answers for all of it, so one target is enough; list them all to keep the scrape when one is down (the
+`manager` label tells them apart).
+
 ### Notifications
 
 Channels (a webhook, e-mail over SMTP, an ntfy topic, a Gotify server) kept with the cluster's state, each telling the
@@ -204,6 +228,7 @@ a client trusts that CA alone and checks that name. `GET /v1/health` and `GET /v
 | `POST /v1/registries/{host}/test` | `{username?, password?}`: signs in as Docker would (v2, Basic or a Bearer token), with the login given or the one set; nothing is pulled |
 | `POST /v1/backup` | `{"passphrase"}`: a sealed backup of the cluster now, as a download (kept nowhere) |
 | `GET /v1/backups`, `GET /v1/backups/{name}` | this manager's scheduled backups (`name`, `taken_at`, `size`, `manager`), newest first; one as a download |
+| `GET /v1/metrics` | the cluster's metrics, Prometheus' text format (see Metrics) |
 | `GET /v1/api-tokens`, `POST /v1/api-tokens`, `DELETE /v1/api-tokens/{id}` | API tokens: `{"name", "role": "read" or "admin"}` gives the token once |
 | `GET /v1/ca` | the cluster CA's certificate (PEM), no token |
 | `GET /v1/floating`, `POST /v1/floating`, `DELETE /v1/floating/{address}` | the pool of floating addresses (G10.3), each with its holder and what stacks expose on it; `{"address"}` adds one (400 if not a LAN's unicast IPv4 address outside 10.240.0.0/16, 409 if there) or a range, `192.0.2.10-20` or `192.0.2.8/29` (at most 1024, those already there kept), answering `{"added": n}`; an address is announced on the LAN only once a stack exposes on it; one in use is not removed (409) |

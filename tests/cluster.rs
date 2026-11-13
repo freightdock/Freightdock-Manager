@@ -901,3 +901,21 @@ async fn a_notification_channel_is_set_tested_and_told_once_with_its_secret_neve
     assert_eq!(https_with(&a.m, &addr, "POST", "/v1/notifications/ops/test", admin, "").await.0, 404);
     a.server.abort();
 }
+
+#[tokio::test]
+async fn the_metrics_are_prometheus_text_for_a_read_token() {
+    let a = start(None).await;
+    until("a leader", || a.m.store.leader().is_some()).await;
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap().to_string();
+    tokio::spawn(freightdock_manager::serve_admin_tls(a.m.clone(), l));
+    let admin = Some(a.m.admin_token.as_str());
+    let (s, b) = https_with(&a.m, &addr, "POST", "/v1/api-tokens", admin, r#"{"name":"prometheus","role":"read"}"#).await;
+    assert_eq!(s, 201, "{b}");
+    let token: serde_json::Value = serde_json::from_str(&b).unwrap();
+    let (s, text) = https_with(&a.m, &addr, "GET", "/v1/metrics", token["token"].as_str(), "").await;
+    assert_eq!(s, 200, "{text}");
+    assert!(text.contains("# TYPE freightdock_manager_leader gauge") && text.lines().any(|l| l.starts_with("freightdock_manager_leader{") && l.ends_with(" 1")), "{text}");
+    assert_eq!(https_with(&a.m, &addr, "GET", "/v1/metrics", None, "").await.0, 401, "never without a token");
+    a.server.abort();
+}

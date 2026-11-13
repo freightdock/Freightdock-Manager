@@ -22,7 +22,7 @@ Status marks: **[x]** done, **[~]** in progress, **[ ]** not started.
 | 9 | G9 Internal networking (Network repo) | Stable workload IPs across workers; postponed by the plan's first release | G7 | **done** (2026-11-13) |
 | 10 | G10 External networking | Exposing services without per-deploy setup | G9 | **done** (2026-11-13) |
 | 11 | G11 Shared storage | Moving stateful workloads safely; needs fencing and storage leases | G6, G7 | first slice done (2026-11-13) |
-| 12 | G12 Advanced | Ceph, replicated storage, gateway redundancy, anti-affinity, more fencing providers | G9 to G11 | not started |
+| 12 | G12 Advanced | Ceph, replicated storage, gateway redundancy, anti-affinity, more fencing providers | G9 to G11 | scoped; metrics done (2026-11-14) |
 
 G1 to G7 plus basic monitoring is the plan's **first working release** (plan section 14). G6 is ranked before G7
 although the plan has recovery first: recovering a workload whose old copy may still be running is the one mistake the
@@ -375,6 +375,21 @@ Built 2026-11-13 (plan 4.6, 5.2, 7.1, 8), the first slice; the README's "Shared 
 9. [ ] Left for later: read-only remounts, SMB, block storage and the cluster filesystems (plan 8.2), replicated
        storage (G12).
 
+### G12: advanced
+
+Scoped 2026-11-14 against the plan's phase 11. Much of it came with the earlier goals:
+
+1. [x] Anti-affinity: `x-freightdock: {apart: [...]}` (G4), both ways and across stacks; excluded labels are
+       constraints with `!=`; spread and preferences; resource-aware placement with reservations.
+2. [x] Gateway redundancy: the floating addresses (G10.3) move to a healthy worker once their holder is fenced, and
+       every node answers the mesh's ports.
+3. [x] Storage-aware placement and its health (G11.8).
+4. [x] Monitoring (2026-11-14): `GET /v1/metrics`, Prometheus' text format from any manager for the whole cluster
+       (`metrics.rs`), with a read token over the TLS API.
+5. [ ] More fencing providers: Redfish (a server's BMC) is the next useful one; it can only be tried against a fake
+       BMC here.
+6. [ ] Replicated storage and Ceph: need disks or a Ceph cluster the test cluster does not have (open question 9).
+
 ## Open questions for the owner
 
 1. ~~Freightdock's role~~ Answered 2026-11-11: the UI only, its own image, run by the managers (decision 11).
@@ -392,3 +407,5 @@ Built 2026-11-13 (plan 4.6, 5.2, 7.1, 8), the first slice; the README's "Shared 
    pool address, as built ("i think thats fine").
 8. ~~Storage for G11~~ Given 2026-11-13: an NFS share on the owner's LAN for the test cluster (its address is not
    written here).
+9. Replicated storage or Ceph (G12.6): worth building on the test cluster? It needs extra disks on the Proxmox host
+   or a Ceph cluster; until then, shared storage is NFS or a shared directory.

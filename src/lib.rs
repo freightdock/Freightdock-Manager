@@ -19,6 +19,7 @@ pub mod stacks;
 pub mod state;
 pub mod store;
 pub mod tls;
+pub mod metrics;
 pub mod network;
 pub mod notify;
 pub mod traffic;
