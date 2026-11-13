@@ -179,7 +179,9 @@ Ranked inside the goal:
        the reboot step or an external provider.
 4. [x] After a reboot: no managed workload starts until the managers authorize it (the hello's fencing state).
 5. [x] External fencing provider; Proxmox as the first (per node labels, pinned certificate, token from a file).
-       Checked on the cluster only up to "no settings"; a real power-off waits for a Proxmox API token.
+       Tried on the test cluster 2026-11-13 against a real Proxmox VE 9 (a token for the workers' LXCs only): a
+       worker cut off was requested at 12 s, powered off by Proxmox and fenced, verified, at 16 s (the self-fencing
+       path takes about 85 s); started again, it was authorized and at rest within 2 s.
 
 ## G7: Failure detection and stateless recovery
 
@@ -320,8 +322,9 @@ Built 2026-11-13 (plan 4.6, 5.2, 7.1, 8), the first slice; the README's "Shared 
 5. [x] Tried on the test cluster with a `path` storage (a local directory on each worker; the workers are
        unprivileged LXCs, which may not mount NFS): moves both ways handed over with no overlap, and a worker cut off
        was fenced, its writer stopped and run on the other worker 45 s after its last write.
-6. [ ] The owner's NFS share on the test cluster: needs the workers to see it (a Proxmox bind mount into each worker
-       as a `path` storage, or NFS mounting allowed), the owner's call.
+6. [x] The owner's NFS share on the test cluster (2026-11-13): mounted on the Proxmox host, bound into each worker
+       LXC and added as a `path` storage. A volume for many was written from both workers and each saw the other's
+       files; a volume for one moved between them handing over the same file 7 s apart, never two writers.
 7. [x] The UI (`freightdock:cluster-ui-17`): storage on the Cluster page (added and removed by an Administrator),
        volumes and their holders on the stacks page, the volumes on storage in the deployer ("Cluster" 21).
 8. [ ] Left for later: storage health reported by the workers, read-only remounts, SMB, block storage and the

@@ -192,7 +192,18 @@ sessions, so those workers fence.
 A node labelled `fence.provider=proxmox`, `proxmox.node=<pve node>`, `proxmox.vmid=<id>` (and `proxmox.type=lxc`, the
 default, or `qemu`) is powered off through the Proxmox API instead, and is fenced once Proxmox says the guest is
 stopped; a failure is tried again after a minute. The API token needs `VM.PowerMgmt` and `VM.Audit` on the guest and is read from a
-file; the server's certificate is pinned by its SHA-256 fingerprint.
+file; the server's certificate is pinned by its SHA-256 fingerprint. A token that can do nothing else:
+
+```sh
+pveum role add FreightdockFence --privs "VM.PowerMgmt,VM.Audit"
+pveum user add freightdock-fence@pve
+pveum user token add freightdock-fence@pve fence --privsep 1     # prints the secret once
+for id in 201 202; do                                             # the workers' guests
+  pveum acl modify /vms/$id --users freightdock-fence@pve --roles FreightdockFence
+  pveum acl modify /vms/$id --tokens 'freightdock-fence@pve!fence' --roles FreightdockFence
+done
+openssl x509 -in /etc/pve/local/pve-ssl.pem -noout -fingerprint -sha256
+```
 
 | Variable | Default | |
 |---|---|---|
@@ -240,7 +251,18 @@ writer (`access: one`, a database's files) is used by one workload, and the mana
 a workload that moves runs on its new node only once the old one let the volume go (its container there is gone) or
 is fenced. `access: many` is for what the application itself keeps safe to share. A fencing worker unmounts its
 `nfs` storage once its workloads are stopped (`FREIGHTDOCK_FENCE_STORAGE_S` after); a `path` storage is the host's to
-take away. A plain named volume stays local to each node, as before.
+take away, so with one a provider such as Proxmox is what makes a fenced node let go of it. A plain named volume
+stays local to each node, as before.
+
+Workers in unprivileged Proxmox LXCs cannot mount NFS. Mount the export on the Proxmox host (a systemd mount unit,
+so nothing in the cluster-wide `storage.cfg` changes), bind it into each worker and add it as a `path` storage:
+
+```sh
+pct set 201 -mp0 /mnt/freightdock,mp=/srv/freightdock            # on the host, for each worker
+freightdock-manager storage add nas path /srv/freightdock
+```
+
+The LXC's root writes as uid 100000 on the export, so the export has to let it (its owner, or open permissions).
 
 ## Build
 
