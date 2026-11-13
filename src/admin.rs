@@ -860,15 +860,7 @@ fn ready(m: &Manager, b: &DeployBody) -> R<(String, Ready)> {
             Some(list) => {
                 let mut ids = vec![];
                 for n in list.iter().map(|n| n.trim()).filter(|n| !n.is_empty()) {
-                    let by_name: Vec<&String> = s.nodes.values().filter(|x| x.labels.get("name").is_some_and(|l| l == n)).map(|x| &x.id).collect();
-                    let by_host: Vec<&String> = s.nodes.values().filter(|x| x.hostname == n).map(|x| &x.id).collect();
-                    let id = if s.nodes.contains_key(n) {
-                        n.to_string()
-                    } else if let [one] = by_name[..] {
-                        one.clone()
-                    } else if let [one] = by_host[..] {
-                        one.clone()
-                    } else {
+                    let Some(id) = node_by(s, n) else {
                         return Err(ApiError(StatusCode::BAD_REQUEST, format!("{n:?} is no node's id, nor one node's name label or hostname")));
                     };
                     if !ids.contains(&id) {
@@ -960,8 +952,37 @@ fn raft_members(members: Vec<(u64, String)>, voters: &[u64], leader: Option<u64>
     members.into_iter().map(|(id, addr)| json!({ "raft_id": id.to_string(), "addr": addr, "voter": voters.contains(&id), "leader": leader == Some(id), "me": id == me })).collect()
 }
 
+/// The node `n` names: its id, else the one node whose `name` label it is (given by the managers or reported by the
+/// worker), else the one node of that hostname.
+fn node_by(s: &crate::state::ClusterState, n: &str) -> Option<String> {
+    if s.nodes.contains_key(n) {
+        return Some(n.to_string());
+    }
+    let one = |hits: Vec<&String>| if let [one] = hits[..] { Some(one.clone()) } else { None };
+    one(s.nodes.values().filter(|x| x.all_labels().get("name").is_some_and(|l| l == n)).map(|x| &x.id).collect())
+        .or_else(|| one(s.nodes.values().filter(|x| x.hostname == n).map(|x| &x.id).collect()))
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_node_is_found_by_id_by_a_name_label_it_was_given_or_reports_or_by_hostname() {
+        let node = |id: &str, host: &str, set: &[(&str, &str)], reported: &[(&str, &str)]| crate::state::Node {
+            id: id.into(), hostname: host.into(), cert_sha256: String::new(), prev_cert_sha256: None, enrolled_at: 0,
+            report: Some(crate::state::NodeReport { labels: reported.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(), ..Default::default() }),
+            reported_at: None, labels: set.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(), fencing: Default::default(), recovered: false, overlay: None,
+        };
+        let mut s = crate::state::ClusterState::default();
+        for n in [node("a", "docker", &[("name", "w3")], &[]), node("b", "docker", &[], &[("name", "vm1")]), node("c", "vm02", &[], &[])] {
+            s.nodes.insert(n.id.clone(), n);
+        }
+        assert_eq!(node_by(&s, "a").as_deref(), Some("a"));
+        assert_eq!(node_by(&s, "w3").as_deref(), Some("a"));
+        assert_eq!(node_by(&s, "vm1").as_deref(), Some("b"), "a name from the worker's own FREIGHTDOCK_LABELS");
+        assert_eq!(node_by(&s, "vm02").as_deref(), Some("c"));
+        assert_eq!(node_by(&s, "docker"), None, "two have that hostname");
+    }
+
     use super::*;
 
     #[test]
