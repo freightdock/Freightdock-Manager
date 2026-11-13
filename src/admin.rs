@@ -29,8 +29,8 @@ impl IntoResponse for ApiError {
 impl From<ProposeError> for ApiError {
     fn from(e: ProposeError) -> Self {
         match e {
-            ProposeError::Rejected(r @ (Rejected::NodeUnknown | Rejected::CommandUnknown | Rejected::StackUnknown | Rejected::FloatingUnknown | Rejected::StorageUnknown | Rejected::RegistryUnknown)) => ApiError(StatusCode::NOT_FOUND, r.to_string()),
-            ProposeError::Rejected(r @ (Rejected::BadAddress | Rejected::BadExposure | Rejected::BadStorage | Rejected::VolumeShared | Rejected::BadSettings | Rejected::BadRegistry)) => ApiError(StatusCode::BAD_REQUEST, r.to_string()),
+            ProposeError::Rejected(r @ (Rejected::NodeUnknown | Rejected::CommandUnknown | Rejected::StackUnknown | Rejected::FloatingUnknown | Rejected::StorageUnknown | Rejected::RegistryUnknown | Rejected::ChannelUnknown)) => ApiError(StatusCode::NOT_FOUND, r.to_string()),
+            ProposeError::Rejected(r @ (Rejected::BadAddress | Rejected::BadExposure | Rejected::BadStorage | Rejected::VolumeShared | Rejected::BadSettings | Rejected::BadRegistry | Rejected::BadChannel)) => ApiError(StatusCode::BAD_REQUEST, r.to_string()),
             ProposeError::Rejected(r) => ApiError(StatusCode::CONFLICT, r.to_string()),
             e @ (ProposeError::Unavailable(_) | ProposeError::NotLeader(_)) => ApiError(StatusCode::SERVICE_UNAVAILABLE, e.to_string()),
             ProposeError::Io(e) => {
@@ -102,6 +102,9 @@ pub fn router(m: Arc<Manager>) -> Router {
         .route("/v1/registries", get(registries))
         .route("/v1/registries/{host}", axum::routing::put(set_registry).delete(remove_registry))
         .route("/v1/registries/{host}/test", post(test_registry))
+        .route("/v1/notifications", get(notifications))
+        .route("/v1/notifications/{name}", axum::routing::put(set_channel).delete(remove_channel))
+        .route("/v1/notifications/{name}/test", post(test_channel))
         .route("/v1/backups", get(backups))
         .route("/v1/backups/{name}", get(backup_file))
         .route("/v1/cluster", get(cluster))
@@ -550,6 +553,68 @@ async fn test_registry(State(m): State<Arc<Manager>>, h: HeaderMap, Path(host): 
     let (Some(user), Some(pass)) = (user, pass) else { return Err(ApiError(StatusCode::BAD_REQUEST, "a login to try needs a user and a password".into())) };
     let said = crate::registry::test(&host, &user, &pass).await.map_err(|e| ApiError(StatusCode::BAD_GATEWAY, format!("{e:#}")))?;
     Ok(Json(json!({ "ok": true, "message": said })))
+}
+
+/// The notification channels, without their secrets, and the events and kinds there are.
+async fn notifications(State(m): State<Arc<Manager>>, h: HeaderMap) -> R<Json<Value>> {
+    authed(&m, &h)?;
+    let channels: Vec<Value> = m.store.read(|s| s.notifications.values().map(crate::notify::Channel::shown).collect());
+    let events: Vec<Value> = crate::notify::EVENTS.iter().map(|(e, says)| json!({ "event": e, "says": says })).collect();
+    Ok(Json(json!({ "channels": channels, "events": events, "kinds": crate::notify::KINDS })))
+}
+
+#[derive(Deserialize)]
+struct ChannelBody {
+    kind: String,
+    #[serde(default = "yes")]
+    enabled: bool,
+    #[serde(default)]
+    events: Vec<String>,
+    #[serde(default)]
+    config: crate::notify::Config,
+    /// Left out: the one set is kept; empty: there is none.
+    #[serde(default)]
+    secret: Option<String>,
+}
+
+fn yes() -> bool {
+    true
+}
+
+/// Sets a channel whole (`{kind, enabled, events, config, secret}`).
+async fn set_channel(State(m): State<Arc<Manager>>, h: HeaderMap, Path(name): Path<String>, Json(b): Json<ChannelBody>) -> R<Json<Value>> {
+    authed(&m, &h)?;
+    let secret = match b.secret {
+        Some(s) if s.is_empty() => None,
+        Some(s) => Some(crate::settings::Secret(s)),
+        None => m.store.read(|s| s.notifications.get(&name).and_then(|c| c.secret.clone())),
+    };
+    let config = b.config.checked(&b.kind, secret.is_some()).map_err(|e| ApiError(StatusCode::BAD_REQUEST, e))?;
+    let mut events: Vec<String> = vec![];
+    for e in b.events {
+        if !events.contains(&e) {
+            events.push(e);
+        }
+    }
+    let channel = crate::notify::Channel { name: name.clone(), kind: b.kind, enabled: b.enabled, events, config, secret, at: now_ms(), last_sent_at: None, last_error: None };
+    m.store.propose(Entry::ChannelSet { channel }).await?;
+    m.events.push("notify", None, format!("notification channel {name} was set"));
+    Ok(Json(m.store.read(|s| s.notifications.get(&name).map(crate::notify::Channel::shown)).unwrap_or(Value::Null)))
+}
+
+async fn remove_channel(State(m): State<Arc<Manager>>, h: HeaderMap, Path(name): Path<String>) -> R<StatusCode> {
+    authed(&m, &h)?;
+    m.store.propose(Entry::ChannelRemoved { name: name.clone(), at: now_ms() }).await?;
+    m.events.push("notify", None, format!("notification channel {name} was removed"));
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Sends a test through the channel as it is set, and says how it went.
+async fn test_channel(State(m): State<Arc<Manager>>, h: HeaderMap, Path(name): Path<String>) -> R<Json<Value>> {
+    authed(&m, &h)?;
+    let Some(ch) = m.store.read(|s| s.notifications.get(&name).cloned()) else { return Err(ApiError(StatusCode::NOT_FOUND, Rejected::ChannelUnknown.to_string())) };
+    m.send_through(&ch, &crate::notify::Event::test()).await.map_err(|e| ApiError(StatusCode::BAD_GATEWAY, e))?;
+    Ok(Json(json!({ "ok": true, "message": format!("sent through {name}") })))
 }
 
 /// The cluster's settings, each with where its value comes from, and what only this manager's environment sets.

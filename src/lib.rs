@@ -20,6 +20,7 @@ pub mod state;
 pub mod store;
 pub mod tls;
 pub mod network;
+pub mod notify;
 pub mod traffic;
 pub mod ui;
 
@@ -158,6 +159,8 @@ pub struct Manager {
     pub data_dir: PathBuf,
     /// Docker requests sent to the workers here, waiting for their replies (`docker.rs`).
     docker_waits: docker::Waits,
+    /// The leader's watch over the cluster and the quiet window of what was told (`notify.rs`).
+    pub notifier: notify::Notifier,
 }
 
 /// How long a manager may be cut off from the majority before it sends its workers away.
@@ -277,7 +280,7 @@ impl Manager {
         let manager_id = kept(&config.data_dir.join("manager.id"), || uuid::Uuid::new_v4().to_string())?;
         let admin_token = kept(&config.data_dir.join("admin.token"), || hex::encode(rand::random::<[u8; 32]>()))?;
         let commands = store.commands();
-        let m = Arc::new(Manager { store, events: Default::default(), sessions: Sessions::new(config.thresholds), ca, manager_id, advertise: config.advertise.clone(), admin_token, peer_tls, peer_channels: Default::default(), local_worker_token: config.local_worker_token.clone(), paced: Default::default(), own: settings::Settings::of(&config.thresholds, &config.fencing), local: config.local(), timers_sent: Default::default(), started: std::time::Instant::now(), cut_off_since: Default::default(), fence_tasks: Default::default(), data_dir: config.data_dir.clone(), docker_waits: Default::default() });
+        let m = Arc::new(Manager { store, events: Default::default(), sessions: Sessions::new(config.thresholds), ca, manager_id, advertise: config.advertise.clone(), admin_token, peer_tls, peer_channels: Default::default(), local_worker_token: config.local_worker_token.clone(), paced: Default::default(), own: settings::Settings::of(&config.thresholds, &config.fencing), local: config.local(), timers_sent: Default::default(), started: std::time::Instant::now(), cut_off_since: Default::default(), fence_tasks: Default::default(), data_dir: config.data_dir.clone(), docker_waits: Default::default(), notifier: Default::default() });
         tokio::spawn(deliver_applied(Arc::downgrade(&m), commands));
         Ok(m)
     }
@@ -583,6 +586,8 @@ pub async fn housekeeping(m: Arc<Manager>) {
                 if let Err(e) = b.scheduled_backup().await {
                     tracing::warn!("the scheduled backup failed: {e:#}");
                     b.events.push("backup", None, format!("the scheduled backup failed: {e:#}"));
+                    let me = b.advertise.first().cloned().unwrap_or_else(|| b.manager_id.clone());
+                    b.tell(notify::Event { kind: "backup.failed", title: format!("A backup failed on the manager at {me}"), message: format!("{e:#}"), node: None, target: me });
                 }
             });
         }
@@ -600,6 +605,9 @@ pub async fn housekeeping(m: Arc<Manager>) {
         m.reconcile().await;
         m.push_network();
         m.local_worker_token().await;
+        if ticks.is_multiple_of(2) {
+            m.notify_round();
+        }
         let health: Vec<_> = m.store.read(|s| s.nodes.keys().cloned().collect::<Vec<_>>()).into_iter().map(|id| {
             let h = m.sessions.liveness(&id).health;
             (id, h)

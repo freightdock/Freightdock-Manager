@@ -16,6 +16,7 @@ hex = "0.4"
 hyper = { version = "1", features = ["client", "server", "http1"] }
 http-body-util = "0.1"
 hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
+lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "hostname", "tokio1-rustls-tls"] }
 libc = "0.2"
 rand = "0.9"
 ring = "0.17"

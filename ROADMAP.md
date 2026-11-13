@@ -257,6 +257,12 @@ same host. Each later goal adds its pages there (stacks with G4, and so on).
        the password never shown), filled into `RunContainer.auth` and a page's pull by the manager that sends it, never
        kept with a command. `GET`/`PUT`/`DELETE /v1/registries/{host}`, a sign-in test (v2 Basic or Bearer), CLI
        `registry ls|add|test|rm`, the UI's Integrations page.
+9. [x] Notifications (2026-11-13): channels (webhook, e-mail, ntfy, Gotify) in the replicated state (`notify.rs`),
+       their secrets never shown and their last outcome kept (`ChannelOutcome`). The leader's watch tells what changed
+       since its last look: node health, fencing, recoveries, workload containers that died, failed runs, managers; a
+       manager tells its own failed backup. Ten minutes' quiet per event and target. `GET /v1/notifications`,
+       `PUT`/`DELETE /v1/notifications/{name}`, a test, CLI `notify ls|set|test|rm`, the UI's Integrations page.
+       Not told: a container's failing health check (the workers do not report health yet).
 
 ## G9 to G12
 

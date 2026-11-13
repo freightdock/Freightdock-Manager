@@ -828,3 +828,76 @@ async fn a_private_registry_s_login_is_kept_never_shown_and_goes_with_its_images
     assert_eq!(https_with(&a.m, &addr, "DELETE", "/v1/registries/ghcr.io", admin, "").await.0, 404);
     a.server.abort();
 }
+
+#[tokio::test]
+async fn a_notification_channel_is_set_tested_and_told_once_with_its_secret_never_shown() {
+    use freightdock_manager::notify::{Event, sign};
+    let a = start(None).await;
+    until("a leader", || a.m.store.leader().is_some()).await;
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap().to_string();
+    tokio::spawn(freightdock_manager::serve_admin_tls(a.m.clone(), l));
+    let admin = Some(a.m.admin_token.as_str());
+
+    // A webhook receiver: what it got, with the signature header.
+    let got: Arc<std::sync::Mutex<Vec<(String, String)>>> = Default::default();
+    let hook = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let hook_at = hook.local_addr().unwrap();
+    let g = got.clone();
+    let app = axum::Router::new().route(
+        "/hook",
+        axum::routing::post(move |h: axum::http::HeaderMap, body: String| {
+            let g = g.clone();
+            async move {
+                let sig = h.get("x-freightdock-signature").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+                g.lock().unwrap().push((sig, body));
+                "ok"
+            }
+        }),
+    );
+    tokio::spawn(async move { axum::serve(hook, app).await });
+
+    let body = format!(r#"{{"kind":"webhook","events":["node.down"],"config":{{"url":"http://{hook_at}/hook?token=abc"}},"secret":"s3cret-key"}}"#);
+    let (s, b) = https_with(&a.m, &addr, "PUT", "/v1/notifications/ops", admin, &body).await;
+    assert_eq!(s, 200, "{b}");
+    let (s, b) = https_with(&a.m, &addr, "PUT", "/v1/notifications/bad", admin, r#"{"kind":"webhook","config":{"url":"ftp://x"}}"#).await;
+    assert!(s == 400 && b.contains("url"), "{s} {b}");
+    let (s, b) = https_with(&a.m, &addr, "PUT", "/v1/notifications/g", admin, r#"{"kind":"gotify","config":{"server":"https://gotify.example"}}"#).await;
+    assert!(s == 400 && b.contains("token"), "{s} {b}");
+    let (s, b) = https_with(&a.m, &addr, "PUT", "/v1/notifications/x", admin, r#"{"kind":"webhook","events":["node.melted"],"config":{"url":"https://h.example"}}"#).await;
+    assert_eq!(s, 400, "{b}");
+
+    let (s, b) = https_with(&a.m, &addr, "POST", "/v1/notifications/ops/test", admin, "").await;
+    assert_eq!(s, 200, "{b}");
+    let (sig, sent) = got.lock().unwrap().pop().expect("the test came through");
+    assert!(sent.contains(r#""event":"test""#), "{sent}");
+    assert_eq!(sig, format!("sha256={}", sign("s3cret-key", sent.as_bytes())), "signed with the channel's key");
+
+    let down = Event { kind: "node.down", title: "w1 is down".into(), message: "m".into(), node: Some("w1".into()), target: "n1".into() };
+    a.m.tell(down.clone());
+    until("the event told", || got.lock().unwrap().iter().any(|(_, b)| b.contains("node.down"))).await;
+    a.m.tell(down.clone());
+    a.m.tell(Event { kind: "node.back", target: "n1".into(), ..down.clone() });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(got.lock().unwrap().len(), 1, "told once in the quiet window, and only what the channel wants");
+
+    let (_, list) = https_with(&a.m, &addr, "GET", "/v1/notifications", admin, "").await;
+    assert!(list.contains(r#""name":"ops""#) && list.contains(r#""has_secret":true"#) && !list.contains("s3cret-key"), "{list}");
+    assert!(list.contains("node.awaiting"), "the events the cluster tells, to choose from: {list}");
+    until("the delivery written down", || a.m.store.read(|s| s.notifications["ops"].last_sent_at.is_some())).await;
+
+    let (s, _) = https_with(&a.m, &addr, "PUT", "/v1/notifications/ops", admin, r#"{"kind":"webhook","events":["node.down"],"config":{"url":"http://127.0.0.1:1/x?token=abc"}}"#).await;
+    assert_eq!(s, 200);
+    assert!(a.m.store.read(|s| s.notifications["ops"].secret.is_some()), "the secret kept when left out");
+    let (s, b) = https_with(&a.m, &addr, "POST", "/v1/notifications/ops/test", admin, "").await;
+    assert!(s == 502 && b.contains("127.0.0.1:1") && !b.contains("abc"), "why, without the query: {s} {b}");
+    until("the error written down", || a.m.store.read(|s| s.notifications["ops"].last_error.is_some())).await;
+    let (s, _) = https_with(&a.m, &addr, "PUT", "/v1/notifications/ops", admin, r#"{"kind":"webhook","enabled":false,"config":{"url":"https://h.example"},"secret":""}"#).await;
+    assert_eq!(s, 200);
+    assert!(a.m.store.read(|s| s.notifications["ops"].secret.is_none() && !s.notifications["ops"].enabled), "an empty secret takes it away");
+
+    assert_eq!(https_with(&a.m, &addr, "DELETE", "/v1/notifications/ops", admin, "").await.0, 204);
+    assert_eq!(https_with(&a.m, &addr, "DELETE", "/v1/notifications/ops", admin, "").await.0, 404);
+    assert_eq!(https_with(&a.m, &addr, "POST", "/v1/notifications/ops/test", admin, "").await.0, 404);
+    a.server.abort();
+}

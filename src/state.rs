@@ -115,6 +115,11 @@ pub enum Entry {
     /// A private registry's login, set or replaced whole (`registry.rs`).
     RegistrySet { registry: crate::registry::Registry },
     RegistryRemoved { host: String, at: Ms },
+    /// A notification channel, set or replaced whole (`notify.rs`); what it last told is kept.
+    ChannelSet { channel: crate::notify::Channel },
+    ChannelRemoved { name: String, at: Ms },
+    /// How a channel's last delivery went: None it went through.
+    ChannelOutcome { name: String, error: Option<String>, at: Ms },
     /// The node a workload moved away from has no copy of it running any more (G5.5).
     WorkloadLeft { workload_id: String, node_id: String, at: Ms },
     /// A workload with a limit on its attempts was run (again) for its spec `generation`.
@@ -181,6 +186,9 @@ pub enum Rejected {
     /// A registry that is not a host and maybe a port, or a login without a user.
     BadRegistry,
     RegistryUnknown,
+    /// A channel name, kind or event that cannot be.
+    BadChannel,
+    ChannelUnknown,
     /// A volume for one writer used by more than one workload.
     VolumeShared,
     /// A volume another node may still be writing to.
@@ -227,6 +235,8 @@ impl std::fmt::Display for Rejected {
             Rejected::NotEmpty => "a backup is restored into a new cluster only, not over one that has a state",
             Rejected::BadRegistry => "a registry is a host and maybe a port (ghcr.io, registry.example:5000, docker.io), and its login has a user and a password",
             Rejected::RegistryUnknown => "the cluster has no login for that registry",
+            Rejected::BadChannel => "a channel is named 1 to 64 of a-z, 0-9, - and _, is a webhook, email, ntfy or gotify, and tells only of events the cluster knows",
+            Rejected::ChannelUnknown => "the cluster has no notification channel of that name",
             Rejected::BadSettings => "a setting is out of its range or order, or the Proxmox provider's settings do not hold",
         })
     }
@@ -919,6 +929,9 @@ pub struct ClusterState {
     /// Private registries' logins, by registry.
     #[serde(default)]
     pub registries: BTreeMap<String, crate::registry::Registry>,
+    /// Notification channels, by name.
+    #[serde(default)]
+    pub notifications: BTreeMap<String, crate::notify::Channel>,
 }
 
 /// A floating address: on its holder's LAN, answering the published ports as the nodes' own addresses do.
@@ -1522,6 +1535,31 @@ impl ClusterState {
             }
             Entry::RegistryRemoved { host, .. } => {
                 self.registries.remove(host).ok_or(Rejected::RegistryUnknown)?;
+            }
+            Entry::ChannelSet { channel } => {
+                if !crate::notify::valid_channel(channel) {
+                    return Err(Rejected::BadChannel);
+                }
+                let mut c = channel.clone();
+                if let Some(old) = self.notifications.get(&c.name) {
+                    c.last_sent_at = old.last_sent_at;
+                    c.last_error = old.last_error.clone();
+                }
+                self.notifications.insert(c.name.clone(), c);
+            }
+            Entry::ChannelRemoved { name, .. } => {
+                self.notifications.remove(name).ok_or(Rejected::ChannelUnknown)?;
+            }
+            Entry::ChannelOutcome { name, error, at } => {
+                if let Some(c) = self.notifications.get_mut(name) {
+                    match error {
+                        None => {
+                            c.last_sent_at = Some(*at);
+                            c.last_error = None;
+                        }
+                        Some(e) => c.last_error = Some(e.clone()),
+                    }
+                }
             }
             Entry::StorageRemoved { name, .. } => {
                 if !self.storage.contains_key(name) {
@@ -2323,6 +2361,26 @@ pub(crate) mod tests {
         assert_eq!(next(&mut s, &Entry::RegistryRemoved { host: "ghcr.io".into(), at: 3 }), Err(Rejected::RegistryUnknown));
         let old: ClusterState = serde_json::from_str(r#"{"cluster_id":null,"applied":0,"join_tokens":{},"nodes":{},"commands":{}}"#).unwrap();
         assert!(old.registries.is_empty());
+    }
+
+    #[test]
+    fn a_notification_channel_is_set_kept_by_outcome_and_removed() {
+        use crate::notify::{Channel, Config};
+        let mut s = with_nodes(&["n1"]);
+        let ch = |name: &str, events: &[&str]| Channel { name: name.into(), kind: "ntfy".into(), enabled: true, events: events.iter().map(|e| e.to_string()).collect(), config: Config::default(), secret: None, at: 1, last_sent_at: None, last_error: None };
+        next(&mut s, &Entry::ChannelSet { channel: ch("ops", &["node.down"]) }).unwrap();
+        next(&mut s, &Entry::ChannelOutcome { name: "ops".into(), error: Some("refused".into()), at: 5 }).unwrap();
+        assert_eq!(s.notifications["ops"].last_error.as_deref(), Some("refused"));
+        next(&mut s, &Entry::ChannelOutcome { name: "ops".into(), error: None, at: 6 }).unwrap();
+        assert_eq!((s.notifications["ops"].last_sent_at, s.notifications["ops"].last_error.as_deref()), (Some(6), None), "a delivery that went through clears the error");
+        next(&mut s, &Entry::ChannelSet { channel: ch("ops", &["node.back"]) }).unwrap();
+        assert_eq!((s.notifications["ops"].events.clone(), s.notifications["ops"].last_sent_at), (vec!["node.back".to_string()], Some(6)), "an edit keeps the channel's history");
+        assert_eq!(next(&mut s, &Entry::ChannelSet { channel: ch("Bad Name", &[]) }), Err(Rejected::BadChannel));
+        assert_eq!(next(&mut s, &Entry::ChannelSet { channel: ch("x", &["node.melted"]) }), Err(Rejected::BadChannel));
+        next(&mut s, &Entry::ChannelRemoved { name: "ops".into(), at: 7 }).unwrap();
+        assert_eq!(next(&mut s, &Entry::ChannelRemoved { name: "ops".into(), at: 8 }), Err(Rejected::ChannelUnknown));
+        next(&mut s, &Entry::ChannelOutcome { name: "ops".into(), error: None, at: 9 }).unwrap();
+        assert!(s.notifications.is_empty(), "an outcome for a channel gone is no harm");
     }
 
     #[test]

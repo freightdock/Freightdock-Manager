@@ -52,6 +52,12 @@ freightdock-manager registry ls             the private registries the cluster h
 freightdock-manager registry add <host> <user>   a registry's login (ghcr.io, registry.example:5000, docker.io); the
                                        password or token from FREIGHTDOCK_REGISTRY_PASSWORD or the first line of stdin
 freightdock-manager registry test|rm <host> try the login set (nothing is pulled), or take it away
+freightdock-manager notify ls               the notification channels, and the events the cluster tells
+freightdock-manager notify set <name> <webhook|email|ntfy|gotify> [k=v ...]   a channel, set whole: url= (webhook);
+                                       server= topic= priority= (ntfy, gotify); host= port= security=starttls|tls|none
+                                       username= from= to=a,b (email); events=a,b or all; enabled=false. Its secret
+                                       (signing key, token, SMTP password) from FREIGHTDOCK_NOTIFY_SECRET, kept if unset
+freightdock-manager notify test|rm <name>   send a test through it, or take it away
 freightdock-manager ca                      the cluster CA's certificate (PEM), for a client of the API over TLS
 freightdock-manager ui <image> [address]|off|status   run the Freightdock UI on the cluster, at https://<address>, an
                                        address of the pool (by default the one it has, else the first free one)
@@ -363,6 +369,62 @@ async fn main() -> Result<()> {
             println!("{:<32} USER", "REGISTRY");
             for r in v.as_array().into_iter().flatten() {
                 println!("{:<32} {}", r["host"].as_str().unwrap_or(""), r["username"].as_str().unwrap_or(""));
+            }
+            Ok(())
+        }
+        Some("notify") => {
+            use reqwest::Method;
+            match (args.get(1).map(String::as_str), args.get(2), args.get(3)) {
+                (Some("ls") | None, ..) => {}
+                (Some("set"), Some(name), Some(kind)) => {
+                    let mut settings = serde_json::Map::new();
+                    let mut body = serde_json::json!({ "kind": kind });
+                    for kv in &args[4..] {
+                        let (k, v) = kv.split_once('=').with_context(|| format!("{kv}: a setting is key=value"))?;
+                        match k {
+                            "events" if v == "all" => {
+                                let known = call(&config, Method::GET, "/v1/notifications", None).await?;
+                                body["events"] = serde_json::json!(known["events"].as_array().into_iter().flatten().filter_map(|e| e["event"].as_str()).collect::<Vec<_>>());
+                            }
+                            "events" => body["events"] = serde_json::json!(v.split(',').filter(|e| !e.is_empty()).collect::<Vec<_>>()),
+                            "enabled" => body["enabled"] = serde_json::json!(v != "false"),
+                            "to" => {
+                                settings.insert(k.into(), serde_json::json!(v.split(',').collect::<Vec<_>>()));
+                            }
+                            "priority" | "port" => {
+                                settings.insert(k.into(), serde_json::json!(v.parse::<u32>().with_context(|| format!("{k} is a number"))?));
+                            }
+                            _ => {
+                                settings.insert(k.into(), serde_json::json!(v));
+                            }
+                        }
+                    }
+                    body["config"] = serde_json::Value::Object(settings);
+                    if let Ok(secret) = std::env::var("FREIGHTDOCK_NOTIFY_SECRET") {
+                        body["secret"] = serde_json::json!(secret);
+                    }
+                    call(&config, Method::PUT, &format!("/v1/notifications/{name}"), Some(body)).await?;
+                }
+                (Some("test"), Some(name), _) => {
+                    let v = call(&config, Method::POST, &format!("/v1/notifications/{name}/test"), None).await?;
+                    println!("{}", v["message"].as_str().unwrap_or(""));
+                    return Ok(());
+                }
+                (Some("rm"), Some(name), _) => {
+                    call(&config, Method::DELETE, &format!("/v1/notifications/{name}"), None).await?;
+                }
+                _ => bail!("{USAGE}"),
+            }
+            let v = call(&config, Method::GET, "/v1/notifications", None).await?;
+            println!("{:<20} {:<8} {:<8} {:<40} LAST", "CHANNEL", "KIND", "ENABLED", "EVENTS");
+            for c in v["channels"].as_array().into_iter().flatten() {
+                let events: Vec<&str> = c["events"].as_array().into_iter().flatten().filter_map(|e| e.as_str()).collect();
+                let last = match (c["last_error"].as_str(), c["last_sent_at"].as_i64()) {
+                    (Some(e), _) => format!("failed: {e}"),
+                    (None, Some(_)) => "sent".into(),
+                    _ => "-".into(),
+                };
+                println!("{:<20} {:<8} {:<8} {:<40} {last}", c["name"].as_str().unwrap_or(""), c["kind"].as_str().unwrap_or(""), c["enabled"], events.join(","));
             }
             Ok(())
         }

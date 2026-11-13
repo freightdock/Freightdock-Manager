@@ -133,6 +133,23 @@ freightdock-manager registry add ghcr.io my-bot          # the token from stdin 
 freightdock-manager registry test ghcr.io
 ```
 
+### Notifications
+
+Channels (a webhook, e-mail over SMTP, an ntfy topic, a Gotify server) kept with the cluster's state, each telling the
+events it chose: a node down or back, fenced, fencing failed, a node waiting to be let back, workloads moved or
+stranded, a workload's container that died on its own (not a stop, not a job that ended with 0), a run that failed (a
+pull refused, Docker's error), a manager down or back, a scheduled backup that failed. The Raft leader watches and
+tells each change once; the same event about the same thing is told at most once in ten minutes (in memory, so a new
+leader may tell once more). A webhook's body is JSON (`event, title, message, node, target, at, freightdock`), signed
+with its key when it has one: `X-Freightdock-Signature: sha256=<hex HMAC-SHA256 of the body>`. Each channel's one
+secret (signing key, token, SMTP password) is set once and never shown; how its last delivery went is kept.
+
+```sh
+FREIGHTDOCK_NOTIFY_SECRET=... freightdock-manager notify set ops ntfy topic=cluster-alerts events=all
+freightdock-manager notify set mail email host=smtp.example from=cluster@example.org to=ops@example.org events=node.down,fence.failed
+freightdock-manager notify test ops
+```
+
 ### Backups
 
 A backup is the cluster's replicated state (stacks, nodes, storage, settings and secrets, the UI's database) and the
@@ -180,6 +197,9 @@ a client trusts that CA alone and checks that name. `GET /v1/health` and `GET /v
 | `POST /v1/nodes/{id}/docker` | `{action, target, params}`: a change to it: `container.start`, `.stop`, `.restart`, `.remove` (`force`), `image.remove`, `image.pull` (`image`), `images.prune`, `volume.remove`, `network.remove`. The worker refuses the cluster's own (labelled `io.freightdock.managed`): they belong to their stack |
 | `GET /v1/registries` | the private registries the cluster has a login for (`host`, `username`), never a password |
 | `PUT /v1/registries/{host}`, `DELETE /v1/registries/{host}` | `{username, password}`: a registry's login (the password kept when left out), or taken away. `host` as images name it: `ghcr.io`, `registry.example:5000`, `docker.io` |
+| `GET /v1/notifications` | the notification channels (never a secret, `has_secret` instead, with `last_sent_at` and `last_error`), the `events` the cluster tells and the `kinds` |
+| `PUT /v1/notifications/{name}`, `DELETE /v1/notifications/{name}` | `{kind, enabled, events, config, secret?}`: a channel set whole (the secret kept when left out, none when empty), or taken away |
+| `POST /v1/notifications/{name}/test` | sends a test through the channel as set; a failure is a 502 with why, without the address's query |
 | `POST /v1/registries/{host}/test` | `{username?, password?}`: signs in as Docker would (v2, Basic or a Bearer token), with the login given or the one set; nothing is pulled |
 | `POST /v1/backup` | `{"passphrase"}`: a sealed backup of the cluster now, as a download (kept nowhere) |
 | `GET /v1/backups`, `GET /v1/backups/{name}` | this manager's scheduled backups (`name`, `taken_at`, `size`, `manager`), newest first; one as a download |
