@@ -127,7 +127,7 @@ fn service(name: &str, v: &Value, warnings: &mut Vec<String>) -> Result<ServiceS
             "command" => spec.command = command(v)?,
             "environment" => spec.env = pairs(v, "environment", warnings, name)?,
             "labels" => spec.labels = pairs(v, "labels", warnings, name)?,
-            "ports" => spec.ports = v.as_sequence().ok_or("ports is a list")?.iter().map(port).collect::<Result<_, _>>()?,
+            "ports" => spec.ports = v.as_sequence().ok_or("ports is a list")?.iter().map(port).collect::<Result<Vec<_>, _>>()?.into_iter().flatten().collect(),
             "volumes" => spec.volumes = v.as_sequence().ok_or("volumes is a list")?.iter().map(volume).collect::<Result<_, _>>()?,
             "restart" => spec.restart = restart(v)?,
             "deploy" => deploy(v, &mut spec)?,
@@ -260,23 +260,42 @@ fn port_number(s: &str) -> Result<u32, String> {
     }
 }
 
-/// `"80"`, `"8080:80"`, `"127.0.0.1:8080:80"`, any with `/udp`; or the long form with target and published.
-fn port(v: &Value) -> Result<Port, String> {
+/// A port range is at most this many ports.
+const MAX_RANGE: u32 = 1000;
+
+/// `"8000"` or `"8000-8010"`: the first and last port.
+fn port_range(s: &str) -> Result<(u32, u32), String> {
+    match s.split_once('-') {
+        None => port_number(s).map(|p| (p, p)),
+        Some((a, b)) => {
+            let (a, b) = (port_number(a)?, port_number(b)?);
+            if b < a {
+                return Err(format!("{s}: a range goes up"));
+            }
+            if b - a >= MAX_RANGE {
+                return Err(format!("{s}: a range is at most {MAX_RANGE} ports"));
+            }
+            Ok((a, b))
+        }
+    }
+}
+
+/// `"80"`, `"8080:80"`, `"127.0.0.1:8080:80"`, any with `/udp`, any of them a range (`"8000-8010:9000-9010"`, a host
+/// range to one container port, a container range alone); or the long form with target and published. A range is
+/// each port of it.
+fn port(v: &Value) -> Result<Vec<Port>, String> {
     if let Some(m) = v.as_mapping() {
         let get = |k: &str| m.get(Value::String(k.into())).and_then(scalar);
         let target = get("target").ok_or("a port needs a target")?;
-        return Ok(Port {
+        return Ok(vec![Port {
             container_port: port_number(&target)?,
             host_port: get("published").filter(|p| !p.is_empty()).map(|p| port_number(&p)).transpose()?.unwrap_or(0),
             protocol: protocol(&get("protocol").unwrap_or_default())?,
             host_ip: get("host_ip").unwrap_or_default(),
-        });
+        }]);
     }
     let s = scalar(v).ok_or("a port is a string or a mapping")?;
     let (spec, proto) = s.split_once('/').unwrap_or((&s, ""));
-    if spec.contains('-') {
-        return Err(format!("{s}: port ranges are not supported yet"));
-    }
     let parts: Vec<&str> = spec.rsplitn(3, ':').collect();
     let (container, host, ip) = match parts.as_slice() {
         [c] => (*c, "", ""),
@@ -284,12 +303,17 @@ fn port(v: &Value) -> Result<Port, String> {
         [c, h, ip] => (*c, *h, *ip),
         _ => unreachable!("rsplitn(3) gives one to three"),
     };
-    Ok(Port {
-        container_port: port_number(container)?,
-        host_port: if host.is_empty() { 0 } else { port_number(host)? },
-        protocol: protocol(proto)?,
-        host_ip: ip.trim_start_matches('[').trim_end_matches(']').to_string(),
-    })
+    let (c0, c1) = port_range(container)?;
+    let hosts = if host.is_empty() { None } else { Some(port_range(host)?) };
+    let pairs: Vec<(u32, u32)> = match hosts {
+        None => (c0..=c1).map(|c| (0, c)).collect(),
+        Some((h0, h1)) if c0 == c1 => (h0..=h1).map(|h| (h, c0)).collect(),
+        Some((h0, h1)) if h1 - h0 == c1 - c0 => (h0..=h1).zip(c0..=c1).collect(),
+        Some(_) => return Err(format!("{s}: the host range has as many ports as the container's, or the container one")),
+    };
+    let protocol = protocol(proto)?;
+    let host_ip = ip.trim_start_matches('[').trim_end_matches(']').to_string();
+    Ok(pairs.into_iter().map(|(host_port, container_port)| Port { container_port, host_port, protocol: protocol.clone(), host_ip: host_ip.clone() }).collect())
 }
 
 fn protocol(p: &str) -> Result<String, String> {
@@ -567,6 +591,13 @@ volumes:
     }
 
     #[test]
+    fn a_port_range_is_each_port_of_it() {
+        let p = parse("services:\n  a:\n    image: x\n    ports: [\"8000-8002:9000-9002/udp\", \"7000-7001\", \"127.0.0.1:6000-6001:80\"]\n").unwrap();
+        let got: Vec<(u32, u32, &str)> = p.services["a"].ports.iter().map(|p| (p.host_port, p.container_port, p.protocol.as_str())).collect();
+        assert_eq!(got, vec![(8000, 9000, "udp"), (8001, 9001, "udp"), (8002, 9002, "udp"), (0, 7000, "tcp"), (0, 7001, "tcp"), (6000, 80, "tcp"), (6001, 80, "tcp")], "a host range to one container port: each to it");
+    }
+
+    #[test]
     fn durations_read_as_compose_writes_them() {
         assert_eq!(duration_ms("5s"), Some(5000));
         assert_eq!(duration_ms("1h2m3s"), Some(3_723_000));
@@ -618,7 +649,9 @@ volumes:
         refused("services:\n  a:\n    image: x\nnetworks:\n  n: {}\n", "networks");
         refused("services:\n  a:\n    image: x\n    volumes: [./here:/x]\n", "relative");
         refused("services:\n  a:\n    image: x\n    volumes: [/anon]\n", "anonymous");
-        refused("services:\n  a:\n    image: x\n    ports: [\"8000-8010:80\"]\n", "ranges");
+        refused("services:\n  a:\n    image: x\n    ports: [\"8000-8010:80-81\"]\n", "as many");
+        refused("services:\n  a:\n    image: x\n    ports: [\"90-80\"]\n", "range");
+        refused("services:\n  a:\n    image: x\n    ports: [\"1-2000\"]\n", "at most");
         refused("services:\n  a:\n    image: x\n    ports: [\"80:80\", \"80:81\"]\n", "twice");
         refused("services:\n  a:\n    image: x\n    deploy: {mode: global}\n", "deploy.mode");
         refused("services:\n  a: {}\n", "image");
