@@ -131,7 +131,10 @@ pub fn place(s: &ClusterState, stack: &str, services: &BTreeMap<String, ServiceS
 /// The op that brings one workload from what its node reported to what the state wants, if one is needed.
 fn op_for(w: &Workload, net: Option<crate::state::Attach>, storage: Vec<crate::state::StorageMount>, run: bool, actual: Option<&WorkloadState>) -> Option<Op> {
     let up = actual.is_some_and(|a| matches!(a.state.as_str(), "running" | "restarting" | "paused" | "removing"));
-    let current = actual.is_some_and(|a| a.generation == w.generation);
+    // A container not on its overlay address (made before its node knew the overlay) is made again; one whose worker
+    // reports no addresses says nothing either way.
+    let placed_right = actual.is_none_or(|a| a.addresses.is_empty() || net.as_ref().is_none_or(|n| a.addresses.contains(&n.address)));
+    let current = actual.is_some_and(|a| a.generation == w.generation) && placed_right;
     if run && !(up && current) {
         return Some(Op::RunContainer {
             workload_id: w.id.clone(),
@@ -558,6 +561,18 @@ mod tests {
             o => panic!("{o:?}"),
         }
         assert!(reconcile(&s, "a", &[], &BTreeSet::from(["web.x.1".to_string()])).is_empty(), "busy");
+    }
+
+    #[test]
+    fn a_running_container_off_its_overlay_address_is_made_again_and_one_that_says_nothing_is_left() {
+        let mut s = state_with(&["a"]);
+        placed(&mut s, &[("x", spec("nginx", 1))]);
+        let (at, g) = (s.address("web.x.1").unwrap(), s.workloads["web.x.1"].generation);
+        let w = |addresses: &[&str]| WorkloadState { addresses: addresses.iter().map(|a| a.to_string()).collect(), ..running("web.x.1", g) };
+        assert!(reconcile(&s, "a", &[w(&[&at])], &BTreeSet::new()).is_empty(), "on its address");
+        assert!(reconcile(&s, "a", &[w(&[])], &BTreeSet::new()).is_empty(), "a worker that does not report addresses: nothing to go on");
+        let ops = reconcile(&s, "a", &[w(&["172.17.0.3"])], &BTreeSet::new());
+        assert!(matches!(&ops[..], [(_, Op::RunContainer { net: Some(n), .. })] if n.address == at), "made before the overlay: made again on it: {ops:?}");
     }
 
     #[test]
