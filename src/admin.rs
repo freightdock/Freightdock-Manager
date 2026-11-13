@@ -565,9 +565,10 @@ fn workload_status(run: bool, placed: bool, actual: Option<&freightdock_proto::v
     }
 }
 
-/// Whether a workload wanted running exited and its restart policy leaves it so.
-fn left_exited(run: bool, actual: Option<&freightdock_proto::v1::WorkloadState>, generation: u64, restart: &crate::state::Restart) -> bool {
-    run && actual.is_some_and(|a| matches!(a.state.as_str(), "exited" | "dead") && a.generation == generation && !restart.again_after(a.exit_code))
+/// Whether a workload wanted running has exited at its spec: it is said so, whether its restart policy runs it again
+/// (soon, or not once its attempts are spent) or leaves it.
+fn left_exited(run: bool, actual: Option<&freightdock_proto::v1::WorkloadState>, generation: u64) -> bool {
+    run && actual.is_some_and(|a| matches!(a.state.as_str(), "exited" | "dead") && a.generation == generation)
 }
 
 /// A stack's options as the API shows them; its env file only in the detail (it may hold secrets, like the file).
@@ -602,7 +603,7 @@ fn stack_json(m: &Manager, s: &crate::state::ClusterState, st: &crate::state::St
                 "generation": w.generation,
                 "address": s.address(&w.id),
                 "desired": if run { "running" } else { "stopped" },
-                "status": if fenced { "fenced" } else if left_exited(run, actual.as_ref(), w.generation, &w.spec.restart) { "exited" } else { workload_status(run, w.node_id.is_some(), actual.as_ref(), w.generation, report.is_some(), lc) },
+                "status": if fenced { "fenced" } else if left_exited(run, actual.as_ref(), w.generation) { "exited" } else { workload_status(run, w.node_id.is_some(), actual.as_ref(), w.generation, report.is_some(), lc) },
                 "recovery": s.recovery_kind(w),
                 "actual": actual.map(|a| json!({ "state": a.state, "generation": a.generation, "exit_code": a.exit_code, "container_id": a.container_id, "image": a.image })),
                 "last_command": lc.map(|c| json!({ "id": c.id, "op": c.op, "status": c.status, "message": c.message, "at": c.updated_at })),
@@ -937,10 +938,9 @@ mod tests {
         assert_eq!(workload_status(false, true, Some(&up), 4, true, None), "pending", "still to stop");
         assert_eq!(workload_status(true, false, None, 4, true, None), "unplaced");
         let done = freightdock_proto::v1::WorkloadState { state: "exited".into(), generation: 4, ..Default::default() };
-        let never = crate::state::Restart { condition: crate::state::RestartWhen::Never, ..Default::default() };
-        assert!(left_exited(true, Some(&done), 4, &never), "exited, and its policy leaves it so");
-        assert!(!left_exited(true, Some(&done), 4, &crate::state::Restart::default()), "to be run again");
-        assert!(!left_exited(true, Some(&done), 5, &never), "an old spec: the new one runs");
+        assert!(left_exited(true, Some(&done), 4), "exited at its spec");
+        assert!(!left_exited(false, Some(&done), 4), "stopped as wanted");
+        assert!(!left_exited(true, Some(&done), 5), "an old spec: the new one runs");
     }
 
     #[test]

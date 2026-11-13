@@ -258,7 +258,7 @@ impl Paced {
     /// Whether the workload may be acted on now for `generation`: its backoff passed and its attempts not spent. A new
     /// generation (a deploy) is tried at once.
     fn ready(&self, id: &str, generation: u64, r: &crate::state::Restart) -> bool {
-        self.0.lock().expect("paced lock").get(id).is_none_or(|(at, n, g)| *g != generation || ((r.max_attempts == 0 || *n < r.max_attempts) && at.elapsed() >= backoff(n.saturating_sub(1), r.delay_ms)))
+        self.0.lock().expect("paced lock").get(id).is_none_or(|(at, n, g)| *g != generation || ((r.max_attempts == 0 || *n <= r.max_attempts) && at.elapsed() >= backoff(n.saturating_sub(1), r.delay_ms)))
     }
 
     fn acted(&self, id: &str, generation: u64) {
@@ -670,10 +670,13 @@ mod tests {
         assert!(p.ready("w", 1, &r));
         p.acted("w", 1);
         p.acted("w", 1);
-        assert!(!p.ready("w", 1, &r), "two attempts made");
+        assert!(p.ready("w", 1, &r), "run, then one attempt again: one more");
+        p.acted("w", 1);
+        assert!(!p.ready("w", 1, &r), "run, then two attempts again: spent");
         assert!(p.ready("w", 2, &r), "a new spec is tried whatever the last one did");
         p.settled("w", 0);
         assert!(p.ready("w", 1, &r), "settled: counted again from none");
+        p.acted("w", 1);
         p.acted("w", 1);
         p.settled("w", 60_000);
         assert!(!p.ready("w", 1, &crate::state::Restart { max_attempts: 1, ..r }), "not settled before its window passed");
