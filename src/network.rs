@@ -75,8 +75,8 @@ pub fn floating_moves(s: &ClusterState, healthy: impl Fn(&str) -> bool, at: Ms) 
     out
 }
 
-/// The cluster's published ports (G10, the routing mesh), the same for every node: each running stack's ports with
-/// a host port, to its placed workloads' addresses at the container's port.
+/// The cluster's published ports (G10, the routing mesh), the same for every node: each running stack's exposures on
+/// the pool, to its placed workloads' addresses at the container's port.
 ///
 /// A workload `down` says is not running takes no new connections: while its container restarts or is made again a
 /// share of them would wait on an address with nothing behind it. One not heard of yet still takes its share, so a
@@ -84,15 +84,8 @@ pub fn floating_moves(s: &ClusterState, healthy: impl Fn(&str) -> bool, at: Ms) 
 pub fn exposures(s: &ClusterState, down: impl Fn(&Workload) -> bool) -> Vec<v1::Exposure> {
     let mut out = vec![];
     for st in s.stacks.values().filter(|st| !st.stopped) {
-        // A Compose port opens nothing on the nodes' own addresses but for the managers' own stack, whose port
-        // they forward the UI to: a user's stack leaves the cluster only on the pool.
-        for (svc, spec) in st.services.iter().filter(|_| st.name == crate::ui::STACK) {
-            for p in spec.ports.iter().filter(|p| p.host_port != 0) {
-                let mut targets: Vec<String> = s.workloads.values().filter(|w| w.stack == st.name && &w.service == svc && w.node_id.is_some() && !down(w)).filter_map(|w| s.address(&w.id)).map(|a| format!("{a}:{}", p.container_port)).collect();
-                targets.sort();
-                out.push(v1::Exposure { stack: st.name.clone(), protocol: p.protocol.clone(), port: p.host_port, targets, address: String::new() });
-            }
-        }
+        // A Compose port opens nothing on the nodes' own addresses, the UI's neither: everything leaves the cluster
+        // on the pool, where its address stays the same wherever it runs.
         // On the pool (G10.5): each on its own address.
         for e in &st.exposures {
             let mut targets: Vec<String> = s.workloads.values().filter(|w| w.stack == st.name && w.service == e.service && w.node_id.is_some() && !down(w)).filter_map(|w| s.address(&w.id)).map(|a| format!("{a}:{}", e.container_port)).collect();
@@ -101,6 +94,28 @@ pub fn exposures(s: &ClusterState, down: impl Fn(&Workload) -> bool) -> Vec<v1::
         }
     }
     out
+}
+
+/// A manager's host, from `host:port` (`[v6]:port` too).
+fn host(addr: &str) -> &str {
+    let h = addr.rsplit_once(':').map_or(addr, |(h, _)| h);
+    h.trim_start_matches('[').trim_end_matches(']')
+}
+
+/// Where another node is reached at `port`: its address as its worker connected from (`peer`). A worker that connected
+/// over loopback is on the same host as the manager that heard it: this one (`via` none), else the manager `via` names.
+pub fn endpoint(peer: &str, via: Option<&str>, port: u32) -> Option<String> {
+    let h = host(peer);
+    if h.is_empty() {
+        return None;
+    }
+    let loopback = h == "localhost" || h.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback());
+    let h = match (loopback, via) {
+        (true, Some(m)) => host(m),
+        (true, None) => "127.0.0.1",
+        (false, _) => h,
+    };
+    Some(if h.contains(':') { format!("[{h}]:{port}") } else { format!("{h}:{port}") })
 }
 
 #[cfg(test)]
@@ -140,21 +155,32 @@ mod tests {
     }
 
     #[test]
-    fn a_compose_port_is_answered_on_the_nodes_only_for_the_managers_own_stack() {
+    fn a_compose_port_is_answered_on_no_node_s_own_address_the_ui_s_neither() {
         let mut s = with_nodes(&["n1", "n2"]);
         let mut web = spec("nginx", 2);
         web.ports = vec![crate::state::Port { host_port: 8088, container_port: 80, protocol: "tcp".into(), host_ip: String::new() }];
         next(&mut s, &deploy("a", &[("web", web)], &[("a.web.1", "n1"), ("a.web.2", "n2")])).unwrap();
-        assert!(state_for(&s, "n1", |_| None, |_| false).exposures.is_empty(), "a user's Compose port opens nothing on a node's own address");
         next(&mut s, &deploy(crate::ui::STACK, &[(crate::ui::SERVICE, crate::ui::spec("freightdock:x"))], &[("freightdock.ui.1", "n1")])).unwrap();
+        assert!(state_for(&s, "n1", |_| None, |_| false).exposures.is_empty(), "nothing on a node's own address");
+        next(&mut s, &Entry::FloatingAdded { address: "192.0.2.10".into(), at: 1 }).unwrap();
+        next(&mut s, &Entry::StackExposed { name: crate::ui::STACK.into(), exposures: vec![crate::ui::exposure("192.0.2.10")], at: 2 }).unwrap();
         for n in ["n1", "n2"] {
             let e = state_for(&s, n, |_| None, |_| false).exposures;
-            assert_eq!(e.len(), 1, "the UI's port, on every node, for the managers to forward to: {e:?}");
-            assert_eq!((e[0].stack.as_str(), e[0].port, e[0].address.as_str()), (crate::ui::STACK, crate::ui::HOST_PORT, ""));
+            assert_eq!(e.len(), 1, "{e:?}");
+            assert_eq!((e[0].port, e[0].address.as_str()), (443, "192.0.2.10"), "the UI on its pool address");
             assert_eq!(e[0].targets, vec![format!("{}:7443", s.address("freightdock.ui.1").unwrap())]);
         }
         next(&mut s, &Entry::StackStopped { name: crate::ui::STACK.into(), stopped: true, at: 9 }).unwrap();
         assert!(state_for(&s, "n1", |_| None, |_| false).exposures.is_empty(), "a stopped stack answers on nothing");
+    }
+
+    #[test]
+    fn a_node_is_reached_where_its_worker_connected_from_and_loopback_means_the_manager_that_heard_it() {
+        assert_eq!(endpoint("192.0.2.7:51000", None, WG_PORT).as_deref(), Some("192.0.2.7:51820"));
+        assert_eq!(endpoint("127.0.0.1:51000", None, WG_PORT).as_deref(), Some("127.0.0.1:51820"), "this manager's own node");
+        assert_eq!(endpoint("127.0.0.1:51000", Some("192.0.2.3:7450"), WG_PORT).as_deref(), Some("192.0.2.3:51820"));
+        assert_eq!(endpoint("[2001:db8::9]:5", None, WG_PORT).as_deref(), Some("[2001:db8::9]:51820"));
+        assert_eq!(endpoint("", None, WG_PORT), None);
     }
 
     #[test]

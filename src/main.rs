@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
 
-use freightdock_manager::{Config, Manager, housekeeping, serve_admin, serve_admin_tls, serve_ui, serve_workers};
+use freightdock_manager::{Config, Manager, housekeeping, serve_admin, serve_admin_tls, serve_workers};
 
 const USAGE: &str = "freightdock-manager [serve]                 run the manager
 freightdock-manager join-token [ttl_s]      make a join token for a worker
@@ -30,7 +30,8 @@ freightdock-manager storage add <name> nfs <host:/export> [options]   an NFS exp
 freightdock-manager storage add <name> path <dir>   a directory that is the same shared storage on every node
 freightdock-manager storage rm <name>           take it away (no stack may keep a volume on it)
 freightdock-manager ca                      the cluster CA's certificate (PEM), for a client of the API over TLS
-freightdock-manager ui <image>|off|status   run the Freightdock UI on the cluster, at port 7443 of every manager
+freightdock-manager ui <image> [address]|off|status   run the Freightdock UI on the cluster, at https://<address>, an
+                                       address of the pool (by default the one it has, else the first free one)
 
 A manager joins a cluster on its first start with FREIGHTDOCK_MANAGER_JOIN=<a manager's host:port> and
 FREIGHTDOCK_MANAGER_JOIN_TOKEN=<a manager-token>.
@@ -255,14 +256,14 @@ async fn main() -> Result<()> {
                 }
                 Some("status") => {}
                 Some(image) => {
-                    call(&config, Method::PUT, "/v1/ui", Some(serde_json::json!({ "image": image }))).await?;
+                    call(&config, Method::PUT, "/v1/ui", Some(serde_json::json!({ "image": image, "address": args.get(2) }))).await?;
                 }
             }
             let v = call(&config, Method::GET, "/v1/ui", None).await?;
             if v["enabled"] != true {
                 println!("the UI is off");
             } else {
-                println!("the UI runs {} at port {} of every manager", v["image"].as_str().unwrap_or(""), v["port"]);
+                println!("the UI runs {} at https://{}", v["image"].as_str().unwrap_or(""), v["address"].as_str().unwrap_or("?"));
                 print_workloads(&v["stack"]);
             }
             Ok(())
@@ -409,16 +410,6 @@ async fn serve(config: Config) -> Result<()> {
                 tracing::error!("admin API over TLS: {e:#}");
             }
         });
-    }
-    if let Some(a) = config.ui_bind {
-        // Not fatal: the cluster runs without it, and a UI started by hand on this host may hold the port.
-        match tokio::net::TcpListener::bind(a).await {
-            Ok(l) => {
-                tracing::info!("the UI on {a}, forwarded to the node it runs on (freightdock-manager ui)");
-                tokio::spawn(serve_ui(m.clone(), l, freightdock_manager::ui::HOST_PORT));
-            }
-            Err(e) => tracing::warn!("the UI's port {a}: {e}; not forwarded (FREIGHTDOCK_MANAGER_UI_BIND)"),
-        }
     }
     tokio::spawn(housekeeping(m.clone()));
     if let Some(j) = &config.join {

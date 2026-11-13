@@ -8,8 +8,9 @@
 #   install-node.sh worker <host> <manager-host>   a worker only, for the cluster of <manager-host>
 #
 # <host> is the address the others reach it at (it is advertised as <host>:7450). Set LABELS=key=value,... for the
-# worker's labels, and UI_IMAGE=<image> with `first` to run the Freightdock UI on the new cluster (at port 7443 of
-# every manager; `freightdock-manager ui <image>` does it later, or on another cluster). A cluster starts with `first` on one node; add managers in twos (1, 3, 5): with two, losing either
+# worker's labels, and UI_IMAGE=<image> UI_ADDRESS=<a free LAN address> with `first` to run the Freightdock UI on the
+# new cluster at https://<UI_ADDRESS>, an address of the pool that stays the UI's wherever it runs (nothing is reached
+# on a node's or a manager's own address; `freightdock-manager ui <image> [address]` does it later). A cluster starts with `first` on one node; add managers in twos (1, 3, 5): with two, losing either
 # stops every change.
 set -eu
 here=$(cd "$(dirname "$0")/../.." && pwd)
@@ -18,6 +19,7 @@ host=${2:?the host to install on}
 via=${3:-}
 labels=${LABELS:-}
 ui_image=${UI_IMAGE:-}
+ui_address=${UI_ADDRESS:-}
 ssh_() { ssh -o BatchMode=no "root@$1" "$2"; }
 fdm() { ssh_ "$via" "FREIGHTDOCK_MANAGER_DATA=/var/lib/freightdock-manager freightdock-manager $1"; }
 
@@ -26,6 +28,9 @@ case $role in
   join|worker) [ -n "$via" ] || { echo "$role needs the host of a manager already in the cluster" >&2; exit 1; } ;;
   *) echo "unknown role $role: first, join or worker" >&2; exit 1 ;;
 esac
+if [ -n "$ui_image" ] && [ -z "$ui_address" ]; then
+  echo "UI_IMAGE needs UI_ADDRESS: the free LAN address the UI is reached at" >&2; exit 1
+fi
 
 if [ "$role" != worker ]; then
   join_lines=""
@@ -65,9 +70,10 @@ ssh_ "$host" "install -m 755 freightdock-worker /usr/local/bin/ && mv freightdoc
 echo "worker on $host"
 
 if [ "$role" = first ] && [ -n "$ui_image" ]; then
-  # The UI needs a node to run on: wait for the worker to be heard, then ask for it.
+  # The UI needs a node to run on and an address of the pool: wait for the worker to be heard, then ask for it.
+  ssh_ "$host" "FREIGHTDOCK_MANAGER_DATA=/var/lib/freightdock-manager freightdock-manager floating add '$ui_address'" || true
   for _ in $(seq 30); do
-    ssh_ "$host" "FREIGHTDOCK_MANAGER_DATA=/var/lib/freightdock-manager freightdock-manager ui '$ui_image'" && break
+    ssh_ "$host" "FREIGHTDOCK_MANAGER_DATA=/var/lib/freightdock-manager freightdock-manager ui '$ui_image' '$ui_address'" && break
     sleep 2
   done
 fi

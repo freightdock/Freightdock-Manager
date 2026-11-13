@@ -213,10 +213,12 @@ same host. Each later goal adds its pages there (stacks with G4, and so on).
          `:managers`, `:names`); the manager that sends the run command fills them (`Manager::wire`), and only for
          the `freightdock` stack's workloads. The API token is derived from the cluster CA's key, which every manager
          holds, so each fills in the same one; the state keeps its hash only (API token `freightdock-ui`, admin).
-       - Every manager forwards 7443 (`FREIGHTDOCK_MANAGER_UI_BIND`) as plain TCP to the UI's node at 7453, looked up
-         at each connection from where its worker connected from; the UI's TLS goes end to end. The UI's certificate
-         names every manager's host (`FREIGHTDOCK_TLS_NAMES` filled in), and its CA travels in the UI's database
-         snapshot, so the certificate a browser trusted once is still trusted after a move.
+       - Reached on an address of the pool at 443 (2026-11-13, `ui <image> [address]`), as every stack is: never on a
+         node's or a manager's own address. At first every manager forwarded 7443 to the UI's node at 7453; that
+         made the UI answer on the managers' addresses, against the rule that a service keeps one address of its own,
+         so it went. The UI's certificate names the managers' hosts and its pool address (`FREIGHTDOCK_TLS_NAMES`
+         filled in), and its CA travels in the UI's database snapshot, so the certificate a browser trusted once is
+         still trusted after a move.
        - A worker whose pull fails runs the image already on its node, if there is one (images built or loaded on
          the node, never pushed).
 

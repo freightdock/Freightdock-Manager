@@ -63,10 +63,12 @@ Port 7450/tcp must be open between managers and from workers to managers; nothin
 
 ## The UI
 
-`freightdock-manager ui <image>` runs the Freightdock UI (the Freightdock-UI repository's image) as the managers' own
-stack, `freightdock`: one workload, placed on a node like any other and moved when that node fails, on a one-node
-cluster too once it is back. Every manager answers for it at port 7443, forwarding the connection as plain TCP to the
-node it runs on (port 7453 there), so the UI's own TLS goes end to end and any manager's address reaches it.
+`freightdock-manager ui <image> [address]` runs the Freightdock UI (the Freightdock-UI repository's image) as the
+managers' own stack, `freightdock`: one workload, placed on a node like any other and moved when that node fails, on a
+one-node cluster too once it is back. Like every stack it is reached on an address of the pool, at
+`https://<address>` (port 443 there, the container's 7443): the address given, else the one it has, else the first
+of the pool free at 443. That address stays the UI's wherever it runs; nothing answers for it on a node's or a
+manager's own address, and with no pool it is refused (`floating add` one first). Its certificate names that address.
 `ui status` shows where it runs, `ui off` removes it.
 
 It needs no volume and no token copied by hand: its database is kept by the managers, and its API token is derived
@@ -83,7 +85,6 @@ it, filled in by the manager that sends it, never written to the cluster's state
 | `FREIGHTDOCK_MANAGER_BIND` | `0.0.0.0:7450` | The worker API (gRPC, mutual TLS) |
 | `FREIGHTDOCK_MANAGER_API_BIND` | `127.0.0.1:7451` | The admin HTTP API, or `off` |
 | `FREIGHTDOCK_MANAGER_API_TLS_BIND` | `0.0.0.0:7452` | The same API over TLS for the network (API tokens), or `off` |
-| `FREIGHTDOCK_MANAGER_UI_BIND` | `0.0.0.0:7443` | Where this manager answers for the UI, forwarded to its node, or `off` |
 | `FREIGHTDOCK_MANAGER_ADVERTISE` | `<hostname>:7450` | Where the others reach this manager, comma separated (the first is its Raft address) |
 | `FREIGHTDOCK_MANAGER_JOIN` | | First start only: join the cluster of the manager at `host[:port]` |
 | `FREIGHTDOCK_MANAGER_JOIN_TOKEN` | | With it: a token from `manager-token` (`FDMT1-...`) |
@@ -135,8 +136,8 @@ pool address (`freightdock-manager stack expose app web:80=192.0.2.10:443`, or t
 only, the port its own there so other stacks may use it on other addresses. Anything else is internal, reached by
 name inside the stack. A Compose file's `ports:` open nothing, on a node's own address or anywhere: they are what the
 file asks for, which the UI offers to expose on the pool when it deploys the stack (two stacks may both ask for 80).
-Only the managers' own stack, the UI, has its port answered on every node, for the managers to forward 7443 to. The
-address and port follow the workloads wherever they run.
+The UI too: nothing a container serves is answered on a node's or a manager's own address. The address and port
+follow the workloads wherever they run.
 
 A stack may be given the nodes it runs on (`stack deploy app app.yml --on w3,w4`, by id, `name` label or hostname, or the UI): its
 workloads are placed only there, moved there when the list changes, and wait (unplaced) while none of them can take

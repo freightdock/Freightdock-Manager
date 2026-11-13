@@ -141,9 +141,9 @@ fn op_for(w: &Workload, net: Option<crate::state::Attach>, storage: Vec<crate::s
             env: w.spec.env.clone(),
             labels: w.spec.labels.iter().map(|(k, v)| (k.clone(), v.clone())).chain([("io.freightdock.stack".to_string(), w.stack.clone()), ("io.freightdock.service".to_string(), w.service.clone())]).collect(),
             generation: w.generation,
-            // A user's stack is reached on the pool or not at all, never on a node's own address: Docker publishes
-            // nothing for it. The managers' own stack keeps its port, which they forward the UI to.
-            ports: if w.stack == crate::ui::STACK { w.spec.ports.clone() } else { vec![] },
+            // A stack, the UI's too, is reached on the pool or not at all, never on a node's own address: Docker
+            // publishes nothing.
+            ports: vec![],
             volumes: w.spec.volumes.clone(),
             limits: w.spec.limits,
             net,
@@ -524,7 +524,7 @@ mod tests {
     }
 
     #[test]
-    fn a_compose_port_is_published_by_docker_only_for_the_managers_own_stack() {
+    fn docker_publishes_no_port_not_even_the_ui_s() {
         let mut s = state_with(&["a"]);
         placed(&mut s, &[("x", published("nginx", 1, 8080))]);
         let ports = |s: &ClusterState| match &reconcile(s, "a", &[], &BTreeSet::new())[..] {
@@ -536,7 +536,7 @@ mod tests {
         let mut s = state_with(&["a"]);
         let p = place(&s, crate::ui::STACK, &ui, &eligible(&["a"]), &[]).unwrap();
         deploy(&mut s, crate::ui::STACK, &ui, p);
-        assert_eq!(ports(&s).len(), 1, "the managers forward to the UI's port on its node");
+        assert!(ports(&s).is_empty(), "the UI is reached on the pool too");
     }
 
     #[test]
