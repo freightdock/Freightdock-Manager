@@ -424,7 +424,7 @@ async fn main() -> Result<()> {
                     (None, Some(_)) => "sent".into(),
                     _ => "-".into(),
                 };
-                println!("{:<20} {:<8} {:<8} {:<40} {last}", c["name"].as_str().unwrap_or(""), c["kind"].as_str().unwrap_or(""), c["enabled"], events.join(","));
+                println!("{:<20} {:<8} {:<8} {:<40} {last}", c["name"].as_str().unwrap_or(""), c["kind"].as_str().unwrap_or(""), if c["enabled"] == true { "yes" } else { "no" }, events.join(","));
             }
             Ok(())
         }

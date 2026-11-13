@@ -701,7 +701,7 @@ async fn proxmox_test(State(m): State<Arc<Manager>>, h: HeaderMap, body: Option<
     let nodes: Vec<crate::state::Node> = m.store.read(|s| s.nodes.values().filter(|n| crate::proxmox::provider_of(n) == "proxmox").cloned().collect());
     let mut guests = vec![];
     for n in nodes {
-        let name = n.all_labels().get("name").cloned().unwrap_or_else(|| n.hostname.clone());
+        let name = n.display_name();
         let r = match crate::proxmox::guest_of(&n) {
             Ok(g) => match px.status(&g).await {
                 Ok(st) => json!({ "guest": g.to_string(), "status": st }),

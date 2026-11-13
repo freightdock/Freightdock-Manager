@@ -507,7 +507,7 @@ impl crate::Manager {
     /// What the watch looks at now.
     pub fn notify_view(&self) -> View {
         let mut v = self.store.read(|s| {
-            let nodes = s.nodes.values().map(|n| NodeView { id: n.id.clone(), name: n.hostname.clone(), health: Health::Unreachable, fence: n.fencing.state, fence_message: n.fencing.message.clone() }).collect();
+            let nodes = s.nodes.values().map(|n| NodeView { id: n.id.clone(), name: n.display_name(), health: Health::Unreachable, fence: n.fencing.state, fence_message: n.fencing.message.clone() }).collect();
             let wanted = s
                 .workloads
                 .values()

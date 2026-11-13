@@ -347,6 +347,11 @@ impl Node {
         l.extend(self.labels.clone());
         l
     }
+
+    /// What a person calls it: its `name` label, else its hostname (two nodes made from one template share that).
+    pub fn display_name(&self) -> String {
+        self.all_labels().get("name").cloned().unwrap_or_else(|| self.hostname.clone())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -2361,6 +2366,16 @@ pub(crate) mod tests {
         assert_eq!(next(&mut s, &Entry::RegistryRemoved { host: "ghcr.io".into(), at: 3 }), Err(Rejected::RegistryUnknown));
         let old: ClusterState = serde_json::from_str(r#"{"cluster_id":null,"applied":0,"join_tokens":{},"nodes":{},"commands":{}}"#).unwrap();
         assert!(old.registries.is_empty());
+    }
+
+    #[test]
+    fn a_node_is_called_by_its_name_label_before_its_hostname() {
+        let mut s = with_nodes(&["n1"]);
+        let n = s.nodes.get_mut("n1").unwrap();
+        n.hostname = "docker".into();
+        assert_eq!(n.display_name(), "docker");
+        n.labels.insert("name".into(), "w3".into());
+        assert_eq!(n.display_name(), "w3");
     }
 
     #[test]
