@@ -154,6 +154,21 @@ pub fn sound_for<'a>(eligible: &[String], storages: impl IntoIterator<Item = &'a
     eligible.iter().filter(|n| !sick.iter().any(|(sn, st)| sn == *n && uses.contains(st.as_str()))).cloned().collect()
 }
 
+/// `place` on the nodes `sound_for` leaves, the stack keeping volumes on `storages`; when nothing fits, the error says
+/// which nodes were left out for their storage, else "none meets" would hide it.
+pub fn place_minding<'a>(s: &ClusterState, stack: &str, services: &BTreeMap<String, ServiceSpec>, eligible: &[String], only: &[String], storages: impl IntoIterator<Item = &'a str> + Clone, sick: &[(String, String)]) -> Result<BTreeMap<String, String>, String> {
+    let sound = sound_for(eligible, storages.clone(), sick);
+    place(s, stack, services, &sound, only).map_err(|e| {
+        let uses: BTreeSet<&str> = storages.into_iter().collect();
+        let out: Vec<String> = sick
+            .iter()
+            .filter(|(n, st)| eligible.contains(n) && uses.contains(st.as_str()))
+            .map(|(n, st)| format!("storage {st} fails on {}", s.nodes.get(n).map_or_else(|| n.clone(), |x| x.display_name())))
+            .collect();
+        if out.is_empty() { e } else { format!("{e}; left out: {}", out.join(", ")) }
+    })
+}
+
 /// The workloads to put on other nodes: of each stack, those on a node that no longer qualifies (its labels changed,
 /// or it is no longer one chosen for the stack) and that `place` has another for. One with nowhere to go stays.
 pub fn replacements(s: &ClusterState, eligible: &[String], sick: &[(String, String)]) -> Vec<(String, BTreeMap<String, String>)> {
@@ -474,6 +489,14 @@ mod tests {
 
     fn published(image: &str, replicas: u32, host_port: u32) -> ServiceSpec {
         ServiceSpec { ports: vec![Port { host_port, container_port: 80, protocol: "tcp".into(), host_ip: String::new() }], ..spec(image, replicas) }
+    }
+
+    #[test]
+    fn a_placement_refused_for_failing_storage_says_so() {
+        let s = state_with(&["a"]);
+        let e = place_minding(&s, "web", &svc(&[("x", spec("nginx", 1))]), &eligible(&["a"]), &[], ["nas"], &[("a".to_string(), "nas".to_string())]).unwrap_err();
+        assert!(e.ends_with("; left out: storage nas fails on a"), "{e}");
+        assert!(place_minding(&s, "web", &svc(&[("x", spec("nginx", 1))]), &eligible(&["a"]), &[], ["other"], &[("a".to_string(), "nas".to_string())]).is_ok());
     }
 
     #[test]

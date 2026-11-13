@@ -1100,8 +1100,7 @@ fn ready(m: &Manager, b: &DeployBody) -> R<(String, Ready)> {
                 ids
             }
         };
-        let eligible = crate::stacks::sound_for(&m.eligible(s), parsed.volumes.values().map(|v| v.storage.as_str()), &m.sick_storage(s));
-        let placements = crate::stacks::place(s, &name, &parsed.services, &eligible, &nodes);
+        let placements = crate::stacks::place_minding(s, &name, &parsed.services, &m.eligible(s), &nodes, parsed.volumes.values().map(|v| v.storage.as_str()), &m.sick_storage(s));
         Ok((name.clone(), Ready { parsed, options, nodes, placements }))
     })
 }

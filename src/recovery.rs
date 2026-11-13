@@ -47,8 +47,8 @@ pub fn plan(s: &ClusterState, from: Option<&str>, eligible: &[String], sick: &[(
     let stacks: BTreeSet<String> = go.iter().map(|id| s.workloads[id].stack.clone()).collect();
     for stack in stacks {
         let (services, only) = (s.stacks[&stack].services.clone(), s.stacks[&stack].nodes.clone());
-        let eligible = crate::stacks::sound_for(eligible, s.stacks[&stack].volumes.values().map(|v| v.storage.as_str()), sick);
-        match crate::stacks::place(&s, &stack, &services, &eligible, &only) {
+        let storages: Vec<String> = s.stacks[&stack].volumes.values().map(|v| v.storage.clone()).collect();
+        match crate::stacks::place_minding(&s, &stack, &services, eligible, &only, storages.iter().map(String::as_str), sick) {
             Ok(p) => {
                 for (id, node) in p.into_iter().filter(|(id, _)| go.contains(id)) {
                     s.workloads.get_mut(&id).expect("placed").node_id = Some(node.clone());
