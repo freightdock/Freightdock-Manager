@@ -13,13 +13,13 @@ Status marks: **[x]** done, **[~]** in progress, **[ ]** not started.
 | 1 | G1 Manager and worker talk | Everything else rides on this link | | **done** |
 | 2 | G2 The link is hardened and observable | Cheap now, expensive to retrofit; the test cluster must tell us what happens | G1 | **done** |
 | 3 | G3 Manager high availability (Raft) | Success criteria 1 and 2 of the first release; changes how every write works, so before anything writes much | G2 | **done** |
-| 4 | G4 Workloads and Compose stacks | The point of the product: deploy and manage stacks across workers | G3 | **done** (first slice; see G4) |
+| 4 | G4 Workloads and Compose stacks | The point of the product: deploy and manage stacks across workers | G3 | **done** (2026-11-13) |
 | 4a | G8 first slice: a Cluster page in Freightdock | Pulled forward (2026-11-11) so every goal from here is seen in the browser as it is built | G3 | **done** |
 | 5 | G5 Scheduling and labels | Workloads need placing once there is more than one worker | G4 | **done** |
 | 6 | G6 Fencing | A worker must be able to fence itself before anything is recovered elsewhere (plan rule 10, 11) | G4 | done |
 | 7 | G7 Failure detection and stateless recovery | Success criteria 4 and 5; safe only with G6 | G5, G6 | done |
 | 8 | G8 UI: Freightdock as the cluster's UI | Usable by people, not just the CLI; can start in parallel once G4's API settles | G4 | **done** |
-| 9 | G9 Internal networking (Network repo) | Stable workload IPs across workers; postponed by the plan's first release | G7 | **done** (2026-11-12, small items left) |
+| 9 | G9 Internal networking (Network repo) | Stable workload IPs across workers; postponed by the plan's first release | G7 | **done** (2026-11-13) |
 | 10 | G10 External networking | Exposing services without per-deploy setup | G9 | **done** (2026-11-13) |
 | 11 | G11 Shared storage | Moving stateful workloads safely; needs fencing and storage leases | G6, G7 | first slice done (2026-11-13) |
 | 12 | G12 Advanced | Ceph, replicated storage, gateway redundancy, anti-affinity, more fencing providers | G9 to G11 | not started |
@@ -146,9 +146,14 @@ Ranked inside the goal:
        volumes, deploy.replicas). Resources (limits) wait for G5.
 4. [x] Deploy, start, stop, restart, update, remove a stack through the admin API and CLI, and the UI's Cluster
        stacks page.
-5. [ ] Left for later: `${VAR}` interpolation and an env file; networks between a stack's services (G9); port
-       ranges; `container_name`; old finished commands are never pruned from the state (they should be, past an age);
-       the restart policy of a crashing workload is a fixed backoff, not configurable.
+5. [x] The rest (2026-11-13): `${VAR}` interpolation (all of Compose's forms) and an env file kept with the stack;
+       port ranges; `container_name` and names given at deploy; finished commands pruned past an hour or the newest
+       1000 (`CommandsPruned`, each workload's latest kept); the restart policy (`restart`, `deploy.restart_policy`:
+       condition, delay, max_attempts, window). Networks between a stack's services came with G9.
+6. [x] A deploy's options (owner, 2026-11-13: "a lable selector, and a way to choose the state of the stack ... a
+       custom name ... a description"): `StackOptions` kept with the stack, applied over the file
+       (`compose::apply_options`): description, env file, label selector, mode (stateless, pinned, shared storage),
+       container names; in the API, the CLI and the UI's deployer.
 
 ## G5: Scheduling and labels
 
@@ -158,9 +163,12 @@ Ranked inside the goal:
        service kept apart, host ports, reservations against the node's CPUs and memory; limits on the container.
        A deploy moves a workload whose node no longer meets its constraints.
 3. [x] HA flag (`x-freightdock: {ha: false}` pins) beside the replica count, kept in the state; G7 acts on it.
-4. [ ] Left for later: re-placing by itself when labels change (today at the next deploy); anti-affinity between
-       different services; a move starts the new copy without waiting for the old to stop (fine for stateless; G6/G7
-       and G11 make it safe for the rest).
+4. [x] Re-placing by itself when a node no longer qualifies (2026-11-13: the leader's `replace_round`,
+       `StackPlaced`; a service with nowhere to go stays and holds back nothing else); anti-affinity between services
+       (`x-freightdock.apart`, of the stack or another, both ways). Tried on the test cluster: a label swap moved two
+       workloads in seconds, the third kept off a node by `apart` stayed.
+5. [ ] Left: a move starts the new copy without waiting for the old to stop (fine for stateless; G6/G7 and G11 make
+       it safe for the rest).
 
 ## G6: Fencing
 
@@ -243,8 +251,9 @@ bridge per stack that talks only to itself (nftables), names through the hosts f
        workload reached at the same address, published ports and the internet still working, the UI on the overlay.
 6. [x] After a move, the stack's containers left on the old node forget the moved address's MAC (`nsenter ... ip
        neigh flush`) when its container is removed there, so they reach it at once; a node removes a stack's network
-       when no container of the stack is left on it. Left: a container made before the worker knew of the overlay is
-       not made again by itself (only possible on a cluster that ran a G9 manager with older workers).
+       when no container of the stack is left on it. A container not on its overlay address (made before the worker
+       knew the overlay) is made again (2026-11-13: workers report each container's addresses; tried on the cluster
+       by moving one onto Docker's bridge: made again on its address in 5 s).
 7. [x] The network in the UI: each workload's address on the stack and node pages, each node's overlay state.
 8. [x] Owner's wish (2026-11-12), once the network part is done: a live, interactive view of the network that shows
        the communication between workloads and nodes. Agreed 2026-11-12: built from the flows (who talks to whom).
@@ -288,8 +297,8 @@ address across nodes later.
        - [x] The UI (`freightdock:cluster-ui-12`): "Reached from outside" per stack (pool, every worker, internal
              only), the exposures editor, what each pool address exposes ("Cluster" 17).
 6. [x] Only the pool and inside (owner, 2026-11-13: "it should only be accessable via the ip pool adresses and
-       internally"): a Compose `ports:` opens nothing anywhere (no mesh rule, no Docker publishing) but for the
-       managers' own UI stack; it is what the file asks for, offered by the UI as an exposure on a free pool address.
+       internally"): a Compose `ports:` opens nothing anywhere (no mesh rule, no Docker publishing), the UI's
+       neither (since 2026-11-13 on its own pool address, G8.5); it is what the file asks for, offered by the UI as an exposure on a free pool address.
        The cross-stack port check went with it. Pool ranges (`192.0.2.10-20`, a prefix), an unused address not
        announced. A stack runs on the nodes chosen for it (`Stack.nodes`, `stack deploy --on`), moved there when the
        choice changes; a deploy takes its exposures too, checked whole; `POST /v1/stack-check` answers what a deploy

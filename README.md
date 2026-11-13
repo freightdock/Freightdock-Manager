@@ -149,13 +149,33 @@ room for its reservation (and, off the overlay, the managers' own stack's host p
 stack if any, preferring nodes that meet its preferences, then spread over a label,
 then away from its other replicas, then the least loaded. From then on the manager each worker is connected to
 compares what the worker reports in every heartbeat with what the state says and sends a command for the difference:
-run (a missing or exited container, or one made for an older spec), stop (a stopped stack), remove (a stack
-container the state no longer holds). One command per workload at a time; one that keeps failing is tried again
-after 5 s, doubling to 5 minutes. Supported Compose: `image`, `command`, `environment`, `labels`, `ports`, `volumes`
-(named or absolute), `deploy.replicas`, `deploy.placement` (`constraints` such as `node.labels.ssd==true` or
-`node.hostname!=old`; `preferences` with `spread: node.labels.<key>` or `prefer: <constraint>`),
-`deploy.resources` (`limits` on the container, `reservations` for placement) and `x-freightdock: {ha: false}` (pinned); `restart`, `depends_on` and `healthcheck` are set aside with a warning, and any
-other key is refused by name. The CLI: `freightdock-manager stack deploy|ls|ps|start|stop|restart|rm`.
+run (a missing container, one made for an older spec, one not on its overlay address, or one that exited and its
+restart policy runs again), stop (a stopped stack), remove (a stack container the state no longer holds). One
+command per workload at a time; a run again waits the policy's delay (5 s by default), doubling to 5 minutes, and
+stops after its `max_attempts` (none by default) until the workload has run for its `window` (10 s). The count is
+each manager's own, in memory: a manager that restarts counts again. Supported Compose: `image`, `command`,
+`environment`, `labels`, `ports` (ranges too: each port of the range), `volumes` (named or absolute),
+`container_name`, `restart` (`no`, `always`, `unless-stopped`, `on-failure[:N]`), `deploy.replicas`,
+`deploy.restart_policy` (`condition`, `delay`, `max_attempts`, `window`), `deploy.placement` (`constraints` such as
+`node.labels.ssd==true` or `node.hostname!=old`; `preferences` with `spread: node.labels.<key>` or
+`prefer: <constraint>`), `deploy.resources` (`limits` on the container, `reservations` for placement),
+`x-freightdock: {ha: false}` (pinned) and `x-freightdock: {apart: [db, other-stack/db]}` (never on a node with
+those services' workloads, both ways); `depends_on` and `healthcheck` are set aside with a warning, and any other
+key is refused by name. Variables (`$VAR`, `${VAR}`, `${VAR:-default}` and Compose's other forms) are filled from
+the stack's env file, as is an environment name given with no value. A workload whose node no longer meets its
+constraints (its labels changed) is put on one that does, by the leader, without a deploy; one with nowhere to go
+stays. The CLI: `freightdock-manager stack deploy|ls|ps|start|stop|restart|rm`.
+
+A deploy may give options beside the file, kept with the stack, each left out as it was: `--description <text>`,
+`--env-file <file>`, `--selector zone=a,disk!=hdd` (node labels every workload needs), `--mode
+stateless|pinned|shared:<storage>|file` (every workload moves with local volumes; waits for its node; moves with its
+named volumes on that storage, one writer; or as the file says) and `--name <service>=<name>` (a container name of
+its own, over `container_name`: one workload's in the cluster, `-<n>` added per replica when it has more, and a name
+for it inside the stack). The API takes the same as `description`, `env`, `selector`, `mode`
+(`{"kind": "shared", "storage": "nas"}`, null for the file) and `names`.
+
+Finished commands are dropped from the state an hour after they finished, or past the newest 1000, each workload's
+latest kept.
 
 ### Fencing
 
