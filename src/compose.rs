@@ -26,12 +26,23 @@ const TOP_IGNORED: &[&str] = &["version", "name"];
 const SERVICE_IGNORED: &[&str] = &["depends_on", "healthcheck"];
 
 pub fn parse(text: &str) -> Result<Parsed, String> {
+    parse_with(text, &BTreeMap::new())
+}
+
+/// Reads a Compose file with its variables (`${VAR}` and the rest of Compose's forms) filled from `env`, the stack's
+/// env file; an environment name with no value takes its value from there too.
+pub fn parse_with(text: &str, env: &BTreeMap<String, String>) -> Result<Parsed, String> {
     if text.len() > MAX_LEN {
         return Err(format!("the Compose file is over {} KiB", MAX_LEN / 1024));
     }
-    let doc: Value = yaml_serde::from_str(text).map_err(|e| format!("not YAML: {e}"))?;
+    let mut doc: Value = yaml_serde::from_str(text).map_err(|e| format!("not YAML: {e}"))?;
+    let mut unset = std::collections::BTreeSet::new();
+    interpolate_all(&mut doc, env, &mut unset)?;
     let top = doc.as_mapping().ok_or("a Compose file is a mapping with services in it")?;
     let mut warnings = vec![];
+    if !unset.is_empty() {
+        warnings.push(format!("{} not set (in the env file or with a default): empty", unset.into_iter().collect::<Vec<_>>().join(", ")));
+    }
     let mut services = BTreeMap::new();
     let mut volumes = BTreeMap::new();
     for (k, v) in top {
@@ -44,7 +55,7 @@ pub fn parse(text: &str) -> Result<Parsed, String> {
                     if !valid_service_name(&name) {
                         return Err(format!("service {name:?}: a name is 1 to 40 of a-z, 0-9, - and _, starting with a letter or digit"));
                     }
-                    let spec = service(&name, svc, &mut warnings).map_err(|e| format!("service {name}: {e}"))?;
+                    let spec = service(&name, svc, env, &mut warnings).map_err(|e| format!("service {name}: {e}"))?;
                     services.insert(name, spec);
                 }
             }
@@ -75,10 +86,150 @@ pub fn parse(text: &str) -> Result<Parsed, String> {
     if services.is_empty() {
         return Err("the Compose file has no services".into());
     }
-    if text.contains("${") {
-        warnings.push("variables (${...}) are not filled in; they are used as written".into());
-    }
     Ok(Parsed { services, warnings, volumes })
+}
+
+/// Fills every string of the document (not its keys) in place.
+fn interpolate_all(v: &mut Value, env: &BTreeMap<String, String>, unset: &mut std::collections::BTreeSet<String>) -> Result<(), String> {
+    match v {
+        Value::String(s) if s.contains('$') => *s = interpolate(s, env, unset)?,
+        Value::Sequence(l) => l.iter_mut().try_for_each(|x| interpolate_all(x, env, unset))?,
+        Value::Mapping(m) => m.iter_mut().try_for_each(|(_, x)| interpolate_all(x, env, unset))?,
+        Value::Tagged(t) => interpolate_all(&mut t.value, env, unset)?,
+        _ => {}
+    }
+    Ok(())
+}
+
+fn var_name(s: &str) -> usize {
+    s.char_indices().find(|&(i, c)| !(c == '_' || c.is_ascii_alphabetic() || (i > 0 && c.is_ascii_digit()))).map_or(s.len(), |(i, _)| i)
+}
+
+/// One string with Compose's variables filled: `$$` is `$`; `$VAR` and `${VAR}`; `${VAR:-x}` (x when unset or empty),
+/// `${VAR-x}` (when unset), `${VAR:?msg}` and `${VAR?msg}` (refused), `${VAR:+x}` and `${VAR+x}` (x when set). An
+/// unset variable with none of them is empty, and said in `unset`.
+pub fn interpolate(s: &str, env: &BTreeMap<String, String>, unset: &mut std::collections::BTreeSet<String>) -> Result<String, String> {
+    let mut out = String::new();
+    let mut rest = s;
+    while let Some(i) = rest.find('$') {
+        out.push_str(&rest[..i]);
+        rest = &rest[i + 1..];
+        if let Some(r) = rest.strip_prefix('$') {
+            out.push('$');
+            rest = r;
+        } else if let Some(r) = rest.strip_prefix('{') {
+            let end = r.find('}').ok_or_else(|| format!("{s:?}: a ${{ with no }}"))?;
+            let (inner, after) = (&r[..end], &r[end + 1..]);
+            let n = var_name(inner);
+            let (name, op) = inner.split_at(n);
+            if name.is_empty() {
+                return Err(format!("{s:?}: ${{{inner}}} is not a variable"));
+            }
+            let val = env.get(name);
+            let set_nonempty = val.is_some_and(|v| !v.is_empty());
+            let piece = |p: &str| op[p.len()..].to_string();
+            let filled = match op {
+                "" => match val {
+                    Some(v) => v.clone(),
+                    None => {
+                        unset.insert(name.to_string());
+                        String::new()
+                    }
+                },
+                o if o.starts_with(":-") => if set_nonempty { val.cloned().unwrap_or_default() } else { piece(":-") },
+                o if o.starts_with('-') => val.cloned().unwrap_or_else(|| piece("-")),
+                o if o.starts_with(":?") => if set_nonempty { val.cloned().unwrap_or_default() } else { return Err(format!("{name}: {}", piece(":?"))) },
+                o if o.starts_with('?') => val.cloned().ok_or_else(|| format!("{name}: {}", piece("?")))?,
+                o if o.starts_with(":+") => if set_nonempty { piece(":+") } else { String::new() },
+                o if o.starts_with('+') => if val.is_some() { piece("+") } else { String::new() },
+                o => return Err(format!("{s:?}: ${{{name}{o}}} is not a form Compose has")),
+            };
+            out.push_str(&filled);
+            rest = after;
+        } else {
+            let n = var_name(rest);
+            if n == 0 {
+                out.push('$');
+                continue;
+            }
+            let name = &rest[..n];
+            match env.get(name) {
+                Some(v) => out.push_str(v),
+                None => {
+                    unset.insert(name.to_string());
+                }
+            }
+            rest = &rest[n..];
+        }
+    }
+    out.push_str(rest);
+    Ok(out)
+}
+
+/// An env file: `KEY=value` lines (`export ` before is let be, quotes around the value taken off), blank lines and
+/// `#` comments.
+pub fn env_file(text: &str) -> Result<BTreeMap<String, String>, String> {
+    let mut out = BTreeMap::new();
+    for (i, line) in text.lines().enumerate() {
+        let l = line.trim();
+        if l.is_empty() || l.starts_with('#') {
+            continue;
+        }
+        let l = l.strip_prefix("export ").unwrap_or(l);
+        let (k, v) = l.split_once('=').ok_or_else(|| format!("env file, line {}: not KEY=value", i + 1))?;
+        let k = k.trim();
+        if k.is_empty() || var_name(k) != k.len() {
+            return Err(format!("env file, line {}: {k:?} is not a variable's name", i + 1));
+        }
+        let v = v.trim();
+        let v = [('"', '"'), ('\'', '\'')].iter().find_map(|(a, b)| v.strip_prefix(*a).and_then(|r| r.strip_suffix(*b))).unwrap_or(v);
+        out.insert(k.to_string(), v.to_string());
+    }
+    Ok(out)
+}
+
+/// The deploy's options over the file: names over `container_name`, the selector added to every service's
+/// constraints, and the mode (stateless: every service moves, named volumes local; pinned: every service waits for
+/// its node; shared: every service moves, every named volume not on storage already put on `storage`, one writer).
+pub fn apply_options(p: &mut Parsed, o: &crate::state::StackOptions) -> Result<(), String> {
+    use crate::state::Mode;
+    for (svc, name) in &o.names {
+        let spec = p.services.get_mut(svc).ok_or_else(|| format!("names: the stack has no service {svc}"))?;
+        if name.is_empty() {
+            continue;
+        }
+        if !crate::state::valid_container_name(name) {
+            return Err(format!("names: {name:?} is not 1 to 63 of a-z, 0-9 and -"));
+        }
+        spec.name = name.clone();
+    }
+    for spec in p.services.values_mut() {
+        for c in &o.selector {
+            if !spec.placement.constraints.contains(c) {
+                spec.placement.constraints.push(c.clone());
+            }
+        }
+        match &o.mode {
+            Some(Mode::Pinned) => spec.ha = false,
+            Some(_) => spec.ha = true,
+            None => {}
+        }
+    }
+    match &o.mode {
+        Some(Mode::Stateless) => p.volumes.clear(),
+        Some(Mode::Shared { storage }) => {
+            for spec in p.services.values() {
+                for v in &spec.volumes {
+                    let src = v.split(':').next().unwrap_or("");
+                    if v.contains(':') && !src.starts_with('/') && !p.volumes.contains_key(src) {
+                        p.volumes.insert(src.to_string(), StackVolume { storage: storage.clone(), access: Access::One });
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 /// A volume's `x-freightdock`: `storage` (a name) and `access` (`one`, the default, or `many`).
@@ -117,16 +268,19 @@ fn scalar(v: &Value) -> Option<String> {
     }
 }
 
-fn service(name: &str, v: &Value, warnings: &mut Vec<String>) -> Result<ServiceSpec, String> {
+fn service(name: &str, v: &Value, vars: &BTreeMap<String, String>, warnings: &mut Vec<String>) -> Result<ServiceSpec, String> {
     let m = v.as_mapping().ok_or("a service is a mapping")?;
-    let mut spec = ServiceSpec { image: String::new(), command: vec![], env: BTreeMap::new(), labels: BTreeMap::new(), ports: vec![], volumes: vec![], replicas: 1, limits: Resources::default(), placement: Default::default(), ha: true, restart: Default::default() };
+    let mut spec = ServiceSpec { image: String::new(), command: vec![], env: BTreeMap::new(), labels: BTreeMap::new(), ports: vec![], volumes: vec![], replicas: 1, limits: Resources::default(), placement: Default::default(), ha: true, restart: Default::default(), name: String::new() };
     for (k, v) in m {
         let k = key(k)?;
         match k.as_str() {
             "image" => spec.image = v.as_str().ok_or("image is a string")?.trim().to_string(),
             "command" => spec.command = command(v)?,
-            "environment" => spec.env = pairs(v, "environment", warnings, name)?,
-            "labels" => spec.labels = pairs(v, "labels", warnings, name)?,
+            "environment" => spec.env = pairs(v, "environment", vars, warnings, name)?,
+            "labels" => spec.labels = pairs(v, "labels", &BTreeMap::new(), warnings, name)?,
+            "container_name" => {
+                spec.name = v.as_str().filter(|n| crate::state::valid_container_name(n)).ok_or("container_name is 1 to 63 of a-z, 0-9 and -, starting with a letter or digit")?.to_string();
+            }
             "ports" => spec.ports = v.as_sequence().ok_or("ports is a list")?.iter().map(port).collect::<Result<Vec<_>, _>>()?.into_iter().flatten().collect(),
             "volumes" => spec.volumes = v.as_sequence().ok_or("volumes is a list")?.iter().map(volume).collect::<Result<_, _>>()?,
             "restart" => spec.restart = restart(v)?,
@@ -220,14 +374,19 @@ pub fn split_words(s: &str) -> Result<Vec<String>, String> {
 }
 
 /// environment or labels: a mapping, or a list of KEY=VALUE.
-fn pairs(v: &Value, what: &str, warnings: &mut Vec<String>, svc: &str) -> Result<BTreeMap<String, String>, String> {
+fn pairs(v: &Value, what: &str, vars: &BTreeMap<String, String>, warnings: &mut Vec<String>, svc: &str) -> Result<BTreeMap<String, String>, String> {
     let mut out = BTreeMap::new();
     match v {
         Value::Mapping(m) => {
             for (k, v) in m {
                 let k = key(k)?;
                 if v.is_null() && what == "environment" {
-                    warnings.push(format!("service {svc}: {k} has no value and is left out (values are not taken from anywhere else)"));
+                    match vars.get(&k) {
+                        Some(x) => {
+                            out.insert(k, x.clone());
+                        }
+                        None => warnings.push(format!("service {svc}: {k} has no value and is not in the env file: left out")),
+                    }
                     continue;
                 }
                 out.insert(k, scalar(v).ok_or_else(|| format!("{what}: a value is not a string"))?);
@@ -240,7 +399,12 @@ fn pairs(v: &Value, what: &str, warnings: &mut Vec<String>, svc: &str) -> Result
                     Some((k, v)) => {
                         out.insert(k.to_string(), v.to_string());
                     }
-                    None if what == "environment" => warnings.push(format!("service {svc}: {s} has no value and is left out (values are not taken from anywhere else)")),
+                    None if what == "environment" => match vars.get(s) {
+                        Some(x) => {
+                            out.insert(s.to_string(), x.clone());
+                        }
+                        None => warnings.push(format!("service {svc}: {s} has no value and is not in the env file: left out")),
+                    },
                     None => {
                         out.insert(s.to_string(), String::new());
                     }
@@ -588,6 +752,56 @@ volumes:
         assert_eq!(d, Restart { condition: RestartWhen::OnFailure, delay_ms: 90_000, max_attempts: 5, window_ms: 500 });
         assert!(r("    restart: sometimes\n").unwrap_err().contains("restart"));
         assert!(r("    deploy:\n      restart_policy: {delay: soon}\n").unwrap_err().contains("delay"));
+    }
+
+    #[test]
+    fn variables_are_filled_from_the_env_file_as_compose_fills_them() {
+        let env = env_file("# a comment\n\nTAG=1.2\nexport PORT=8080\nQUOTED=\"a b\"\nSINGLE='c d'\nEMPTY=\n").unwrap();
+        assert_eq!((env["QUOTED"].as_str(), env["SINGLE"].as_str(), env["PORT"].as_str(), env["EMPTY"].as_str()), ("a b", "c d", "8080", ""));
+        let y = "services:\n  a:\n    image: \"x:${TAG}\"\n    environment:\n      P: $PORT\n      D: ${MISSING:-dflt}\n      E: ${EMPTY:-was-empty}\n      F: ${EMPTY-kept}\n      G: $$HOME\n      H: ${TAG:+set}\n      TOKEN:\n    ports: [\"${PORT}:80\"]\n";
+        let p = parse_with(y, &env).unwrap();
+        let a = &p.services["a"];
+        assert_eq!(a.image, "x:1.2");
+        assert_eq!((a.env["P"].as_str(), a.env["D"].as_str(), a.env["E"].as_str(), a.env["F"].as_str(), a.env["G"].as_str(), a.env["H"].as_str()), ("8080", "dflt", "was-empty", "", "$HOME", "set"));
+        assert!(!a.env.contains_key("TOKEN") && p.warnings.iter().any(|w| w.contains("TOKEN")), "{:?}", p.warnings);
+        assert_eq!(a.ports[0].host_port, 8080);
+        let mut with_token = env.clone();
+        with_token.insert("TOKEN".into(), "t".into());
+        assert_eq!(parse_with(y, &with_token).unwrap().services["a"].env["TOKEN"], "t", "a name with no value takes the env file's");
+        let p = parse_with("services:\n  a:\n    image: x\n    environment: {A: \"${NOPE}\"}\n", &BTreeMap::new()).unwrap();
+        assert_eq!(p.services["a"].env["A"], "");
+        assert!(p.warnings.iter().any(|w| w.contains("NOPE")), "unset: empty, and said: {:?}", p.warnings);
+        assert!(parse_with("services:\n  a:\n    image: \"${NOPE:?give NOPE}\"\n", &BTreeMap::new()).unwrap_err().contains("give NOPE"));
+        assert!(env_file("not a line").unwrap_err().contains("line 1"));
+    }
+
+    #[test]
+    fn container_name_is_the_service_s_own_name() {
+        assert_eq!(parse("services:\n  a:\n    image: x\n    container_name: main-db\n").unwrap().services["a"].name, "main-db");
+        assert!(parse("services:\n  a:\n    image: x\n    container_name: Main_DB\n").unwrap_err().contains("container_name"));
+    }
+
+    #[test]
+    fn the_deploy_s_options_go_over_the_file() {
+        use crate::state::{Mode, StackOptions};
+        let y = "services:\n  db:\n    image: pg\n    volumes: [data:/d, /srv/x:/x]\n  web:\n    image: nginx\n    container_name: site\n    x-freightdock: {ha: false}\nvolumes:\n  data:\n";
+        let mut p = parse(y).unwrap();
+        let o = StackOptions { names: [("db".to_string(), "main-db".to_string()), ("web".to_string(), String::new())].into(), selector: vec![constraint("node.labels.zone==a").unwrap()], mode: Some(Mode::Shared { storage: "nas".into() }), ..Default::default() };
+        apply_options(&mut p, &o).unwrap();
+        assert_eq!((p.services["db"].name.as_str(), p.services["web"].name.as_str()), ("main-db", "site"), "an empty name keeps the file's");
+        assert!(p.services.values().all(|s| s.placement.constraints.contains(&constraint("node.labels.zone==a").unwrap()) && s.ha));
+        assert_eq!(p.volumes["data"], StackVolume { storage: "nas".into(), access: Access::One }, "named volumes on the storage, a bind mount left");
+        assert_eq!(p.volumes.len(), 1);
+        let mut p = parse(y).unwrap();
+        apply_options(&mut p, &StackOptions { mode: Some(Mode::Pinned), ..Default::default() }).unwrap();
+        assert!(p.services.values().all(|s| !s.ha));
+        let mut p = parse(y).unwrap();
+        apply_options(&mut p, &StackOptions { mode: Some(Mode::Stateless), ..Default::default() }).unwrap();
+        assert!(p.services.values().all(|s| s.ha) && p.volumes.is_empty());
+        for bad in [("nope", "x"), ("db", "Bad Name")] {
+            let mut p = parse(y).unwrap();
+            assert!(apply_options(&mut p, &StackOptions { names: [(bad.0.to_string(), bad.1.to_string())].into(), ..Default::default() }).is_err(), "{bad:?}");
+        }
     }
 
     #[test]

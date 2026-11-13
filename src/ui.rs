@@ -57,6 +57,7 @@ pub fn spec(image: &str) -> ServiceSpec {
         placement: Default::default(),
         ha: true,
         restart: Default::default(),
+        name: String::new(),
     }
 }
 

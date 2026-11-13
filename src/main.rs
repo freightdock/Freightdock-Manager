@@ -13,9 +13,15 @@ freightdock-manager command <node> <json>   send a command, e.g. '{\"op\":\"ping
 freightdock-manager remove <node>           forget a node; its certificate opens nothing more
 freightdock-manager authorize <node>        let a node that came back fenced run workloads again
 freightdock-manager label <node> [k=v ...]  set the node's labels (all of them; none clears them)
-freightdock-manager stack deploy <name> <compose file> [--on node,...]   make or change a stack (- reads the file
-                                            from stdin), on the nodes named (id, name label or hostname; --on any: any node). Its
-                                            Compose ports open nothing: expose them on the pool with stack expose
+freightdock-manager stack deploy <name> <compose file> [options]   make or change a stack (- reads the file
+                                            from stdin). Its Compose ports open nothing: expose them on the pool with stack expose.
+                                            Each option left out stays as it was:
+                                              --on node,...          the nodes it runs on (id, name label or hostname; any: any node)
+                                              --env-file <file>      fills its ${VAR}s and its environment names with no value
+                                              --description <text>   what it is for
+                                              --selector k=v,k!=v    node labels its workloads need (none: no selector)
+                                              --mode stateless|pinned|shared:<storage>|file   how it survives a node
+                                              --name service=name    a container name of its own (again for more)
 freightdock-manager stack ls                list the stacks
 freightdock-manager stack ps <name>         a stack's workloads: where they run and how they are
 freightdock-manager stack start|stop|restart|rm <name>
@@ -281,18 +287,43 @@ async fn stack(config: &Config, args: &[String]) -> Result<()> {
     match (args.first().map(String::as_str), name) {
         (Some("deploy"), Some(name)) => {
             let Some(file) = args.get(2) else { bail!("{USAGE}") };
-            let nodes = match (args.get(3).map(String::as_str), args.get(4)) {
-                (None, _) => None,
-                (Some("--on"), Some(list)) if list == "any" => Some(vec![]),
-                (Some("--on"), Some(list)) => Some(list.split(',').map(str::to_string).collect::<Vec<_>>()),
-                _ => bail!("{USAGE}"),
-            };
+            let mut body = serde_json::json!({ "name": name });
+            let mut names = serde_json::Map::new();
+            let mut rest = args[3..].iter();
+            while let Some(flag) = rest.next() {
+                let Some(v) = rest.next() else { bail!("{flag} needs a value\n{USAGE}") };
+                match flag.as_str() {
+                    "--on" if v == "any" => body["nodes"] = serde_json::json!([]),
+                    "--on" => body["nodes"] = serde_json::json!(v.split(',').collect::<Vec<_>>()),
+                    "--env-file" => body["env"] = serde_json::json!(std::fs::read_to_string(v).with_context(|| format!("reading {v}"))?),
+                    "--description" => body["description"] = serde_json::json!(v),
+                    "--selector" if v == "none" => body["selector"] = serde_json::json!([]),
+                    "--selector" => body["selector"] = serde_json::json!(v.split(',').collect::<Vec<_>>()),
+                    "--mode" => {
+                        body["mode"] = match v.split_once(':') {
+                            _ if v == "file" => serde_json::Value::Null,
+                            Some(("shared", storage)) => serde_json::json!({ "kind": "shared", "storage": storage }),
+                            None if v == "stateless" || v == "pinned" => serde_json::json!({ "kind": v }),
+                            _ => bail!("--mode is stateless, pinned, shared:<storage> or file"),
+                        }
+                    }
+                    "--name" => {
+                        let (svc, n) = v.split_once('=').context("--name is service=name")?;
+                        names.insert(svc.to_string(), serde_json::json!(n));
+                    }
+                    _ => bail!("{flag}?\n{USAGE}"),
+                }
+            }
+            if !names.is_empty() {
+                body["names"] = serde_json::Value::Object(names);
+            }
             let compose = if file == "-" {
                 std::io::read_to_string(std::io::stdin())?
             } else {
                 std::fs::read_to_string(file).with_context(|| format!("reading {file}"))?
             };
-            let v = call(config, Method::POST, "/v1/stacks", Some(serde_json::json!({ "name": name, "compose": compose, "nodes": nodes }))).await?;
+            body["compose"] = serde_json::json!(compose);
+            let v = call(config, Method::POST, "/v1/stacks", Some(body)).await?;
             for w in v["warnings"].as_array().into_iter().flatten() {
                 eprintln!("warning: {}", w.as_str().unwrap_or(""));
             }
@@ -344,6 +375,18 @@ async fn stack(config: &Config, args: &[String]) -> Result<()> {
 }
 
 fn print_workloads(s: &Value) {
+    let o = &s["options"];
+    if let Some(d) = o["description"].as_str().filter(|d| !d.is_empty()) {
+        println!("{d}");
+    }
+    let mode = o["mode"]["kind"].as_str().map_or("as its file says".to_string(), |k| match o["mode"]["storage"].as_str() {
+        Some(st) => format!("{k} on {st}"),
+        None => k.to_string(),
+    });
+    let selector = o["selector"].as_array().map(|l| l.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", ")).filter(|l| !l.is_empty());
+    if !o.is_null() {
+        println!("mode: {mode}{}", selector.map(|l| format!("; only on nodes with {l}")).unwrap_or_default());
+    }
     println!("{:<32} {:<16} {:<10} {:<10} LAST", "WORKLOAD", "NODE", "WANTED", "STATUS");
     for w in s["workloads"].as_array().into_iter().flatten() {
         let last = &w["last_command"];

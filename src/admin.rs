@@ -570,6 +570,15 @@ fn left_exited(run: bool, actual: Option<&freightdock_proto::v1::WorkloadState>,
     run && actual.is_some_and(|a| matches!(a.state.as_str(), "exited" | "dead") && a.generation == generation && !restart.again_after(a.exit_code))
 }
 
+/// A stack's options as the API shows them; its env file only in the detail (it may hold secrets, like the file).
+fn options_json(o: &crate::state::StackOptions, detail: bool) -> Value {
+    let mut v = json!({ "description": o.description, "selector": o.selector.iter().map(ToString::to_string).collect::<Vec<_>>(), "mode": o.mode, "names": o.names });
+    if detail {
+        v["env"] = json!(o.env);
+    }
+    v
+}
+
 fn stack_json(m: &Manager, s: &crate::state::ClusterState, st: &crate::state::Stack, with_compose: bool) -> Value {
     let last = last_commands(s);
     let mut reports: std::collections::HashMap<&str, Option<Vec<freightdock_proto::v1::WorkloadState>>> = std::collections::HashMap::new();
@@ -599,10 +608,11 @@ fn stack_json(m: &Manager, s: &crate::state::ClusterState, st: &crate::state::St
             })
         })
         .collect();
-    let services: serde_json::Map<String, Value> = st.services.iter().map(|(k, v)| (k.clone(), json!({ "image": v.image, "replicas": v.replicas, "ports": v.ports, "ha": v.ha, "limits": v.limits, "placement": { "constraints": v.placement.constraints.iter().map(ToString::to_string).collect::<Vec<_>>(), "prefer": v.placement.prefer.iter().map(ToString::to_string).collect::<Vec<_>>(), "spread": v.placement.spread, "reserve": v.placement.reserve } }))).collect();
-    let mut v = json!({ "name": st.name, "subnet": s.subnet(&st.name), "stopped": st.stopped, "created_at": st.created_at, "updated_at": st.updated_at, "services": services, "workloads": workloads, "exposures": st.exposures, "nodes": st.nodes, "volumes": st.volumes.iter().map(|(k, v)| (k.clone(), json!({ "storage": v.storage, "access": v.access, "holder": s.leases.get(&format!("{}/{k}", st.name)).map(|l| &l.node_id) }))).collect::<serde_json::Map<String, Value>>() });
+    let services: serde_json::Map<String, Value> = st.services.iter().map(|(k, v)| (k.clone(), json!({ "image": v.image, "replicas": v.replicas, "ports": v.ports, "ha": v.ha, "name": v.name, "restart": v.restart, "limits": v.limits, "placement": { "constraints": v.placement.constraints.iter().map(ToString::to_string).collect::<Vec<_>>(), "prefer": v.placement.prefer.iter().map(ToString::to_string).collect::<Vec<_>>(), "spread": v.placement.spread, "reserve": v.placement.reserve } }))).collect();
+    let mut v = json!({ "name": st.name, "subnet": s.subnet(&st.name), "stopped": st.stopped, "created_at": st.created_at, "updated_at": st.updated_at, "services": services, "workloads": workloads, "options": options_json(&st.options, false), "description": st.options.description, "exposures": st.exposures, "nodes": st.nodes, "volumes": st.volumes.iter().map(|(k, v)| (k.clone(), json!({ "storage": v.storage, "access": v.access, "holder": s.leases.get(&format!("{}/{k}", st.name)).map(|l| &l.node_id) }))).collect::<serde_json::Map<String, Value>>() });
     if with_compose {
         v["compose"] = json!(st.compose);
+        v["options"] = options_json(&st.options, true);
     }
     v
 }
@@ -651,7 +661,8 @@ async fn ui_deploy(State(m): State<Arc<Manager>>, h: HeaderMap, Json(b): Json<Ui
     let compose = format!("# The managers' own stack: the Freightdock UI (PUT /v1/ui).\nservices:\n  {}:\n    image: {image}\n", crate::ui::SERVICE);
     let placements = m.store.read(|s| crate::stacks::place(s, crate::ui::STACK, &services, &m.eligible(s), &[])).map_err(|e| ApiError(StatusCode::CONFLICT, e))?;
     let existed = m.store.read(|s| s.stacks.contains_key(crate::ui::STACK));
-    m.store.propose(Entry::StackDeployed { name: crate::ui::STACK.into(), compose, services, placements, at: now_ms(), nodes: vec![], exposures: Some(vec![crate::ui::exposure(&address)]), volumes: Default::default() }).await?;
+    let options = crate::state::StackOptions { description: "The Freightdock UI, run by the managers".into(), ..Default::default() };
+    m.store.propose(Entry::StackDeployed { name: crate::ui::STACK.into(), compose, services, placements, at: now_ms(), nodes: vec![], exposures: Some(vec![crate::ui::exposure(&address)]), volumes: Default::default(), options }).await?;
     m.events.push("ui", None, format!("the UI {} ({image}) at https://{address}", if existed { "updated" } else { "deployed" }));
     let (code, Json(v)) = (if existed { StatusCode::OK } else { StatusCode::CREATED }, ui_status(State(m), h).await?);
     Ok((code, Json(v)))
@@ -680,12 +691,78 @@ struct DeployBody {
     /// Its exposures on the pool, all of them. Left out: as they were.
     #[serde(default)]
     exposures: Option<Vec<crate::state::Exposure>>,
+    /// The options beside the Compose file (`StackOptions`); each left out is as it was.
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    env: Option<String>,
+    /// Node labels its workloads need: `key=value`, `key!=value`, or a constraint as Compose writes it.
+    #[serde(default)]
+    selector: Option<Vec<String>>,
+    /// `{"kind": "stateless" | "pinned" | "shared", "storage": ...}`, or null for as the file says.
+    #[serde(default, deserialize_with = "present")]
+    mode: Option<Value>,
+    /// Container names by service.
+    #[serde(default)]
+    names: Option<std::collections::BTreeMap<String, String>>,
+}
+
+/// A field that is there, null included: `Some(Value::Null)`, where a plain `Option` reads null as left out.
+fn present<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Value>, D::Error> {
+    use serde::Deserialize;
+    Value::deserialize(d).map(Some)
+}
+
+/// A selector's item: `zone=a` and `zone!=a` are node labels; anything else is a constraint (`node.hostname==w1`).
+fn selector_item(s: &str) -> Result<crate::state::Constraint, String> {
+    let s = s.trim();
+    if s.starts_with("node.") {
+        return crate::compose::constraint(s);
+    }
+    let (k, equal, v) = match s.split_once("!=") {
+        Some((k, v)) => (k, false, v),
+        None => s.split_once('=').map(|(k, v)| (k, true, v.trim_start_matches('='))).ok_or_else(|| format!("selector: {s:?} is not label=value or label!=value"))?,
+    };
+    let (k, v) = (k.trim(), v.trim());
+    if k.is_empty() || v.is_empty() {
+        return Err(format!("selector: {s:?} is not label=value or label!=value"));
+    }
+    Ok(crate::state::Constraint { field: format!("node.labels.{k}"), equal, value: v.to_string() })
+}
+
+/// The stack's options as this deploy makes them: each given one, else what the stack had.
+fn options_of(b: &DeployBody, had: Option<&crate::state::StackOptions>) -> Result<crate::state::StackOptions, String> {
+    let mut o = had.cloned().unwrap_or_default();
+    if let Some(d) = &b.description {
+        let d = d.trim();
+        if d.chars().count() > 500 {
+            return Err("a description is at most 500 characters".into());
+        }
+        o.description = d.to_string();
+    }
+    if let Some(e) = &b.env {
+        if e.len() > 64 * 1024 {
+            return Err("an env file is at most 64 KiB".into());
+        }
+        o.env = e.clone();
+    }
+    if let Some(list) = &b.selector {
+        o.selector = list.iter().filter(|s| !s.trim().is_empty()).map(|s| selector_item(s)).collect::<Result<_, _>>()?;
+    }
+    if let Some(m) = &b.mode {
+        o.mode = if m.is_null() { None } else { Some(serde_json::from_value(m.clone()).map_err(|_| "mode is {\"kind\": \"stateless\"}, {\"kind\": \"pinned\"}, {\"kind\": \"shared\", \"storage\": <name>} or null".to_string())?) };
+    }
+    if let Some(n) = &b.names {
+        o.names = n.iter().map(|(k, v)| (k.clone(), v.trim().to_string())).collect();
+    }
+    Ok(o)
 }
 
 /// A deploy made ready: the Compose file parsed, the nodes named resolved to ids, and the new workloads placed (or
 /// why they cannot be).
 struct Ready {
     parsed: crate::compose::Parsed,
+    options: crate::state::StackOptions,
     nodes: Vec<String>,
     placements: Result<std::collections::BTreeMap<String, String>, String>,
 }
@@ -698,7 +775,11 @@ fn ready(m: &Manager, b: &DeployBody) -> R<(String, Ready)> {
     if name == crate::ui::STACK {
         return Err(ApiError(StatusCode::BAD_REQUEST, format!("{} is the managers' own stack, for the UI: PUT /v1/ui", crate::ui::STACK)));
     }
-    let parsed = crate::compose::parse(&b.compose).map_err(|e| ApiError(StatusCode::BAD_REQUEST, e))?;
+    let bad = |e: String| ApiError(StatusCode::BAD_REQUEST, e);
+    let options = m.store.read(|s| options_of(b, s.stacks.get(&name).map(|st| &st.options))).map_err(bad)?;
+    let vars = crate::compose::env_file(&options.env).map_err(bad)?;
+    let mut parsed = crate::compose::parse_with(&b.compose, &vars).map_err(bad)?;
+    crate::compose::apply_options(&mut parsed, &options).map_err(bad)?;
     m.store.read(|s| {
         for (vol, v) in &parsed.volumes {
             if !s.storage.contains_key(&v.storage) {
@@ -729,7 +810,7 @@ fn ready(m: &Manager, b: &DeployBody) -> R<(String, Ready)> {
             }
         };
         let placements = crate::stacks::place(s, &name, &parsed.services, &m.eligible(s), &nodes);
-        Ok((name.clone(), Ready { parsed, nodes, placements }))
+        Ok((name.clone(), Ready { parsed, options, nodes, placements }))
     })
 }
 
@@ -739,13 +820,13 @@ fn ready(m: &Manager, b: &DeployBody) -> R<(String, Ready)> {
 async fn stack_check(State(m): State<Arc<Manager>>, h: HeaderMap, Json(b): Json<DeployBody>) -> R<Json<Value>> {
     authed(&m, &h)?;
     let (name, r) = ready(&m, &b)?;
-    let services: serde_json::Map<String, Value> = r.parsed.services.iter().map(|(k, v)| (k.clone(), json!({ "image": v.image, "replicas": v.replicas, "ports": v.ports }))).collect();
+    let services: serde_json::Map<String, Value> = r.parsed.services.iter().map(|(k, v)| (k.clone(), json!({ "image": v.image, "replicas": v.replicas, "ports": v.ports, "name": v.name, "ha": v.ha }))).collect();
     let (placements, unplaced) = match r.placements {
         Ok(p) => (json!(p), Value::Null),
         Err(why) => (Value::Null, json!(why)),
     };
     let exists = m.store.read(|s| s.stacks.contains_key(&name));
-    Ok(Json(json!({ "name": name, "exists": exists, "services": services, "warnings": r.parsed.warnings, "nodes": r.nodes, "placements": placements, "unplaced": unplaced, "volumes": r.parsed.volumes })))
+    Ok(Json(json!({ "name": name, "exists": exists, "services": services, "warnings": r.parsed.warnings, "nodes": r.nodes, "placements": placements, "unplaced": unplaced, "volumes": r.parsed.volumes, "options": options_json(&r.options, true) })))
 }
 
 /// Makes or changes a stack from a Compose file: its new workloads are placed on connected nodes with Docker (the
@@ -756,7 +837,7 @@ async fn deploy_stack(State(m): State<Arc<Manager>>, h: HeaderMap, Json(b): Json
     let (name, r) = ready(&m, &b)?;
     let placements = r.placements.map_err(|e| ApiError(StatusCode::CONFLICT, e))?;
     let existed = m.store.read(|s| s.stacks.contains_key(&name));
-    m.store.propose(Entry::StackDeployed { name: name.clone(), compose: b.compose, services: r.parsed.services, placements, at: now_ms(), nodes: r.nodes, exposures: b.exposures, volumes: r.parsed.volumes }).await?;
+    m.store.propose(Entry::StackDeployed { name: name.clone(), compose: b.compose, services: r.parsed.services, placements, at: now_ms(), nodes: r.nodes, exposures: b.exposures, volumes: r.parsed.volumes, options: r.options }).await?;
     m.events.push("stack_deployed", None, format!("stack {name} {}", if existed { "updated" } else { "deployed" }));
     let v = m.store.read(|s| s.stacks.get(&name).map(|st| stack_json(&m, s, st, false))).unwrap_or(Value::Null);
     Ok((if existed { StatusCode::OK } else { StatusCode::CREATED }, Json(json!({ "stack": v, "warnings": r.parsed.warnings }))))

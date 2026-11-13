@@ -65,6 +65,10 @@ pub enum Entry {
         /// Its named volumes kept on shared storage (G11); the others are local to each node.
         #[serde(default)]
         volumes: BTreeMap<String, StackVolume>,
+        /// What the deploy chose beside the Compose file, already applied to `services` and `volumes`; kept to show
+        /// and to edit.
+        #[serde(default)]
+        options: StackOptions,
     },
     /// The stack's workloads are to run (`stopped: false`) or not.
     StackStopped { name: String, stopped: bool, at: Ms },
@@ -134,6 +138,8 @@ pub enum Rejected {
     FenceStep,
     /// A stack or service name that is not 1 to 40 of a-z 0-9 and - (services may have _ too), starting alphanumeric.
     BadName,
+    /// A container name another workload in the cluster has (its own or `<stack>-<service>-<slot>`).
+    NameTaken,
     /// A recovery for a workload that is no longer where it said, or may not move by itself (pinned or local data).
     NotRecoverable,
     /// An API token with that id or secret exists.
@@ -187,7 +193,8 @@ impl std::fmt::Display for Rejected {
             Rejected::BadExposure => "an exposure is to a service of the stack, over tcp or udp, from a port that is not the host's own (22, 7450 to 7452, 51820) to a container port",
             Rejected::ExposureTaken => "that address already has that port (and protocol) exposed",
             Rejected::BadAddress => "a floating address must be a unicast IPv4 address of a LAN, outside the cluster's range 10.240.0.0/16",
-            Rejected::BadName => "a stack or service name must be 1 to 40 of a-z, 0-9 and - (services may have _), starting with a letter or digit",
+            Rejected::BadName => "a stack or service name must be 1 to 40 of a-z, 0-9 and - (services may have _), starting with a letter or digit; a container name 1 to 63 of a-z, 0-9 and -",
+            Rejected::NameTaken => "another workload in the cluster has that container name",
             Rejected::StorageExists => "the cluster has storage of that name already",
             Rejected::StorageUnknown => "no such storage (or volume on it)",
             Rejected::StorageInUse => "a stack keeps a volume on that storage: remove the stack first",
@@ -415,6 +422,10 @@ pub struct ServiceSpec {
     /// When a workload of it that exited is run again, and how soon (Compose `restart`, `deploy.restart_policy`).
     #[serde(default)]
     pub restart: Restart,
+    /// A name of its own for its containers (Compose `container_name`, or one chosen when deploying), each replica's
+    /// with `-<slot>` when it has more than one; empty: `<stack>-<service>-<slot>`. Also a name for it inside the stack.
+    #[serde(default)]
+    pub name: String,
 }
 
 fn yes() -> bool {
@@ -522,8 +533,10 @@ pub struct Placement {
 impl ServiceSpec {
     /// The spec as one workload's container runs it: the replica count, the placement and HA are the stack's
     /// business, so changing them makes no container again.
-    pub fn for_workload(&self) -> ServiceSpec {
-        ServiceSpec { replicas: 1, placement: Placement::default(), ha: true, ..self.clone() }
+    /// Its name is the replica's own: `<name>-<slot>` when it has more than one.
+    pub fn for_workload(&self, slot: u32) -> ServiceSpec {
+        let name = if self.name.is_empty() || self.replicas <= 1 { self.name.clone() } else { format!("{}-{slot}", self.name) };
+        ServiceSpec { replicas: 1, placement: Placement::default(), ha: true, name, ..self.clone() }
     }
 }
 
@@ -548,6 +561,34 @@ pub struct Stack {
     /// Its named volumes kept on shared storage (G11), by volume name.
     #[serde(default)]
     pub volumes: BTreeMap<String, StackVolume>,
+    #[serde(default)]
+    pub options: StackOptions,
+}
+
+/// What a deploy chooses beside the Compose file (`compose::apply_options`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StackOptions {
+    /// What the stack is for, in the words of whoever deployed it.
+    pub description: String,
+    /// The env file its `${VAR}`s and its environment names with no value are filled from (`KEY=value` lines).
+    pub env: String,
+    /// Node labels every workload of it needs (constraints, on top of its services' own).
+    pub selector: Vec<Constraint>,
+    /// How its workloads behave when their node fails, over what the file says; none: as it says.
+    pub mode: Option<Mode>,
+    /// Container names by service, over `container_name`; an empty one keeps the file's.
+    pub names: BTreeMap<String, String>,
+}
+
+/// A stack's way of surviving a node: moved freely, its named volumes local (stateless); waiting for its node
+/// (pinned); or moved with its named volumes on shared storage, one writer at a time (shared).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum Mode {
+    Stateless,
+    Pinned,
+    Shared { storage: String },
 }
 
 /// Where a stack keeps a named volume (G11): on the cluster's storage of that name, for one writer at a time or many.
@@ -671,6 +712,13 @@ pub struct Workload {
     pub host: Option<u8>,
 }
 
+impl Workload {
+    /// Its container's name on its node: its own (`ServiceSpec::name`), else `<stack>-<service>-<slot>`.
+    pub fn container_name(&self) -> String {
+        if self.spec.name.is_empty() { format!("{}-{}-{}", self.stack, self.service, self.slot) } else { self.spec.name.clone() }
+    }
+}
+
 /// Where a container joins the overlay (G9): its stack's network, its address there, and the stack's names as
 /// `name:address` (each service, and each replica as `<service>-<slot>`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -698,6 +746,9 @@ impl ClusterState {
             if let Some(a) = self.address(&o.id) {
                 hosts.push(format!("{}:{a}", o.service));
                 hosts.push(format!("{}-{}:{a}", o.service, o.slot));
+                if !o.spec.name.is_empty() {
+                    hosts.push(format!("{}:{a}", o.spec.name));
+                }
             }
         }
         Some(Attach { stack: w.stack.clone(), address, hosts })
@@ -717,6 +768,11 @@ pub fn workload_id(stack: &str, service: &str, slot: u32) -> String {
 
 fn good_name(n: &str, underscore: bool) -> bool {
     !n.is_empty() && n.len() <= 40 && n.as_bytes()[0].is_ascii_alphanumeric() && n.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || (underscore && b == b'_'))
+}
+
+/// A container's own name: 1 to 63 of a-z, 0-9 and -, starting with a letter or digit (a host name too).
+pub fn valid_container_name(n: &str) -> bool {
+    !n.is_empty() && n.len() <= 63 && n.as_bytes()[0].is_ascii_alphanumeric() && n.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
 pub fn valid_stack_name(n: &str) -> bool {
@@ -1228,9 +1284,20 @@ impl ClusterState {
                 }
                 self.commands.insert(command.id.clone(), command.clone());
             }
-            Entry::StackDeployed { name, compose, services, placements, at, nodes, exposures: given, volumes } => {
-                if !valid_stack_name(name) || !services.keys().all(|s| valid_service_name(s)) {
+            Entry::StackDeployed { name, compose, services, placements, at, nodes, exposures: given, volumes, options } => {
+                if !valid_stack_name(name) || !services.keys().all(|s| valid_service_name(s)) || services.values().any(|s| !s.name.is_empty() && !valid_container_name(&s.name)) {
                     return Err(Rejected::BadName);
+                }
+                // A container name is one workload's in the cluster: Docker's names are per node, and a workload may
+                // land on any node.
+                let taken: std::collections::BTreeSet<String> = self.workloads.values().filter(|w| w.stack != *name).map(Workload::container_name).collect();
+                let mut mine = std::collections::BTreeSet::new();
+                for (id, svc, slot) in Self::wanted(name, services) {
+                    let w = Workload { id, stack: name.clone(), service: svc.clone(), slot, node_id: None, spec: services[&svc].for_workload(slot), generation: 0, host: None };
+                    let n = w.container_name();
+                    if taken.contains(&n) || !mine.insert(n) {
+                        return Err(Rejected::NameTaken);
+                    }
                 }
                 for (vol, v) in volumes {
                     if !self.storage.contains_key(&v.storage) {
@@ -1260,7 +1327,7 @@ impl ClusterState {
                 let keep: std::collections::BTreeSet<&String> = wanted.iter().map(|w| &w.0).collect();
                 self.workloads.retain(|id, w| w.stack != *name || keep.contains(id));
                 for (id, svc, slot) in &wanted {
-                    let spec = services[svc].for_workload();
+                    let spec = services[svc].for_workload(*slot);
                     match self.workloads.get_mut(id) {
                         Some(w) => {
                             // A placement for a placed workload moves it: its old node's reconcile removes the
@@ -1299,7 +1366,7 @@ impl ClusterState {
                     Some(list) => list.clone(),
                     None => self.stacks.get(name).map(|s| s.exposures.iter().filter(|e| services.contains_key(&e.service)).cloned().collect()).unwrap_or_default(),
                 };
-                self.stacks.insert(name.clone(), Stack { name: name.clone(), compose: compose.clone(), services: services.clone(), stopped: false, created_at, updated_at: *at, net, exposures, nodes: nodes.clone(), volumes: volumes.clone() });
+                self.stacks.insert(name.clone(), Stack { name: name.clone(), compose: compose.clone(), services: services.clone(), stopped: false, created_at, updated_at: *at, net, exposures, nodes: nodes.clone(), volumes: volumes.clone(), options: options.clone() });
             }
             Entry::StackExposed { name, exposures, at } => {
                 let st = self.stacks.get(name).ok_or(Rejected::StackUnknown)?;
@@ -1574,6 +1641,24 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_container_name_is_one_workload_s_in_the_cluster() {
+        let mut s = with_nodes(&["n1"]);
+        let named = |n: &str, replicas| ServiceSpec { name: n.into(), ..spec("x", replicas) };
+        let a = deploy("a", &[("db", named("main-db", 1)), ("web", named("site", 2))], &[("a.db.1", "n1"), ("a.web.1", "n1"), ("a.web.2", "n1")]);
+        next(&mut s, &a).unwrap();
+        assert_eq!(s.workloads["a.db.1"].container_name(), "main-db");
+        assert_eq!((s.workloads["a.web.1"].container_name(), s.workloads["a.web.2"].container_name()), ("site-1".to_string(), "site-2".to_string()));
+        assert!(s.attach(&s.workloads["a.web.1"]).unwrap().hosts.contains(&format!("main-db:{}", s.address("a.db.1").unwrap())), "reached by it inside the stack");
+        next(&mut s, &a).unwrap();
+        assert_eq!(next(&mut s, &deploy("b", &[("db", named("main-db", 1))], &[("b.db.1", "n1")])), Err(Rejected::NameTaken));
+        assert_eq!(next(&mut s, &deploy("b", &[("db", named("site-2", 1))], &[("b.db.1", "n1")])), Err(Rejected::NameTaken));
+        next(&mut s, &deploy("c", &[("x", spec("x", 1))], &[("c.x.1", "n1")])).unwrap();
+        assert_eq!(s.workloads["c.x.1"].container_name(), "c-x-1");
+        assert_eq!(next(&mut s, &deploy("b", &[("db", named("c-x-1", 1))], &[("b.db.1", "n1")])), Err(Rejected::NameTaken), "another's own name");
+        assert_eq!(next(&mut s, &deploy("b", &[("db", named("Bad_", 1))], &[("b.db.1", "n1")])), Err(Rejected::BadName));
+    }
+
+    #[test]
     fn check_changes_nothing() {
         let mut s = cluster();
         with_token(&mut s, "t", 1000);
@@ -1666,7 +1751,7 @@ pub(crate) mod tests {
     }
 
     pub fn spec(image: &str, replicas: u32) -> ServiceSpec {
-        ServiceSpec { image: image.into(), command: vec![], env: Default::default(), labels: Default::default(), ports: vec![], volumes: vec![], replicas, limits: Default::default(), placement: Default::default(), ha: true, restart: Default::default() }
+        ServiceSpec { image: image.into(), command: vec![], env: Default::default(), labels: Default::default(), ports: vec![], volumes: vec![], replicas, limits: Default::default(), placement: Default::default(), ha: true, restart: Default::default(), name: String::new() }
     }
 
     pub fn with_nodes(nodes: &[&str]) -> ClusterState {
@@ -1690,6 +1775,7 @@ pub(crate) mod tests {
             nodes: vec![],
             exposures: None,
             volumes: Default::default(),
+            options: Default::default(),
         }
     }
 
@@ -1873,7 +1959,7 @@ pub(crate) mod tests {
         next(&mut s, &Entry::FloatingAdded { address: "192.0.2.10".into(), at: 1 }).unwrap();
         let x = |port: u16| Exposure { service: "web".into(), container_port: 80, protocol: "tcp".into(), address: "192.0.2.10".into(), port };
         let with = |nodes: &[&str], exposures: Option<Vec<Exposure>>| match deploy("a", &[("web", spec("nginx", 1))], &[("a.web.1", "n2")]) {
-            Entry::StackDeployed { name, compose, services, placements, at, .. } => Entry::StackDeployed { name, compose, services, placements, at, nodes: nodes.iter().map(|n| n.to_string()).collect(), exposures, volumes: Default::default() },
+            Entry::StackDeployed { name, compose, services, placements, at, .. } => Entry::StackDeployed { name, compose, services, placements, at, nodes: nodes.iter().map(|n| n.to_string()).collect(), exposures, volumes: Default::default(), options: Default::default() },
             _ => unreachable!(),
         };
         next(&mut s, &with(&["n2"], Some(vec![x(80)]))).unwrap();
@@ -1885,7 +1971,7 @@ pub(crate) mod tests {
         assert_eq!(s.stacks["a"].exposures, vec![x(80)], "and a refusal changes nothing");
         next(&mut s, &deploy("b", &[("web", spec("nginx", 1))], &[("b.web.1", "n1")])).unwrap();
         let b = match with(&[], Some(vec![Exposure { ..x(80) }])) {
-            Entry::StackDeployed { services, at, nodes, exposures, .. } => Entry::StackDeployed { name: "b".into(), compose: String::new(), services, placements: Default::default(), at, nodes, exposures, volumes: Default::default() },
+            Entry::StackDeployed { services, at, nodes, exposures, .. } => Entry::StackDeployed { name: "b".into(), compose: String::new(), services, placements: Default::default(), at, nodes, exposures, volumes: Default::default(), options: Default::default() },
             _ => unreachable!(),
         };
         assert_eq!(next(&mut s, &b), Err(Rejected::ExposureTaken), "80 on .10 is a's");
@@ -2001,7 +2087,7 @@ pub(crate) mod tests {
         match deploy(name, services, placements) {
             Entry::StackDeployed { name, compose, services, placements, at, nodes, exposures, .. } => {
                 let volumes = volumes.iter().map(|(v, st, a)| (v.to_string(), StackVolume { storage: st.to_string(), access: *a })).collect();
-                Entry::StackDeployed { name, compose, services, placements, at, nodes, exposures, volumes }
+                Entry::StackDeployed { name, compose, services, placements, at, nodes, exposures, volumes, options: Default::default() }
             }
             _ => unreachable!(),
         }
