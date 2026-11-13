@@ -55,6 +55,7 @@ pub fn op_to_proto(op: &Op) -> v1::command::Op {
                 .into_iter()
                 .map(|m| v1::StorageVolume { volume: m.volume, storage: m.storage, driver: match m.driver { crate::state::StorageDriver::Nfs => "nfs", crate::state::StorageDriver::Path => "path" }.into(), source: m.source, options: m.options, dir: m.dir })
                 .collect(),
+            auth: None,
         }),
         Op::StopContainer { workload_id, timeout_s } => P::StopContainer(v1::StopContainer { workload_id, timeout_s }),
         Op::RemoveContainer { workload_id } => P::RemoveContainer(v1::RemoveContainer { workload_id }),

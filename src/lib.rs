@@ -12,6 +12,7 @@ pub mod peer;
 pub mod proxmox;
 pub mod raft;
 pub mod recovery;
+pub mod registry;
 pub mod sessions;
 pub mod settings;
 pub mod stacks;
@@ -421,7 +422,14 @@ impl Manager {
             let addresses = self.store.read(|s| s.stacks.get(ui::STACK).map(|st| st.exposures.iter().map(|e| e.address.clone()).collect()).unwrap_or_default());
             ui::fill(&mut c.op, &ui::Fill { token: ui::token(&self.ca.key_pem()), ca_pem: self.ca.cert_pem.clone(), managers: self.managers(), addresses });
         }
-        grpc::command_to_proto(&c)
+        let mut m = grpc::command_to_proto(&c);
+        // A private registry's login for the image, filled in here only: never kept with the command.
+        if let Some(freightdock_proto::v1::manager_message::Body::Command(cmd)) = &mut m.body
+            && let Some(freightdock_proto::v1::command::Op::RunContainer(r)) = &mut cmd.op
+        {
+            r.auth = self.store.read(|s| registry::auth_for(&s.registries, &r.image));
+        }
+        m
     }
 
     /// Sends a command to its node if the node is connected to this manager. If not, it waits as pending and is sent

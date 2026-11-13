@@ -112,6 +112,9 @@ pub enum Entry {
     StorageAdded { storage: Storage },
     /// Refused while a stack keeps a volume on it.
     StorageRemoved { name: String, at: Ms },
+    /// A private registry's login, set or replaced whole (`registry.rs`).
+    RegistrySet { registry: crate::registry::Registry },
+    RegistryRemoved { host: String, at: Ms },
     /// The node a workload moved away from has no copy of it running any more (G5.5).
     WorkloadLeft { workload_id: String, node_id: String, at: Ms },
     /// A workload with a limit on its attempts was run (again) for its spec `generation`.
@@ -175,6 +178,9 @@ pub enum Rejected {
     StorageInUse,
     /// A storage name, source or options that cannot be.
     BadStorage,
+    /// A registry that is not a host and maybe a port, or a login without a user.
+    BadRegistry,
+    RegistryUnknown,
     /// A volume for one writer used by more than one workload.
     VolumeShared,
     /// A volume another node may still be writing to.
@@ -219,6 +225,8 @@ impl std::fmt::Display for Rejected {
             Rejected::VolumeShared => "a volume for one writer (access: one) is used by one workload only: one service with one replica, or access: many",
             Rejected::LeaseHeld => "another node holds that volume and may still be writing to it",
             Rejected::NotEmpty => "a backup is restored into a new cluster only, not over one that has a state",
+            Rejected::BadRegistry => "a registry is a host and maybe a port (ghcr.io, registry.example:5000, docker.io), and its login has a user and a password",
+            Rejected::RegistryUnknown => "the cluster has no login for that registry",
             Rejected::BadSettings => "a setting is out of its range or order, or the Proxmox provider's settings do not hold",
         })
     }
@@ -908,6 +916,9 @@ pub struct ClusterState {
     /// The cluster's settings; what is not set here each manager takes from its own environment.
     #[serde(default)]
     pub settings: crate::settings::Settings,
+    /// Private registries' logins, by registry.
+    #[serde(default)]
+    pub registries: BTreeMap<String, crate::registry::Registry>,
 }
 
 /// A floating address: on its holder's LAN, answering the published ports as the nodes' own addresses do.
@@ -1502,6 +1513,15 @@ impl ClusterState {
                     return Err(Rejected::BadSettings);
                 }
                 self.settings = settings.clone();
+            }
+            Entry::RegistrySet { registry } => {
+                if !crate::registry::valid_host(&registry.host) || registry.username.trim().is_empty() || registry.password.0.is_empty() || registry.username.len() > 255 {
+                    return Err(Rejected::BadRegistry);
+                }
+                self.registries.insert(registry.host.clone(), registry.clone());
+            }
+            Entry::RegistryRemoved { host, .. } => {
+                self.registries.remove(host).ok_or(Rejected::RegistryUnknown)?;
             }
             Entry::StorageRemoved { name, .. } => {
                 if !self.storage.contains_key(name) {
@@ -2286,6 +2306,23 @@ pub(crate) mod tests {
         next(&mut s, &Entry::StackDeployed { name: "st".into(), compose: String::new(), services, placements: [("st.web.1".to_string(), "a".to_string())].into(), at: 1, nodes: vec![], exposures: None, volumes: Default::default(), options: Default::default() }).unwrap();
         next(&mut s, &Entry::StackPlaced { name: "st".into(), placements: [("st.web.1".to_string(), "b".to_string())].into(), at: 2 }).unwrap();
         assert_eq!(s.workloads["st.web.1"].leaving, None, "start-first: the new copy may start beside the old");
+    }
+
+    #[test]
+    fn a_registry_s_login_is_set_replaced_and_removed() {
+        use crate::registry::Registry;
+        use crate::settings::Secret;
+        let mut s = with_nodes(&["n1"]);
+        let r = |host: &str, user: &str| Registry { host: host.into(), username: user.into(), password: Secret("p".into()), at: 1 };
+        next(&mut s, &Entry::RegistrySet { registry: r("ghcr.io", "a") }).unwrap();
+        next(&mut s, &Entry::RegistrySet { registry: r("ghcr.io", "b") }).unwrap();
+        assert_eq!(s.registries["ghcr.io"].username, "b", "one login per registry");
+        assert_eq!(next(&mut s, &Entry::RegistrySet { registry: r("https://x", "a") }), Err(Rejected::BadRegistry));
+        assert_eq!(next(&mut s, &Entry::RegistrySet { registry: r("x.io", "") }), Err(Rejected::BadRegistry), "a login has a user");
+        next(&mut s, &Entry::RegistryRemoved { host: "ghcr.io".into(), at: 2 }).unwrap();
+        assert_eq!(next(&mut s, &Entry::RegistryRemoved { host: "ghcr.io".into(), at: 3 }), Err(Rejected::RegistryUnknown));
+        let old: ClusterState = serde_json::from_str(r#"{"cluster_id":null,"applied":0,"join_tokens":{},"nodes":{},"commands":{}}"#).unwrap();
+        assert!(old.registries.is_empty());
     }
 
     #[test]

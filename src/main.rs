@@ -48,6 +48,10 @@ freightdock-manager docker <node> <action> [target] [k=v ...]   a node's Docker 
                                        containers, container <c>, logs <c> [tail=N], images, volumes, networks;
                                        container.start|stop|restart|remove <c>, image.remove <i>, image.pull image=<i>,
                                        images.prune, volume.remove <v>, network.remove <n> (never the cluster's own)
+freightdock-manager registry ls             the private registries the cluster has a login for
+freightdock-manager registry add <host> <user>   a registry's login (ghcr.io, registry.example:5000, docker.io); the
+                                       password or token from FREIGHTDOCK_REGISTRY_PASSWORD or the first line of stdin
+freightdock-manager registry test|rm <host> try the login set (nothing is pulled), or take it away
 freightdock-manager ca                      the cluster CA's certificate (PEM), for a client of the API over TLS
 freightdock-manager ui <image> [address]|off|status   run the Freightdock UI on the cluster, at https://<address>, an
                                        address of the pool (by default the one it has, else the first free one)
@@ -326,6 +330,39 @@ async fn main() -> Result<()> {
                 }
             } else {
                 println!("{}", serde_json::to_string_pretty(&v)?);
+            }
+            Ok(())
+        }
+        Some("registry") => {
+            use reqwest::Method;
+            match (args.get(1).map(String::as_str), args.get(2), args.get(3)) {
+                (Some("ls") | None, ..) => {}
+                (Some("add"), Some(host), Some(user)) => {
+                    let password = match std::env::var("FREIGHTDOCK_REGISTRY_PASSWORD") {
+                        Ok(p) => p,
+                        Err(_) => {
+                            eprintln!("the password or token for {user} at {host} (one line on stdin):");
+                            let mut line = String::new();
+                            std::io::stdin().read_line(&mut line)?;
+                            line.trim_end_matches(['\r', '\n']).to_string()
+                        }
+                    };
+                    call(&config, Method::PUT, &format!("/v1/registries/{host}"), Some(serde_json::json!({ "username": user, "password": password }))).await?;
+                }
+                (Some("test"), Some(host), _) => {
+                    let v = call(&config, Method::POST, &format!("/v1/registries/{host}/test"), Some(serde_json::json!({}))).await?;
+                    println!("{}", v["message"].as_str().unwrap_or(""));
+                    return Ok(());
+                }
+                (Some("rm"), Some(host), _) => {
+                    call(&config, Method::DELETE, &format!("/v1/registries/{host}"), None).await?;
+                }
+                _ => bail!("{USAGE}"),
+            }
+            let v = call(&config, Method::GET, "/v1/registries", None).await?;
+            println!("{:<32} USER", "REGISTRY");
+            for r in v.as_array().into_iter().flatten() {
+                println!("{:<32} {}", r["host"].as_str().unwrap_or(""), r["username"].as_str().unwrap_or(""));
             }
             Ok(())
         }

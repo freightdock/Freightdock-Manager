@@ -29,8 +29,8 @@ impl IntoResponse for ApiError {
 impl From<ProposeError> for ApiError {
     fn from(e: ProposeError) -> Self {
         match e {
-            ProposeError::Rejected(r @ (Rejected::NodeUnknown | Rejected::CommandUnknown | Rejected::StackUnknown | Rejected::FloatingUnknown | Rejected::StorageUnknown)) => ApiError(StatusCode::NOT_FOUND, r.to_string()),
-            ProposeError::Rejected(r @ (Rejected::BadAddress | Rejected::BadExposure | Rejected::BadStorage | Rejected::VolumeShared | Rejected::BadSettings)) => ApiError(StatusCode::BAD_REQUEST, r.to_string()),
+            ProposeError::Rejected(r @ (Rejected::NodeUnknown | Rejected::CommandUnknown | Rejected::StackUnknown | Rejected::FloatingUnknown | Rejected::StorageUnknown | Rejected::RegistryUnknown)) => ApiError(StatusCode::NOT_FOUND, r.to_string()),
+            ProposeError::Rejected(r @ (Rejected::BadAddress | Rejected::BadExposure | Rejected::BadStorage | Rejected::VolumeShared | Rejected::BadSettings | Rejected::BadRegistry)) => ApiError(StatusCode::BAD_REQUEST, r.to_string()),
             ProposeError::Rejected(r) => ApiError(StatusCode::CONFLICT, r.to_string()),
             e @ (ProposeError::Unavailable(_) | ProposeError::NotLeader(_)) => ApiError(StatusCode::SERVICE_UNAVAILABLE, e.to_string()),
             ProposeError::Io(e) => {
@@ -99,6 +99,9 @@ pub fn router(m: Arc<Manager>) -> Router {
         .route("/v1/settings/proxmox/fingerprint", post(proxmox_fingerprint))
         .route("/v1/settings/proxmox/test", post(proxmox_test))
         .route("/v1/backup", post(take_backup))
+        .route("/v1/registries", get(registries))
+        .route("/v1/registries/{host}", axum::routing::put(set_registry).delete(remove_registry))
+        .route("/v1/registries/{host}/test", post(test_registry))
         .route("/v1/backups", get(backups))
         .route("/v1/backups/{name}", get(backup_file))
         .route("/v1/cluster", get(cluster))
@@ -496,6 +499,57 @@ async fn remove_storage(State(m): State<Arc<Manager>>, h: HeaderMap, Path(name):
     m.store.propose(Entry::StorageRemoved { name: name.clone(), at: now_ms() }).await?;
     m.events.push("storage", None, format!("storage {name} removed"));
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// The private registries' logins, without their passwords.
+async fn registries(State(m): State<Arc<Manager>>, h: HeaderMap) -> R<Json<Value>> {
+    authed(&m, &h)?;
+    Ok(Json(m.store.read(|s| json!(s.registries.values().map(|r| json!({ "host": r.host, "username": r.username, "at": r.at })).collect::<Vec<_>>()))))
+}
+
+#[derive(Deserialize)]
+struct LoginBody {
+    #[serde(default)]
+    username: String,
+    #[serde(default)]
+    password: Option<String>,
+}
+
+/// Sets a registry's login (`{username, password}`); the password may be left out to keep the one set.
+async fn set_registry(State(m): State<Arc<Manager>>, h: HeaderMap, Path(host): Path<String>, Json(b): Json<LoginBody>) -> R<Json<Value>> {
+    authed(&m, &h)?;
+    let host = host.trim().to_ascii_lowercase();
+    let password = match (b.password.filter(|p| !p.is_empty()), m.store.read(|s| s.registries.get(&host).map(|r| r.password.clone()))) {
+        (Some(p), _) => crate::settings::Secret(p),
+        (None, Some(old)) => old,
+        (None, None) => return Err(ApiError(StatusCode::BAD_REQUEST, "a new registry login needs its password (or token)".into())),
+    };
+    let registry = crate::registry::Registry { host: host.clone(), username: b.username.trim().to_string(), password, at: now_ms() };
+    m.store.propose(Entry::RegistrySet { registry }).await?;
+    m.events.push("registry", None, format!("the login for {host} was set"));
+    Ok(Json(json!({ "host": host, "username": b.username.trim() })))
+}
+
+async fn remove_registry(State(m): State<Arc<Manager>>, h: HeaderMap, Path(host): Path<String>) -> R<StatusCode> {
+    authed(&m, &h)?;
+    m.store.propose(Entry::RegistryRemoved { host: host.clone(), at: now_ms() }).await?;
+    m.events.push("registry", None, format!("the login for {host} was removed"));
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Signs in to the registry with the login given (the password kept when left out) or the one set. Changes nothing.
+async fn test_registry(State(m): State<Arc<Manager>>, h: HeaderMap, Path(host): Path<String>, body: Option<Json<LoginBody>>) -> R<Json<Value>> {
+    authed(&m, &h)?;
+    if !crate::registry::valid_host(&host) {
+        return Err(ApiError(StatusCode::BAD_REQUEST, Rejected::BadRegistry.to_string()));
+    }
+    let kept = m.store.read(|s| s.registries.get(&host).cloned());
+    let given = body.map(|b| b.0);
+    let user = given.as_ref().map(|b| b.username.trim().to_string()).filter(|u| !u.is_empty()).or_else(|| kept.as_ref().map(|k| k.username.clone()));
+    let pass = given.and_then(|b| b.password).filter(|p| !p.is_empty()).or_else(|| kept.map(|k| k.password.0));
+    let (Some(user), Some(pass)) = (user, pass) else { return Err(ApiError(StatusCode::BAD_REQUEST, "a login to try needs a user and a password".into())) };
+    let said = crate::registry::test(&host, &user, &pass).await.map_err(|e| ApiError(StatusCode::BAD_GATEWAY, format!("{e:#}")))?;
+    Ok(Json(json!({ "ok": true, "message": said })))
 }
 
 /// The cluster's settings, each with where its value comes from, and what only this manager's environment sets.

@@ -253,6 +253,10 @@ same host. Each later goal adds its pages there (stacks with G4, and so on).
        a container, remove, pull and prune images, remove a volume or network; never the cluster's own (a workload's
        container, a stack's network or volume), which the worker refuses. `GET`/`POST /v1/nodes/{id}/docker`, CLI
        `docker <node> <action>`, a worker's `docker_requests` capability (an older worker is told apart).
+8. [x] Private registries (2026-11-13), item 3's next: a login per registry in the replicated state (`registry.rs`;
+       the password never shown), filled into `RunContainer.auth` and a page's pull by the manager that sends it, never
+       kept with a command. `GET`/`PUT`/`DELETE /v1/registries/{host}`, a sign-in test (v2 Basic or Bearer), CLI
+       `registry ls|add|test|rm`, the UI's Integrations page.
 
 ## G9 to G12
 

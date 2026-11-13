@@ -121,6 +121,18 @@ freightdock-manager settings proxmox https://192.0.2.20:8006 AB:CD:... /root/fen
 freightdock-manager settings set fence_stop_s=45 recovery_delay_s=default
 ```
 
+### Private registries
+
+A login per registry, kept with the cluster's state (the password set once and never shown, in a backup like every
+other secret). When a workload's image is from that registry (Docker's rule: the first part of the name, when it has
+a `.` or a `:` or is `localhost`; else Docker Hub, `docker.io`), the manager that sends the run fills the login in;
+it is never kept with the command. A pull from a node's Docker page gets it the same way.
+
+```sh
+freightdock-manager registry add ghcr.io my-bot          # the token from stdin or FREIGHTDOCK_REGISTRY_PASSWORD
+freightdock-manager registry test ghcr.io
+```
+
 ### Backups
 
 A backup is the cluster's replicated state (stacks, nodes, storage, settings and secrets, the UI's database) and the
@@ -166,6 +178,9 @@ a client trusts that CA alone and checks that name. `GET /v1/health` and `GET /v
 | `GET /v1/recoveries?stack=` | the recovery history, newest first |
 | `GET /v1/nodes/{id}/docker?action=&target=` | a look at the node's Docker through its worker, now: `info`, `containers`, `container` (inspect), `logs` (`tail`, `timestamps`), `images`, `volumes`, `networks`. Not in the log; asked through the manager that holds the node's stream |
 | `POST /v1/nodes/{id}/docker` | `{action, target, params}`: a change to it: `container.start`, `.stop`, `.restart`, `.remove` (`force`), `image.remove`, `image.pull` (`image`), `images.prune`, `volume.remove`, `network.remove`. The worker refuses the cluster's own (labelled `io.freightdock.managed`): they belong to their stack |
+| `GET /v1/registries` | the private registries the cluster has a login for (`host`, `username`), never a password |
+| `PUT /v1/registries/{host}`, `DELETE /v1/registries/{host}` | `{username, password}`: a registry's login (the password kept when left out), or taken away. `host` as images name it: `ghcr.io`, `registry.example:5000`, `docker.io` |
+| `POST /v1/registries/{host}/test` | `{username?, password?}`: signs in as Docker would (v2, Basic or a Bearer token), with the login given or the one set; nothing is pulled |
 | `POST /v1/backup` | `{"passphrase"}`: a sealed backup of the cluster now, as a download (kept nowhere) |
 | `GET /v1/backups`, `GET /v1/backups/{name}` | this manager's scheduled backups (`name`, `taken_at`, `size`, `manager`), newest first; one as a download |
 | `GET /v1/api-tokens`, `POST /v1/api-tokens`, `DELETE /v1/api-tokens/{id}` | API tokens: `{"name", "role": "read" or "admin"}` gives the token once |

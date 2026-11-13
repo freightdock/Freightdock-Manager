@@ -71,7 +71,9 @@ impl Manager {
             return Err(DockerError::UnknownAction(action.to_string()));
         }
         let Some(report) = self.store.read(|s| s.nodes.get(node).map(|n| n.report.clone())) else { return Err(DockerError::UnknownNode) };
-        let req = DockerRequest { request_id: uuid::Uuid::new_v4().to_string(), action: action.to_string(), target: target.to_string(), params };
+        // A pull from a private registry: its login, filled in here and nowhere kept.
+        let auth = (action == "image.pull").then(|| params.get("image").and_then(|i| self.store.read(|s| crate::registry::auth_for(&s.registries, i)))).flatten();
+        let req = DockerRequest { request_id: uuid::Uuid::new_v4().to_string(), action: action.to_string(), target: target.to_string(), params, auth };
         let reply = if self.sessions.sender(node).is_some() {
             if !report.as_ref().is_some_and(|r| r.docker_requests) {
                 return Err(DockerError::Older);

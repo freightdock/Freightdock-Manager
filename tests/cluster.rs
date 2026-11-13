@@ -786,3 +786,45 @@ async fn a_node_s_docker_is_asked_through_the_manager_that_holds_its_stream() {
     a.server.abort();
     b.server.abort();
 }
+
+#[tokio::test]
+async fn a_private_registry_s_login_is_kept_never_shown_and_goes_with_its_images_only() {
+    use freightdock_manager::state::{CommandRecord, CommandStatus, Op};
+    use freightdock_proto::v1::{command, manager_message::Body};
+    let a = start(None).await;
+    until("a leader", || a.m.store.leader().is_some()).await;
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap().to_string();
+    tokio::spawn(freightdock_manager::serve_admin_tls(a.m.clone(), l));
+    let admin = Some(a.m.admin_token.as_str());
+
+    let (s, b) = https_with(&a.m, &addr, "PUT", "/v1/registries/ghcr.io", admin, r#"{"username":"bot","password":"s3cret"}"#).await;
+    assert_eq!(s, 200, "{b}");
+    let (s, b) = https_with(&a.m, &addr, "PUT", "/v1/registries/ghcr.io", admin, r#"{"username":"bot2"}"#).await;
+    assert_eq!(s, 200, "the password kept when left out: {b}");
+    let (s, b) = https_with(&a.m, &addr, "PUT", "/v1/registries/quay.io", admin, r#"{"username":"bot"}"#).await;
+    assert!(s == 400 && b.contains("password"), "a new login needs one: {s} {b}");
+    let (s, b) = https_with(&a.m, &addr, "PUT", "/v1/registries/Not%20A%20Host", admin, r#"{"username":"bot","password":"x"}"#).await;
+    assert_eq!(s, 400, "{b}");
+    let (_, list) = https_with(&a.m, &addr, "GET", "/v1/registries", admin, "").await;
+    assert!(list.contains(r#""host":"ghcr.io""#) && list.contains("bot2") && !list.contains("s3cret"), "{list}");
+
+    let run = |image: &str| CommandRecord { id: "c".into(), node_id: "n".into(), op: Op::RunContainer { workload_id: "app.web.1".into(), image: image.into(), name: String::new(), command: vec![], env: Default::default(), labels: Default::default(), generation: 0, ports: vec![], volumes: vec![], limits: Default::default(), net: Default::default(), storage: vec![] }, config_version: 0, created_at: 0, deadline: 0, status: CommandStatus::Pending, message: String::new(), result_json: String::new(), updated_at: 0 };
+    let auth = |c: &CommandRecord| match a.m.wire(c).body {
+        Some(Body::Command(cmd)) => match cmd.op {
+            Some(command::Op::RunContainer(r)) => r.auth,
+            _ => panic!(),
+        },
+        _ => panic!(),
+    };
+    let got = auth(&run("ghcr.io/team/app:1")).expect("the login goes with the run");
+    assert_eq!((got.server.as_str(), got.username.as_str(), got.password.as_str()), ("ghcr.io", "bot2", "s3cret"));
+    assert!(auth(&run("nginx")).is_none(), "and only with its registry's images");
+    assert!(!serde_json::to_string(&run("ghcr.io/team/app:1")).unwrap().contains("s3cret"), "never in the command kept");
+
+    let (s, b) = https_with(&a.m, &addr, "POST", "/v1/registries/127.0.0.1:1/test", admin, r#"{"username":"u","password":"p"}"#).await;
+    assert!(s == 502 && b.contains("127.0.0.1:1"), "tried, and why it failed said: {s} {b}");
+    assert_eq!(https_with(&a.m, &addr, "DELETE", "/v1/registries/ghcr.io", admin, "").await.0, 204);
+    assert_eq!(https_with(&a.m, &addr, "DELETE", "/v1/registries/ghcr.io", admin, "").await.0, 404);
+    a.server.abort();
+}
