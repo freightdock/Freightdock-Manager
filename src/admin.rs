@@ -217,7 +217,8 @@ async fn docker_change(State(m): State<Arc<Manager>>, h: HeaderMap, Path(id): Pa
     if !crate::docker::CHANGES.contains(&b.action.as_str()) {
         return Err(ApiError(StatusCode::BAD_REQUEST, format!("{:?} is not a change to a node's Docker; a read is a GET", b.action)));
     }
-    let what = if b.target.is_empty() { b.action.clone() } else { format!("{} {}", b.action, b.target) };
+    let on = if b.target.is_empty() { b.params.get("image").cloned().unwrap_or_default() } else { b.target.clone() };
+    let what = if on.is_empty() { b.action.clone() } else { format!("{} {on}", b.action) };
     let v = m.docker(&id, &b.action, &b.target, b.params).await?;
     m.events.push("docker", Some(&id), format!("Docker: {what}"));
     Ok(Json(v))
