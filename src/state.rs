@@ -110,6 +110,8 @@ pub enum Entry {
     StorageAdded { storage: Storage },
     /// Refused while a stack keeps a volume on it.
     StorageRemoved { name: String, at: Ms },
+    /// The node a workload moved away from has no copy of it running any more (G5.5).
+    WorkloadLeft { workload_id: String, node_id: String, at: Ms },
     /// The cluster's settings, replaced whole (`settings.rs`).
     SettingsSet { settings: crate::settings::Settings, at: Ms },
     /// A volume for one writer (`stack/volume`) leased to the node about to run its workload. Refused while another
@@ -434,6 +436,10 @@ pub struct ServiceSpec {
     /// with `-<slot>` when it has more than one; empty: `<stack>-<service>-<slot>`. Also a name for it inside the stack.
     #[serde(default)]
     pub name: String,
+    /// A move starts the new copy before the old one stopped (Compose `deploy.update_config.order: start-first`);
+    /// by default the old one stops first, as Docker's does.
+    #[serde(default)]
+    pub start_first: bool,
 }
 
 fn yes() -> bool {
@@ -722,9 +728,27 @@ pub struct Workload {
     /// Its address in its stack's /24 (G9): the last byte, 2 to 254 (.1 is the bridge). Kept when it moves.
     #[serde(default)]
     pub host: Option<u8>,
+    /// The node it moved away from, until that node's copy is gone (`WorkloadLeft`): its new node runs it only then,
+    /// or once that node is fenced or removed (G5.5). None for a start-first service.
+    #[serde(default)]
+    pub leaving: Option<String>,
 }
 
 impl Workload {
+    /// Placed on `to`: a move from another node remembers the node it leaves (unless start-first); back onto the node
+    /// it was leaving, there is nothing left to wait for.
+    fn place(&mut self, to: &str) {
+        match self.node_id.as_deref() {
+            Some(from) if from != to && !self.spec.start_first => {
+                self.leaving = Some(from.to_string());
+            }
+            _ => {}
+        }
+        if self.leaving.as_deref() == Some(to) {
+            self.leaving = None;
+        }
+        self.node_id = Some(to.to_string());
+    }
     /// Its container's name on its node: its own (`ServiceSpec::name`), else `<stack>-<service>-<slot>`.
     pub fn container_name(&self) -> String {
         if self.spec.name.is_empty() { format!("{}-{}-{}", self.stack, self.service, self.slot) } else { self.spec.name.clone() }
@@ -1127,6 +1151,12 @@ impl ClusterState {
         self.nodes.get(holder).is_none_or(|n| matches!(n.fencing.state, FenceState::Fenced | FenceState::AwaitingAuthorization))
     }
 
+    /// Whether a moved workload still waits for its old node: one heard (not fenced, not removed) that has not said
+    /// its copy is gone.
+    pub fn waits_for_old(&self, w: &Workload) -> bool {
+        w.leaving.as_ref().and_then(|n| self.nodes.get(n)).is_some_and(|n| !matches!(n.fencing.state, FenceState::Fenced | FenceState::AwaitingAuthorization))
+    }
+
     pub fn should_run(&self, w: &Workload) -> bool {
         self.stacks.get(&w.stack).is_some_and(|s| !s.stopped)
     }
@@ -1308,7 +1338,7 @@ impl ClusterState {
                 let taken: std::collections::BTreeSet<String> = self.workloads.values().filter(|w| w.stack != *name).map(Workload::container_name).collect();
                 let mut mine = std::collections::BTreeSet::new();
                 for (id, svc, slot) in Self::wanted(name, services) {
-                    let w = Workload { id, stack: name.clone(), service: svc.clone(), slot, node_id: None, spec: services[&svc].for_workload(slot), generation: 0, host: None };
+                    let w = Workload { id, stack: name.clone(), service: svc.clone(), slot, node_id: None, spec: services[&svc].for_workload(slot), generation: 0, host: None, leaving: None };
                     let n = w.container_name();
                     if taken.contains(&n) || !mine.insert(n) {
                         return Err(Rejected::NameTaken);
@@ -1348,7 +1378,7 @@ impl ClusterState {
                             // A placement for a placed workload moves it: its old node's reconcile removes the
                             // container there, its new node's runs one.
                             if let Some(n) = placements.get(id) {
-                                w.node_id = Some(n.clone());
+                                w.place(n);
                             }
                             if w.spec != spec {
                                 w.spec = spec;
@@ -1356,7 +1386,7 @@ impl ClusterState {
                             }
                         }
                         None => {
-                            self.workloads.insert(id.clone(), Workload { id: id.clone(), stack: name.clone(), service: svc.clone(), slot: *slot, node_id: placements.get(id).cloned(), spec, generation: index, host: None });
+                            self.workloads.insert(id.clone(), Workload { id: id.clone(), stack: name.clone(), service: svc.clone(), slot: *slot, node_id: placements.get(id).cloned(), spec, generation: index, host: None, leaving: None });
                         }
                     }
                 }
@@ -1391,7 +1421,7 @@ impl ClusterState {
                     return Err(Rejected::NodeUnknown);
                 }
                 for (id, n) in placements {
-                    self.workloads.get_mut(id).expect("checked").node_id = Some(n.clone());
+                    self.workloads.get_mut(id).expect("checked").place(n);
                 }
                 if let Some(st) = self.stacks.get_mut(name) {
                     st.updated_at = *at;
@@ -1412,6 +1442,13 @@ impl ClusterState {
                     return Err(Rejected::StorageExists);
                 }
                 self.storage.insert(storage.name.clone(), storage.clone());
+            }
+            Entry::WorkloadLeft { workload_id, node_id, .. } => {
+                if let Some(w) = self.workloads.get_mut(workload_id)
+                    && w.leaving.as_deref() == Some(node_id.as_str())
+                {
+                    w.leaving = None;
+                }
             }
             Entry::SettingsSet { settings, .. } => {
                 if settings.check().is_err() {
@@ -1474,7 +1511,7 @@ impl ClusterState {
                     }
                 }
                 for (id, to) in moves {
-                    self.workloads.get_mut(id).expect("checked").node_id = Some(to.clone());
+                    self.workloads.get_mut(id).expect("checked").place(to);
                     // A command still open for it on the old node is done with.
                     for c in self.commands.values_mut().filter(|c| !c.status.is_terminal() && c.op.workload_id() == Some(id.as_str())) {
                         c.status = CommandStatus::Rejected;
@@ -1798,7 +1835,7 @@ pub(crate) mod tests {
     }
 
     pub fn spec(image: &str, replicas: u32) -> ServiceSpec {
-        ServiceSpec { image: image.into(), command: vec![], env: Default::default(), labels: Default::default(), ports: vec![], volumes: vec![], replicas, limits: Default::default(), placement: Default::default(), ha: true, restart: Default::default(), name: String::new() }
+        ServiceSpec { image: image.into(), command: vec![], env: Default::default(), labels: Default::default(), ports: vec![], volumes: vec![], replicas, limits: Default::default(), placement: Default::default(), ha: true, restart: Default::default(), name: String::new(), start_first: false }
     }
 
     pub fn with_nodes(nodes: &[&str]) -> ClusterState {
@@ -2138,6 +2175,37 @@ pub(crate) mod tests {
             }
             _ => unreachable!(),
         }
+    }
+
+    #[test]
+    fn a_move_remembers_the_node_left_until_its_copy_is_gone_there() {
+        let mut s = with_nodes(&["a", "b"]);
+        let services = crate::compose::parse("services:\n  web:\n    image: nginx\n").unwrap().services;
+        next(&mut s, &Entry::StackDeployed { name: "st".into(), compose: String::new(), services, placements: [("st.web.1".to_string(), "a".to_string())].into(), at: 1, nodes: vec![], exposures: None, volumes: Default::default(), options: Default::default() }).unwrap();
+        assert_eq!(s.workloads["st.web.1"].leaving, None, "a first placement leaves nothing");
+        next(&mut s, &Entry::StackPlaced { name: "st".into(), placements: [("st.web.1".to_string(), "b".to_string())].into(), at: 2 }).unwrap();
+        assert_eq!(s.workloads["st.web.1"].leaving.as_deref(), Some("a"));
+        assert!(s.waits_for_old(&s.workloads["st.web.1"]), "a is healthy and may still run it");
+        next(&mut s, &Entry::WorkloadLeft { workload_id: "st.web.1".into(), node_id: "b".into(), at: 3 }).unwrap();
+        assert_eq!(s.workloads["st.web.1"].leaving.as_deref(), Some("a"), "only the node it left says so");
+        next(&mut s, &Entry::WorkloadLeft { workload_id: "st.web.1".into(), node_id: "a".into(), at: 4 }).unwrap();
+        assert!(!s.waits_for_old(&s.workloads["st.web.1"]));
+
+        next(&mut s, &Entry::StackPlaced { name: "st".into(), placements: [("st.web.1".to_string(), "a".to_string())].into(), at: 5 }).unwrap();
+        assert_eq!(s.workloads["st.web.1"].leaving.as_deref(), Some("b"));
+        next(&mut s, &Entry::StackPlaced { name: "st".into(), placements: [("st.web.1".to_string(), "b".to_string())].into(), at: 6 }).unwrap();
+        assert_eq!(s.workloads["st.web.1"].leaving.as_deref(), Some("a"), "back before it left: it waits for a again");
+        s.nodes.get_mut("a").unwrap().fencing.state = FenceState::Fenced;
+        assert!(!s.waits_for_old(&s.workloads["st.web.1"]), "a fenced runs nothing");
+        s.nodes.get_mut("a").unwrap().fencing.state = FenceState::None;
+        s.nodes.remove("a");
+        assert!(!s.waits_for_old(&s.workloads["st.web.1"]), "a removed runs nothing for the cluster");
+
+        let mut s = with_nodes(&["a", "b"]);
+        let services = crate::compose::parse("services:\n  web:\n    image: nginx\n    deploy: {update_config: {order: start-first}}\n").unwrap().services;
+        next(&mut s, &Entry::StackDeployed { name: "st".into(), compose: String::new(), services, placements: [("st.web.1".to_string(), "a".to_string())].into(), at: 1, nodes: vec![], exposures: None, volumes: Default::default(), options: Default::default() }).unwrap();
+        next(&mut s, &Entry::StackPlaced { name: "st".into(), placements: [("st.web.1".to_string(), "b".to_string())].into(), at: 2 }).unwrap();
+        assert_eq!(s.workloads["st.web.1"].leaving, None, "start-first: the new copy may start beside the old");
     }
 
     #[test]

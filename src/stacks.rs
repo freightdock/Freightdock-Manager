@@ -228,6 +228,10 @@ pub fn reconcile(s: &ClusterState, node: &str, actual: &[WorkloadState], busy: &
             continue;
         }
         if let Some(op) = op_for(w, s.attach(w), s.storage_mounts(w), s.should_run(w), actual.iter().find(|a| a.workload_id == w.id)) {
+            // Moved here: not run while its old node may still run it (G5.5).
+            if matches!(op, Op::RunContainer { .. }) && s.waits_for_old(w) {
+                continue;
+            }
             out.push((w.id.clone(), op));
         }
     }
@@ -237,6 +241,17 @@ pub fn reconcile(s: &ClusterState, node: &str, actual: &[WorkloadState], busy: &
         }
     }
     out
+}
+
+/// The workloads that moved away from `node` and have no copy left running there: its manager says so
+/// (`WorkloadLeft`), and their new node runs them.
+pub fn left(s: &ClusterState, node: &str, actual: &[WorkloadState]) -> Vec<String> {
+    let up = |a: &WorkloadState| matches!(a.state.as_str(), "running" | "restarting" | "paused" | "removing" | "created");
+    s.workloads
+        .values()
+        .filter(|w| w.leaving.as_deref() == Some(node) && !actual.iter().any(|a| a.workload_id == w.id && up(a)))
+        .map(|w| w.id.clone())
+        .collect()
 }
 
 /// The volumes for one writer `node` holds and may let go: no workload placed there to run uses one, and nothing of
@@ -300,6 +315,7 @@ impl Manager {
         }
         let mut todo = vec![];
         let mut release = vec![];
+        let mut gone = vec![];
         self.store.read(|s| {
             let busy = s.busy_workloads();
             for (node, actual) in &reports {
@@ -308,6 +324,7 @@ impl Manager {
                     continue;
                 }
                 release.extend(releasable(s, node, actual).into_iter().map(|v| (node.clone(), v)));
+                gone.extend(left(s, node, actual).into_iter().map(|w| (node.clone(), w)));
                 let ops = reconcile(s, node, actual, &busy);
                 for w in s.workloads_on(node) {
                     if !busy.contains(&w.id) && !ops.iter().any(|(id, _)| *id == w.id) {
@@ -322,6 +339,12 @@ impl Manager {
                 }));
             }
         });
+        for (node, id) in gone {
+            match self.store.propose(Entry::WorkloadLeft { workload_id: id.clone(), node_id: node.clone(), at: now_ms() }).await {
+                Ok(_) => tracing::info!(node = %node, workload = %id, "moved: its old copy is gone, it runs on its new node"),
+                Err(e) => tracing::debug!(node = %node, workload = %id, "moved: not said: {e}"),
+            }
+        }
         for (node, volume) in release {
             match self.store.propose(Entry::LeaseReleased { volume: volume.clone(), node_id: node.clone(), at: now_ms() }).await {
                 Ok(_) => tracing::info!(node = %node, volume = %volume, "storage: lease let go"),
@@ -619,6 +642,25 @@ mod tests {
         assert!(releasable(&s, "b", &[]).is_empty(), "b holds nothing");
         s.workloads.remove("app.db.1");
         assert!(releasable(&s, "a", &[running("app.db.1", 1)]).is_empty(), "its stack's container still runs, though the state forgot it");
+    }
+
+    #[test]
+    fn a_moved_workload_runs_on_its_new_node_once_its_old_copy_is_gone() {
+        let mut s = state_with(&["a", "b"]);
+        let one = svc(&[("x", spec("nginx", 1))]);
+        deploy(&mut s, "web", &one, BTreeMap::from([("web.x.1".to_string(), "a".to_string())]));
+        let i = s.applied + 1;
+        s.apply_at(i, &Entry::StackPlaced { name: "web".into(), placements: [("web.x.1".to_string(), "b".to_string())].into(), at: 2 }).unwrap();
+        assert!(reconcile(&s, "b", &[], &BTreeSet::new()).is_empty(), "the old copy may still run on a");
+        assert!(matches!(reconcile(&s, "a", &[running("web.x.1", 1)], &BTreeSet::new())[..], [(_, Op::RemoveContainer { .. })]));
+        assert!(left(&s, "a", &[running("web.x.1", 1)]).is_empty(), "still there");
+        assert!(left(&s, "a", &[WorkloadState { state: "removing".into(), ..running("web.x.1", 1) }]).is_empty());
+        assert_eq!(left(&s, "a", &[WorkloadState { state: "exited".into(), ..running("web.x.1", 1) }]), vec!["web.x.1".to_string()], "stopped is gone enough");
+        assert_eq!(left(&s, "a", &[]), vec!["web.x.1".to_string()]);
+        assert!(left(&s, "b", &[]).is_empty(), "b left nothing");
+        let i = s.applied + 1;
+        s.apply_at(i, &Entry::WorkloadLeft { workload_id: "web.x.1".into(), node_id: "a".into(), at: 3 }).unwrap();
+        assert!(matches!(reconcile(&s, "b", &[], &BTreeSet::new())[..], [(_, Op::RunContainer { .. })]));
     }
 
     #[test]

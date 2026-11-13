@@ -441,6 +441,10 @@ fn print_workloads(s: &Value) {
     for w in s["workloads"].as_array().into_iter().flatten() {
         let last = &w["last_command"];
         let last = if last.is_null() { String::new() } else { format!("{} {} {}", last["op"]["op"].as_str().unwrap_or(""), last["status"].as_str().unwrap_or(""), last["message"].as_str().unwrap_or("")) };
+        let last = match w["waits_for"].as_str() {
+            Some(n) => format!("waits for its old copy on {} to stop", &n[..n.len().min(8)]),
+            None => last,
+        };
         println!(
             "{:<32} {:<16} {:<10} {:<10} {}",
             w["id"].as_str().unwrap_or(""),

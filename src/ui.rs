@@ -58,6 +58,7 @@ pub fn spec(image: &str) -> ServiceSpec {
         ha: true,
         restart: Default::default(),
         name: String::new(),
+        start_first: false,
     }
 }
 

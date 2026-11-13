@@ -159,7 +159,7 @@ mod tests {
         s.stacks.insert("app".into(), Stack { name: "app".into(), compose: String::new(), services: services.clone(), stopped: false, created_at: 0, updated_at: 0, net: None, exposures: vec![], nodes: vec![] , volumes: Default::default(), options: Default::default() });
         for (id, svc, slot, on) in [("app.web.1", "web", 1, "a"), ("app.web.2", "web", 2, "b"), ("app.db.1", "db", 1, "a"), ("app.cron.1", "cron", 1, "a")] {
             let sp = services[svc].for_workload(slot);
-            s.workloads.insert(id.into(), Workload { id: id.into(), stack: "app".into(), service: svc.into(), slot, node_id: Some(on.into()), spec: sp, generation: 1, host: None });
+            s.workloads.insert(id.into(), Workload { id: id.into(), stack: "app".into(), service: svc.into(), slot, node_id: Some(on.into()), spec: sp, generation: 1, host: None, leaving: None });
         }
         s
     }

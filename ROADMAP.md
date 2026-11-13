@@ -15,7 +15,7 @@ Status marks: **[x]** done, **[~]** in progress, **[ ]** not started.
 | 3 | G3 Manager high availability (Raft) | Success criteria 1 and 2 of the first release; changes how every write works, so before anything writes much | G2 | **done** |
 | 4 | G4 Workloads and Compose stacks | The point of the product: deploy and manage stacks across workers | G3 | **done** (2026-11-13) |
 | 4a | G8 first slice: a Cluster page in Freightdock | Pulled forward (2026-11-11) so every goal from here is seen in the browser as it is built | G3 | **done** |
-| 5 | G5 Scheduling and labels | Workloads need placing once there is more than one worker | G4 | **done** |
+| 5 | G5 Scheduling and labels | Workloads need placing once there is more than one worker | G4 | **done** (all of it, 2026-11-13) |
 | 6 | G6 Fencing | A worker must be able to fence itself before anything is recovered elsewhere (plan rule 10, 11) | G4 | done |
 | 7 | G7 Failure detection and stateless recovery | Success criteria 4 and 5; safe only with G6 | G5, G6 | done |
 | 8 | G8 UI: Freightdock as the cluster's UI | Usable by people, not just the CLI; can start in parallel once G4's API settles | G4 | **done** |
@@ -165,8 +165,11 @@ Ranked inside the goal:
        `StackPlaced`; a service with nowhere to go stays and holds back nothing else); anti-affinity between services
        (`x-freightdock.apart`, of the stack or another, both ways). Tried on the test cluster: a label swap moved two
        workloads in seconds, the third kept off a node by `apart` stayed.
-5. [ ] Left: a move starts the new copy without waiting for the old to stop (fine for stateless; G6/G7 and G11 make
-       it safe for the rest).
+5. [x] A move waits for the old copy to stop (2026-11-13), as Docker's `stop-first`: the workload keeps the node it
+       left (`Workload.leaving`) until that node's manager says its copy is gone (`WorkloadLeft`), or the node is
+       fenced or removed; `deploy.update_config.order: start-first` starts the new copy beside the old. Tried on the
+       test cluster: a writer on a volume for many moved w3 to w4, its lines in the shared file in two runs, never
+       interleaved, 7 s apart; the stack said what it waited for.
 
 ## G6: Fencing
 

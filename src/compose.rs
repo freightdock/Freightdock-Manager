@@ -280,7 +280,7 @@ fn scalar(v: &Value) -> Option<String> {
 
 fn service(name: &str, v: &Value, vars: &BTreeMap<String, String>, warnings: &mut Vec<String>) -> Result<ServiceSpec, String> {
     let m = v.as_mapping().ok_or("a service is a mapping")?;
-    let mut spec = ServiceSpec { image: String::new(), command: vec![], env: BTreeMap::new(), labels: BTreeMap::new(), ports: vec![], volumes: vec![], replicas: 1, limits: Resources::default(), placement: Default::default(), ha: true, restart: Default::default(), name: String::new() };
+    let mut spec = ServiceSpec { image: String::new(), command: vec![], env: BTreeMap::new(), labels: BTreeMap::new(), ports: vec![], volumes: vec![], replicas: 1, limits: Resources::default(), placement: Default::default(), ha: true, restart: Default::default(), name: String::new(), start_first: false };
     for (k, v) in m {
         let k = key(k)?;
         match k.as_str() {
@@ -294,7 +294,7 @@ fn service(name: &str, v: &Value, vars: &BTreeMap<String, String>, warnings: &mu
             "ports" => spec.ports = v.as_sequence().ok_or("ports is a list")?.iter().map(port).collect::<Result<Vec<_>, _>>()?.into_iter().flatten().collect(),
             "volumes" => spec.volumes = v.as_sequence().ok_or("volumes is a list")?.iter().map(volume).collect::<Result<_, _>>()?,
             "restart" => spec.restart = restart(v)?,
-            "deploy" => deploy(v, &mut spec)?,
+            "deploy" => deploy(v, &mut spec, warnings, name)?,
             "x-freightdock" => freightdock(v, &mut spec)?,
             k if k.starts_with("x-") => {}
             k if SERVICE_IGNORED.contains(&k) => warnings.push(format!("service {name}: {k} is not used (the cluster starts and restarts workloads itself)")),
@@ -535,7 +535,7 @@ fn mapping<'a>(v: &'a Value, what: &str) -> Result<&'a yaml_serde::Mapping, Stri
 }
 
 /// `deploy`: replicas, placement (constraints and preferences) and resources (limits and reservations).
-fn deploy(v: &Value, spec: &mut ServiceSpec) -> Result<(), String> {
+fn deploy(v: &Value, spec: &mut ServiceSpec, warnings: &mut Vec<String>, svc: &str) -> Result<(), String> {
     for (k, v) in mapping(v, "deploy")? {
         match key(k)?.as_str() {
             "replicas" => spec.replicas = v.as_u64().filter(|n| (0..=100).contains(n)).ok_or("deploy.replicas is 0 to 100")? as u32,
@@ -586,6 +586,20 @@ fn deploy(v: &Value, spec: &mut ServiceSpec) -> Result<(), String> {
                         "window" => spec.restart.window_ms = ms("window")?,
                         "max_attempts" => spec.restart.max_attempts = v.as_u64().and_then(|n| u32::try_from(n).ok()).ok_or("deploy.restart_policy.max_attempts is a number")?,
                         k => return Err(format!("deploy.restart_policy.{k} is not known")),
+                    }
+                }
+            }
+            "update_config" => {
+                for (k, v) in mapping(v, "deploy.update_config")? {
+                    match key(k)?.as_str() {
+                        "order" => {
+                            spec.start_first = match scalar(v).unwrap_or_default().as_str() {
+                                "start-first" => true,
+                                "stop-first" => false,
+                                o => return Err(format!("deploy.update_config.order: {o:?} is stop-first or start-first")),
+                            }
+                        }
+                        k => warnings.push(format!("service {svc}: deploy.update_config.{k} is not used (a workload is moved or made again one at a time)")),
                     }
                 }
             }
@@ -749,6 +763,17 @@ volumes:
         assert_eq!(a.volumes, vec!["data:/var/lib/data", "/srv/conf:/etc/conf:ro", "/x:/y:ro"]);
         assert_eq!(a.replicas, 3);
         assert_eq!(p.warnings.len(), 1, "healthcheck is set aside: {:?}", p.warnings);
+    }
+
+    #[test]
+    fn a_move_stops_the_old_copy_first_unless_update_config_says_start_first() {
+        let p = |y: &str| parse(&format!("services:\n  a:\n    image: x\n{y}"));
+        assert!(!p("").unwrap().services["a"].start_first, "Docker's default: stop-first");
+        assert!(p("    deploy:\n      update_config: {order: start-first}\n").unwrap().services["a"].start_first);
+        assert!(!p("    deploy:\n      update_config: {order: stop-first}\n").unwrap().services["a"].start_first);
+        assert!(p("    deploy:\n      update_config: {order: sideways}\n").unwrap_err().contains("order"));
+        let w = p("    deploy:\n      update_config: {order: start-first, parallelism: 2}\n").unwrap();
+        assert!(w.warnings.iter().any(|w| w.contains("parallelism")), "{:?}", w.warnings);
     }
 
     #[test]
