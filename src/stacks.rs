@@ -279,6 +279,17 @@ pub fn backoff(in_a_row: u32, delay_ms: u64) -> Duration {
     base.saturating_mul(1 << in_a_row.min(16)).min(Duration::from_secs(300).max(base))
 }
 
+/// Whether a workload may be run again by the attempts the state keeps for it (any manager's): not for a spec it
+/// spent its attempts on, and not before its backoff after the last. A new spec, or none counted, may.
+pub fn may_run(a: Option<crate::state::Attempts>, generation: u64, r: &crate::state::Restart, now: crate::state::Ms) -> bool {
+    a.filter(|a| a.generation == generation).is_none_or(|a| (r.max_attempts == 0 || a.runs <= r.max_attempts) && now - a.at >= backoff(a.runs.saturating_sub(1), r.delay_ms).as_millis() as i64)
+}
+
+/// Whether the attempts kept for a workload as wanted may be cleared: its restart window passed since the last.
+pub fn settles(a: Option<crate::state::Attempts>, r: &crate::state::Restart, now: crate::state::Ms) -> bool {
+    a.is_some_and(|a| now - a.at >= r.window_ms as i64)
+}
+
 /// What this manager did lately per workload, in memory only: when, how many times in a row, for which generation.
 #[derive(Default)]
 pub struct Paced(Mutex<HashMap<String, (Instant, u32, u64)>>);
@@ -316,6 +327,8 @@ impl Manager {
         let mut todo = vec![];
         let mut release = vec![];
         let mut gone = vec![];
+        let mut settle = vec![];
+        let now = now_ms();
         self.store.read(|s| {
             let busy = s.busy_workloads();
             for (node, actual) in &reports {
@@ -329,16 +342,22 @@ impl Manager {
                 for w in s.workloads_on(node) {
                     if !busy.contains(&w.id) && !ops.iter().any(|(id, _)| *id == w.id) {
                         self.paced.settled(&w.id, w.spec.restart.window_ms);
+                        if settles(w.attempts, &w.spec.restart, now) {
+                            settle.push(w.id.clone());
+                        }
                     }
                 }
                 todo.extend(ops.into_iter().map(|(id, op)| {
-                    let (generation, restart) = s.workloads.get(&id).map(|w| (w.generation, w.spec.restart)).unwrap_or_default();
+                    let (generation, restart, attempts) = s.workloads.get(&id).map(|w| (w.generation, w.spec.restart, w.attempts)).unwrap_or_default();
                     // A volume for one writer is leased to the node before its workload runs there (G11).
                     let leases = if matches!(op, Op::RunContainer { .. }) { s.workloads.get(&id).map(|w| s.exclusive_volumes(w)).unwrap_or_default().into_iter().filter(|v| s.leases.get(v).is_none_or(|l| l.node_id != *node)).collect() } else { vec![] };
-                    (node.clone(), id, op, leases, generation, restart)
+                    (node.clone(), id, op, leases, generation, restart, attempts)
                 }));
             }
         });
+        for id in settle {
+            let _ = self.store.propose(Entry::WorkloadSettled { workload_id: id, at: now_ms() }).await;
+        }
         for (node, id) in gone {
             match self.store.propose(Entry::WorkloadLeft { workload_id: id.clone(), node_id: node.clone(), at: now_ms() }).await {
                 Ok(_) => tracing::info!(node = %node, workload = %id, "moved: its old copy is gone, it runs on its new node"),
@@ -354,10 +373,15 @@ impl Manager {
         // Stops and removals first: a run on one node may be waiting for a lease the other lets go once its own
         // container of the workload is gone.
         todo.sort_by_key(|(_, _, op, ..)| matches!(op, Op::RunContainer { .. }));
-        'next: for (node, id, op, leases, generation, restart) in todo {
+        'next: for (node, id, op, leases, generation, restart, attempts) in todo {
             // Its attempts count only against running it again; a stop or a removal is never held back by them.
             let paced = if matches!(op, Op::RunContainer { .. }) { restart } else { crate::state::Restart { max_attempts: 0, ..restart } };
             if !self.paced.ready(&id, generation, &paced) {
+                continue;
+            }
+            // A limit on its attempts counts on in the state, whichever manager ran it before.
+            let counted = matches!(op, Op::RunContainer { .. }) && restart.max_attempts > 0;
+            if counted && !may_run(attempts, generation, &restart, now_ms()) {
                 continue;
             }
             // A run waiting for a lease is paced on its own, so it never holds back what the other node has to do.
@@ -375,6 +399,10 @@ impl Manager {
             }
             self.paced.settled(&waiting, 0);
             self.paced.acted(&id, generation);
+            if counted && let Err(e) = self.store.propose(Entry::WorkloadAttempted { workload_id: id.clone(), generation, at: now_ms() }).await {
+                tracing::debug!(workload = %id, "reconcile: attempt not counted, not run: {e}");
+                continue;
+            }
             let now = now_ms();
             let what = match &op {
                 Op::RunContainer { .. } => "run",
@@ -642,6 +670,22 @@ mod tests {
         assert!(releasable(&s, "b", &[]).is_empty(), "b holds nothing");
         s.workloads.remove("app.db.1");
         assert!(releasable(&s, "a", &[running("app.db.1", 1)]).is_empty(), "its stack's container still runs, though the state forgot it");
+    }
+
+    #[test]
+    fn the_attempts_kept_in_the_state_hold_a_run_back_whichever_manager_acts() {
+        use crate::state::{Attempts, Restart, RestartWhen};
+        let r = Restart { condition: RestartWhen::OnFailure, delay_ms: 5_000, max_attempts: 2, window_ms: 10_000 };
+        let at = |runs, at| Some(Attempts { generation: 3, runs, at });
+        assert!(may_run(None, 3, &r, 0), "never tried");
+        assert!(may_run(at(1, 0), 3, &r, 5_000), "the first again after its delay");
+        assert!(!may_run(at(1, 0), 3, &r, 4_999), "not before");
+        assert!(may_run(at(2, 0), 3, &r, 10_000), "the second again after twice the delay");
+        assert!(!may_run(at(2, 0), 3, &r, 9_999));
+        assert!(!may_run(at(3, 0), 3, &r, 1 << 40), "first run and two attempts: spent");
+        assert!(may_run(at(3, 0), 4, &r, 0), "a new spec is tried at once");
+        assert!(may_run(at(9, 0), 3, &Restart { max_attempts: 0, ..r }, 1 << 40), "no limit");
+        assert!(settles(at(3, 0), &r, 10_000) && !settles(at(3, 0), &r, 9_999) && !settles(None, &r, 1 << 40));
     }
 
     #[test]

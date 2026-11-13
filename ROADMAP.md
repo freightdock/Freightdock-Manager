@@ -147,7 +147,8 @@ Ranked inside the goal:
 5. [x] The rest (2026-11-13): `${VAR}` interpolation (all of Compose's forms) and an env file kept with the stack;
        port ranges; `container_name` and names given at deploy; finished commands pruned past an hour or the newest
        1000 (`CommandsPruned`, each workload's latest kept); the restart policy (`restart`, `deploy.restart_policy`:
-       condition, delay, max_attempts, window). Networks between a stack's services came with G9.
+       condition, delay, max_attempts, window; a limit's attempts kept in the state from 2026-11-13, `WorkloadAttempted`
+       and `WorkloadSettled`, so a manager that takes over counts on). Networks between a stack's services came with G9.
 6. [x] A deploy's options (owner, 2026-11-13: "a lable selector, and a way to choose the state of the stack ... a
        custom name ... a description"): `StackOptions` kept with the stack, applied over the file
        (`compose::apply_options`): description, env file, label selector, mode (stateless, pinned, shared storage),

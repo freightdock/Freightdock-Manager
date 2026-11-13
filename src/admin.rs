@@ -1006,7 +1006,7 @@ mod tests {
     #[test]
     fn a_workload_s_last_command_is_the_latest_on_the_node_it_is_on_now() {
         let mut s = crate::state::tests::cluster();
-        s.workloads.insert("a.web.1".into(), crate::state::Workload { id: "a.web.1".into(), stack: "a".into(), service: "web".into(), slot: 1, node_id: Some("new".into()), spec: crate::state::tests::spec("nginx", 1), generation: 1, host: None, leaving: None });
+        s.workloads.insert("a.web.1".into(), crate::state::Workload { id: "a.web.1".into(), stack: "a".into(), service: "web".into(), slot: 1, node_id: Some("new".into()), spec: crate::state::tests::spec("nginx", 1), generation: 1, host: None, leaving: None, attempts: None });
         let on = |id: &str, node: &str, at| CommandRecord { op: crate::state::Op::RemoveContainer { workload_id: "a.web.1".into() }, created_at: at, ..crate::state::tests::command(id, node) };
         s.commands.insert("run".into(), on("run", "new", 5));
         s.commands.insert("cleanup".into(), on("cleanup", "old", 9));

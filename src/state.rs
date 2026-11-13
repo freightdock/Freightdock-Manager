@@ -112,6 +112,10 @@ pub enum Entry {
     StorageRemoved { name: String, at: Ms },
     /// The node a workload moved away from has no copy of it running any more (G5.5).
     WorkloadLeft { workload_id: String, node_id: String, at: Ms },
+    /// A workload with a limit on its attempts was run (again) for its spec `generation`.
+    WorkloadAttempted { workload_id: String, generation: u64, at: Ms },
+    /// It stayed as wanted for its restart window: its attempts count from nothing again.
+    WorkloadSettled { workload_id: String, at: Ms },
     /// The cluster's settings, replaced whole (`settings.rs`).
     SettingsSet { settings: crate::settings::Settings, at: Ms },
     /// A volume for one writer (`stack/volume`) leased to the node about to run its workload. Refused while another
@@ -732,6 +736,18 @@ pub struct Workload {
     /// or once that node is fenced or removed (G5.5). None for a start-first service.
     #[serde(default)]
     pub leaving: Option<String>,
+    /// Its runs in a row for one spec, kept for a service with `max_attempts` so that any manager acting on it counts
+    /// on from the same number (G4.5): cleared once it stays as wanted for its restart window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempts: Option<Attempts>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Attempts {
+    pub generation: u64,
+    pub runs: u32,
+    /// When the last of them was asked for.
+    pub at: Ms,
 }
 
 impl Workload {
@@ -1338,7 +1354,7 @@ impl ClusterState {
                 let taken: std::collections::BTreeSet<String> = self.workloads.values().filter(|w| w.stack != *name).map(Workload::container_name).collect();
                 let mut mine = std::collections::BTreeSet::new();
                 for (id, svc, slot) in Self::wanted(name, services) {
-                    let w = Workload { id, stack: name.clone(), service: svc.clone(), slot, node_id: None, spec: services[&svc].for_workload(slot), generation: 0, host: None, leaving: None };
+                    let w = Workload { id, stack: name.clone(), service: svc.clone(), slot, node_id: None, spec: services[&svc].for_workload(slot), generation: 0, host: None, leaving: None, attempts: None };
                     let n = w.container_name();
                     if taken.contains(&n) || !mine.insert(n) {
                         return Err(Rejected::NameTaken);
@@ -1386,7 +1402,7 @@ impl ClusterState {
                             }
                         }
                         None => {
-                            self.workloads.insert(id.clone(), Workload { id: id.clone(), stack: name.clone(), service: svc.clone(), slot: *slot, node_id: placements.get(id).cloned(), spec, generation: index, host: None, leaving: None });
+                            self.workloads.insert(id.clone(), Workload { id: id.clone(), stack: name.clone(), service: svc.clone(), slot: *slot, node_id: placements.get(id).cloned(), spec, generation: index, host: None, leaving: None, attempts: None });
                         }
                     }
                 }
@@ -1448,6 +1464,17 @@ impl ClusterState {
                     && w.leaving.as_deref() == Some(node_id.as_str())
                 {
                     w.leaving = None;
+                }
+            }
+            Entry::WorkloadAttempted { workload_id, generation, at } => {
+                if let Some(w) = self.workloads.get_mut(workload_id) {
+                    let runs = w.attempts.filter(|a| a.generation == *generation).map_or(1, |a| a.runs.saturating_add(1));
+                    w.attempts = Some(Attempts { generation: *generation, runs, at: *at });
+                }
+            }
+            Entry::WorkloadSettled { workload_id, .. } => {
+                if let Some(w) = self.workloads.get_mut(workload_id) {
+                    w.attempts = None;
                 }
             }
             Entry::SettingsSet { settings, .. } => {
@@ -2175,6 +2202,22 @@ pub(crate) mod tests {
             }
             _ => unreachable!(),
         }
+    }
+
+    #[test]
+    fn a_workload_s_attempts_are_counted_per_spec_in_the_state_until_it_settles() {
+        let mut s = with_nodes(&["a"]);
+        let services = crate::compose::parse("services:\n  job:\n    image: x\n    restart: on-failure:2\n").unwrap().services;
+        next(&mut s, &Entry::StackDeployed { name: "st".into(), compose: String::new(), services, placements: [("st.job.1".to_string(), "a".to_string())].into(), at: 1, nodes: vec![], exposures: None, volumes: Default::default(), options: Default::default() }).unwrap();
+        let g = s.workloads["st.job.1"].generation;
+        next(&mut s, &Entry::WorkloadAttempted { workload_id: "st.job.1".into(), generation: g, at: 10 }).unwrap();
+        next(&mut s, &Entry::WorkloadAttempted { workload_id: "st.job.1".into(), generation: g, at: 20 }).unwrap();
+        assert_eq!(s.workloads["st.job.1"].attempts, Some(Attempts { generation: g, runs: 2, at: 20 }));
+        next(&mut s, &Entry::WorkloadAttempted { workload_id: "st.job.1".into(), generation: g + 7, at: 30 }).unwrap();
+        assert_eq!(s.workloads["st.job.1"].attempts, Some(Attempts { generation: g + 7, runs: 1, at: 30 }), "a new spec counts from one");
+        next(&mut s, &Entry::WorkloadSettled { workload_id: "st.job.1".into(), at: 40 }).unwrap();
+        assert_eq!(s.workloads["st.job.1"].attempts, None);
+        next(&mut s, &Entry::WorkloadAttempted { workload_id: "gone".into(), generation: 1, at: 50 }).unwrap();
     }
 
     #[test]
