@@ -70,6 +70,9 @@ pub enum Entry {
         #[serde(default)]
         options: StackOptions,
     },
+    /// Workloads of a stack put on other nodes, their specs as they were: the leader's, when one is on a node that no
+    /// longer qualifies (its labels changed). Refused unless each is the stack's and each node enrolled.
+    StackPlaced { name: String, placements: BTreeMap<String, String>, at: Ms },
     /// The stack's workloads are to run (`stopped: false`) or not.
     StackStopped { name: String, stopped: bool, at: Ms },
     /// The stack and its workloads are gone from the state; the workers' reconcile removes their containers.
@@ -528,6 +531,10 @@ pub struct Placement {
     /// What each workload is counted as taking from its node (Compose `deploy.resources.reservations`).
     #[serde(default)]
     pub reserve: Resources,
+    /// Services never on a node with one of its workloads (anti-affinity, `x-freightdock.apart`): a service of the
+    /// stack, or `<stack>/<service>`. It holds both ways.
+    #[serde(default)]
+    pub apart: Vec<String>,
 }
 
 impl ServiceSpec {
@@ -1368,6 +1375,20 @@ impl ClusterState {
                 };
                 self.stacks.insert(name.clone(), Stack { name: name.clone(), compose: compose.clone(), services: services.clone(), stopped: false, created_at, updated_at: *at, net, exposures, nodes: nodes.clone(), volumes: volumes.clone(), options: options.clone() });
             }
+            Entry::StackPlaced { name, placements, at } => {
+                if placements.keys().any(|id| self.workloads.get(id).is_none_or(|w| w.stack != *name)) {
+                    return Err(Rejected::StackUnknown);
+                }
+                if placements.values().any(|n| !self.nodes.contains_key(n)) {
+                    return Err(Rejected::NodeUnknown);
+                }
+                for (id, n) in placements {
+                    self.workloads.get_mut(id).expect("checked").node_id = Some(n.clone());
+                }
+                if let Some(st) = self.stacks.get_mut(name) {
+                    st.updated_at = *at;
+                }
+            }
             Entry::StackExposed { name, exposures, at } => {
                 let st = self.stacks.get(name).ok_or(Rejected::StackUnknown)?;
                 self.check_exposures(name, &st.services, exposures)?;
@@ -1656,6 +1677,18 @@ pub(crate) mod tests {
         assert_eq!(s.workloads["c.x.1"].container_name(), "c-x-1");
         assert_eq!(next(&mut s, &deploy("b", &[("db", named("c-x-1", 1))], &[("b.db.1", "n1")])), Err(Rejected::NameTaken), "another's own name");
         assert_eq!(next(&mut s, &deploy("b", &[("db", named("Bad_", 1))], &[("b.db.1", "n1")])), Err(Rejected::BadName));
+    }
+
+    #[test]
+    fn a_stack_s_workloads_are_placed_again_only_on_nodes_there_are() {
+        let mut s = with_nodes(&["n1", "n2"]);
+        next(&mut s, &deploy("a", &[("web", spec("x", 1))], &[("a.web.1", "n1")])).unwrap();
+        let g = s.workloads["a.web.1"].generation;
+        let placed = |p: &[(&str, &str)]| Entry::StackPlaced { name: "a".into(), placements: p.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(), at: 9 };
+        assert_eq!(next(&mut s, &placed(&[("a.web.1", "n9")])), Err(Rejected::NodeUnknown));
+        assert_eq!(next(&mut s, &placed(&[("b.web.1", "n2")])), Err(Rejected::StackUnknown), "not a workload of the stack");
+        next(&mut s, &placed(&[("a.web.1", "n2")])).unwrap();
+        assert_eq!((s.workloads["a.web.1"].node_id.as_deref(), s.workloads["a.web.1"].generation), (Some("n2"), g), "moved, its spec as it was");
     }
 
     #[test]

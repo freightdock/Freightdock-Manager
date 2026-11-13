@@ -85,6 +85,20 @@ pub fn place(s: &ClusterState, stack: &str, services: &BTreeMap<String, ServiceS
         let meets: Vec<&Node> = nodes.iter().copied().filter(|n| p.constraints.iter().all(|c| c.holds(n))).collect();
         let free: Vec<&Node> = meets.iter().copied().filter(|n| held.get(n.id.as_str()).is_none_or(|h| h.ports.is_disjoint(&needs))).collect();
         let room: Vec<&Node> = free.iter().copied().filter(|n| fits(n, &held.get(n.id.as_str()).map(|h| h.reserved).unwrap_or_default(), &p.reserve)).collect();
+        // Kept apart (both ways): from this stack's services as placed so far, and from other stacks' as they are.
+        let apart = |other_stack: &str, other: &str, other_spec: Option<&ServiceSpec>| {
+            let (mine, theirs) = if other_stack == stack { (other.to_string(), svc.to_string()) } else { (format!("{other_stack}/{other}"), format!("{stack}/{svc}")) };
+            p.apart.contains(&mine) || other_spec.is_some_and(|o| o.placement.apart.contains(&theirs))
+        };
+        let away: Vec<&Node> = room
+            .iter()
+            .copied()
+            .filter(|n| {
+                let here_mine = replicas.iter().any(|(sv, on)| *on == n.id && *sv != svc.as_str() && apart(stack, sv, services.get(*sv)));
+                let here_other = s.workloads.values().any(|w| w.stack != stack && w.node_id.as_deref() == Some(n.id.as_str()) && apart(&w.stack, &w.service, spec_of(w)));
+                !here_mine && !here_other
+            })
+            .collect();
         let why = if nodes.is_empty() && !only.is_empty() {
             Some(format!("none of the nodes chosen for it can take it now ({})", only.join(", ")))
         } else if nodes.is_empty() {
@@ -95,6 +109,8 @@ pub fn place(s: &ClusterState, stack: &str, services: &BTreeMap<String, ServiceS
             Some("every node that could already publishes one of its host ports".to_string())
         } else if room.is_empty() {
             Some("none has room for its reservation".to_string())
+        } else if away.is_empty() {
+            Some(format!("every node that could holds a service it is kept apart from ({})", p.apart.join(", ")))
         } else {
             None
         };
@@ -116,7 +132,7 @@ pub fn place(s: &ClusterState, stack: &str, services: &BTreeMap<String, ServiceS
             let load = held.get(n.id.as_str()).map_or(0, |h| h.load);
             (misses, spread, here, load, n.id.clone())
         };
-        let node = room.into_iter().min_by_key(|n| score(n)).expect("room is not empty");
+        let node = away.into_iter().min_by_key(|n| score(n)).expect("away is not empty");
         let h = held.entry(node.id.as_str()).or_default();
         h.load += 1;
         h.ports.extend(needs);
@@ -126,6 +142,20 @@ pub fn place(s: &ClusterState, stack: &str, services: &BTreeMap<String, ServiceS
         out.insert(id.clone(), node.id.clone());
     }
     Ok(out)
+}
+
+/// The workloads to put on other nodes: of each stack, those on a node that no longer qualifies (its labels changed,
+/// or it is no longer one chosen for the stack) and that `place` has another for. One with nowhere to go stays.
+pub fn replacements(s: &ClusterState, eligible: &[String]) -> Vec<(String, BTreeMap<String, String>)> {
+    let mut out = vec![];
+    for st in s.stacks.values() {
+        let Ok(p) = place(s, &st.name, &st.services, eligible, &st.nodes) else { continue };
+        let moves: BTreeMap<String, String> = p.into_iter().filter(|(id, n)| s.workloads.get(id).and_then(|w| w.node_id.as_ref()).is_some_and(|on| on != n)).collect();
+        if !moves.is_empty() {
+            out.push((st.name.clone(), moves));
+        }
+    }
+    out
 }
 
 /// The op that brings one workload from what its node reported to what the state wants, if one is needed.
@@ -460,6 +490,39 @@ mod tests {
         let p = place(&s, "st", &svc(&[("w", with(spec("w", 2), |x| x.placement.spread = vec!["zone".into()]))]), &all, &[]).unwrap();
         let zones: BTreeSet<&str> = p.values().map(|n| if n == "c" { "2" } else { "1" }).collect();
         assert_eq!(zones.len(), 2, "one per zone: {p:?}");
+    }
+
+    #[test]
+    fn services_kept_apart_never_share_a_node_either_way() {
+        let s = sized(&[("a", &[], 4, 1024), ("b", &[], 4, 1024), ("c", &[], 4, 1024)]);
+        let all = eligible(&["a", "b", "c"]);
+        let apart = |sp: ServiceSpec, from: &[&str]| with(sp, |x| x.placement.apart = from.iter().map(|f| f.to_string()).collect());
+        let p = place(&s, "st", &svc(&[("db", spec("pg", 2)), ("cache", apart(spec("redis", 1), &["db"]))]), &all, &[]).unwrap();
+        assert!(p["st.cache.1"] != p["st.db.1"] && p["st.cache.1"] != p["st.db.2"], "{p:?}");
+        let p = place(&s, "st", &svc(&[("db", apart(spec("pg", 2), &["cache"])), ("cache", spec("redis", 1))]), &all, &[]).unwrap();
+        assert!(p["st.cache.1"] != p["st.db.1"] && p["st.cache.1"] != p["st.db.2"], "named on the other side: {p:?}");
+        let e = place(&s, "st", &svc(&[("db", spec("pg", 1)), ("cache", apart(spec("redis", 1), &["db"]))]), &eligible(&["a"]), &[]).unwrap_err();
+        assert!(e.contains("apart"), "{e}");
+        let mut s = s;
+        let p = place(&s, "other", &svc(&[("pg", spec("pg", 1))]), &all, &[]).unwrap();
+        deploy(&mut s, "other", &svc(&[("pg", spec("pg", 1))]), p.clone());
+        let q = place(&s, "st", &svc(&[("x", apart(spec("x", 1), &["other/pg"]))]), &all, &[]).unwrap();
+        assert_ne!(q["st.x.1"], p["other.pg.1"], "another stack's service too");
+    }
+
+    #[test]
+    fn a_workload_left_on_a_node_that_no_longer_qualifies_is_placed_again() {
+        let mut s = sized(&[("a", &["zone=1"], 4, 1024), ("b", &["zone=2"], 4, 1024)]);
+        let all = eligible(&["a", "b"]);
+        let one = svc(&[("x", with(spec("x", 1), |x| x.placement.constraints = vec![c("node.labels.zone==1")])), ("y", spec("y", 1))]);
+        let p = place(&s, "st", &one, &all, &[]).unwrap();
+        deploy(&mut s, "st", &one, p);
+        assert!(replacements(&s, &all).is_empty(), "every workload where it may be");
+        s.nodes.get_mut("a").unwrap().labels.insert("zone".into(), "2".into());
+        s.nodes.get_mut("b").unwrap().labels.insert("zone".into(), "1".into());
+        assert_eq!(replacements(&s, &all), vec![("st".to_string(), [("st.x.1".to_string(), "b".to_string())].into())], "x follows its label; y stays");
+        s.nodes.get_mut("b").unwrap().labels.insert("zone".into(), "3".into());
+        assert!(replacements(&s, &all).is_empty(), "nowhere to go: it stays where it is");
     }
 
     #[test]

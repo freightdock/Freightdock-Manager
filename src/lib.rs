@@ -362,6 +362,25 @@ pub const EXPIRY_GRACE_MS: i64 = 5_000;
 
 impl Manager {
     /// Marks pending commands past their deadline as expired. Run every second by `housekeeping`.
+    /// The leader puts a workload whose node no longer qualifies (its labels changed, or it is no longer chosen for
+    /// its stack) on one that does (`stacks::replacements`); the reconcile moves its container.
+    pub async fn replace_round(&self) {
+        if self.store.leader() != Some(self.store.id) {
+            return;
+        }
+        let todo = self.store.read(|s| stacks::replacements(s, &self.eligible(s)));
+        for (name, placements) in todo {
+            let what = placements.iter().map(|(w, n)| format!("{w} to {}", &n[..n.len().min(8)])).collect::<Vec<_>>().join(", ");
+            match self.store.propose(Entry::StackPlaced { name: name.clone(), placements, at: now_ms() }).await {
+                Ok(_) => {
+                    tracing::info!(stack = %name, "placed again, its nodes no longer qualifying: {what}");
+                    self.events.push("stack_placed", None, format!("stack {name}: {what} (its node no longer qualifies)"));
+                }
+                Err(e) => tracing::debug!(stack = %name, "not placed again: {e}"),
+            }
+        }
+    }
+
     /// The leader drops finished commands (`ClusterState::prunable`): kept an hour, and at most [`COMMANDS_KEPT`],
     /// so the state does not grow with every run. In batches, so no one entry is large.
     pub async fn prune_commands(&self) {
@@ -437,11 +456,16 @@ pub async fn housekeeping(m: Arc<Manager>) {
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut pruned = std::time::Instant::now();
+    let mut ticks: u64 = 0;
     loop {
+        ticks += 1;
         tick.tick().await;
         if pruned.elapsed() >= Duration::from_secs(60) {
             pruned = std::time::Instant::now();
             m.prune_commands().await;
+        }
+        if ticks.is_multiple_of(5) {
+            m.replace_round().await;
         }
         m.quorum_guard();
         m.gather_heard().await;

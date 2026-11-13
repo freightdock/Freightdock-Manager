@@ -86,6 +86,16 @@ pub fn parse_with(text: &str, env: &BTreeMap<String, String>) -> Result<Parsed, 
     if services.is_empty() {
         return Err("the Compose file has no services".into());
     }
+    for (name, spec) in &services {
+        for other in &spec.placement.apart {
+            if other == name {
+                return Err(format!("service {name}: x-freightdock.apart: a service is not kept apart from itself"));
+            }
+            if !other.contains('/') && !services.contains_key(other) {
+                return Err(format!("service {name}: x-freightdock.apart: the stack has no service {other} (another stack's is <stack>/<service>)"));
+            }
+        }
+    }
     Ok(Parsed { services, warnings, volumes })
 }
 
@@ -635,6 +645,9 @@ fn freightdock(v: &Value, spec: &mut ServiceSpec) -> Result<(), String> {
     for (k, v) in mapping(v, "x-freightdock")? {
         match key(k)?.as_str() {
             "ha" => spec.ha = v.as_bool().ok_or("x-freightdock.ha is true or false")?,
+            "apart" => {
+                spec.placement.apart = v.as_sequence().ok_or("x-freightdock.apart is a list of services")?.iter().map(|x| x.as_str().map(str::to_string).ok_or("x-freightdock.apart is a list of services")).collect::<Result<_, _>>()?;
+            }
             k => return Err(format!("x-freightdock.{k} is not known")),
         }
     }
@@ -802,6 +815,14 @@ volumes:
             let mut p = parse(y).unwrap();
             assert!(apply_options(&mut p, &StackOptions { names: [(bad.0.to_string(), bad.1.to_string())].into(), ..Default::default() }).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn services_are_kept_apart_with_x_freightdock_apart() {
+        let p = parse("services:\n  a:\n    image: x\n    x-freightdock: {apart: [b, shop/db]}\n  b:\n    image: y\n").unwrap();
+        assert_eq!(p.services["a"].placement.apart, vec!["b", "shop/db"]);
+        assert!(parse("services:\n  a:\n    image: x\n    x-freightdock: {apart: [a]}\n").unwrap_err().contains("itself"));
+        assert!(parse("services:\n  a:\n    image: x\n    x-freightdock: {apart: [nope]}\n").unwrap_err().contains("nope"));
     }
 
     #[test]
