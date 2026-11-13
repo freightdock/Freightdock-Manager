@@ -5,7 +5,7 @@ Wants=network-online.target
 
 [Service]
 # Settings in /etc/freightdock/manager.env, e.g.
-#   FREIGHTDOCK_MANAGER_ADVERTISE=10.0.0.11:7450
+#   FREIGHTDOCK_MANAGER_ADVERTISE=192.0.2.11:7450
 EnvironmentFile=-/etc/freightdock/manager.env
 Environment=FREIGHTDOCK_MANAGER_DATA=/var/lib/freightdock-manager
 ExecStart=/usr/local/bin/freightdock-manager serve

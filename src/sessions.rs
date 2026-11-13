@@ -348,7 +348,7 @@ mod tests {
     }
 
     fn heard(node: &str, ms: u64) -> HeardNode {
-        HeardNode { node_id: node.into(), heard_ms_ago: ms, connected_for_ms: 60_000, peer: "10.0.0.9:1".into(), resources: None, workloads: None, network: None, traffic: None }
+        HeardNode { node_id: node.into(), heard_ms_ago: ms, connected_for_ms: 60_000, peer: "192.0.2.9:1".into(), resources: None, workloads: None, network: None, traffic: None }
     }
 
     #[test]
@@ -360,7 +360,7 @@ mod tests {
         let l = s.liveness("n");
         assert_eq!(l.health, Health::Healthy, "the freshest word counts: {l:?}");
         assert_eq!(l.via.as_deref(), Some("m3:7450"));
-        assert_eq!(l.peer.as_deref(), Some("10.0.0.9:1"));
+        assert_eq!(l.peer.as_deref(), Some("192.0.2.9:1"));
         // Its own session wins when it is fresher.
         let (tx, _rx) = mpsc::channel(1);
         s.open("n", tx, "here".into(), None);

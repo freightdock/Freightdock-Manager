@@ -47,10 +47,10 @@ static and run on any x86_64 Linux with systemd:
 
 ```sh
 Freightdock-Manager/deploy/build-static.sh                               # -> dist/freightdock-manager, dist/freightdock-worker
-Freightdock-Manager/deploy/install-node.sh first  10.0.0.11              # manager + worker: a whole cluster on one node
-Freightdock-Manager/deploy/install-node.sh join   10.0.0.12 10.0.0.11    # another manager + worker, joining it
-Freightdock-Manager/deploy/install-node.sh join   10.0.0.13 10.0.0.11    # a third (managers go 1, 3, 5)
-Freightdock-Manager/deploy/install-node.sh worker 10.0.0.21 10.0.0.11    # a worker only
+Freightdock-Manager/deploy/install-node.sh first  192.0.2.11              # manager + worker: a whole cluster on one node
+Freightdock-Manager/deploy/install-node.sh join   192.0.2.12 192.0.2.11    # another manager + worker, joining it
+Freightdock-Manager/deploy/install-node.sh join   192.0.2.13 192.0.2.11    # a third (managers go 1, 3, 5)
+Freightdock-Manager/deploy/install-node.sh worker 192.0.2.21 192.0.2.11    # a worker only
 ```
 
 The script works over `ssh root@<host>`; `LABELS=key=value,...` sets the worker's labels, and `UI_IMAGE=<image>`

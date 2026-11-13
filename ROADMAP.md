@@ -11,7 +11,7 @@ Status marks: **[x]** done, **[~]** in progress, **[ ]** not started.
 | Rank | Goal | Why it is here | Needs | Status |
 |---|---|---|---|---|
 | 1 | G1 Manager and worker talk | Everything else rides on this link | | **done** |
-| 2 | G2 The link is hardened and observable | Cheap now, expensive to retrofit; the test cluster must tell us what happens | G1 | **done** but CI (blocked on publishing) |
+| 2 | G2 The link is hardened and observable | Cheap now, expensive to retrofit; the test cluster must tell us what happens | G1 | **done** |
 | 3 | G3 Manager high availability (Raft) | Success criteria 1 and 2 of the first release; changes how every write works, so before anything writes much | G2 | **done** |
 | 4 | G4 Workloads and Compose stacks | The point of the product: deploy and manage stacks across workers | G3 | **done** (first slice; see G4) |
 | 4a | G8 first slice: a Cluster page in Freightdock | Pulled forward (2026-11-11) so every goal from here is seen in the browser as it is built | G3 | **done** |
@@ -101,7 +101,7 @@ While nothing is published the crates point at each other by path (`../Freightdo
 - [x] Static binaries (`Freightdock-Manager/deploy/build-static.sh`) and systemd units.
 - [x] Running on the test cluster (three Proxmox LXCs), all tests in PROGRESS.md passing.
 
-## G2: The link is hardened and observable (done, 2026-11-11, but 6 and 7)
+## G2: The link is hardened and observable (done, 2026-11-11; 6 and 7 since)
 
 Ranked inside the goal:
 
@@ -111,7 +111,10 @@ Ranked inside the goal:
 3. [x] The worker keeps its command journal on disk, so a restart does not forget what it already did.
 4. [x] Node events (connected, disconnected, health changes, enrolled, removed) in memory, `GET /v1/events`.
 5. [x] A `status` CLI command: cluster, managers, nodes and recent events in one view.
-6. [ ] CI for Contracts and Manager (tests, clippy, gitleaks), as Agent has. **Blocked** on publishing (question 2).
+6. [x] CI for Contracts, Network, Manager and Worker (gitleaks with Freightdock's rules, tests, clippy as errors),
+       each checking out the repositories it needs beside it; written 2026-11-13, runs from the first push. Before
+       that push: the earlier commits of Manager hold the test LAN's addresses in PROGRESS.md (the tree no longer
+       does), so publish from a fresh first commit or accept them (the owner's call).
 7. [x] Certificate renewal before expiry. Managers (done 2026-11-12): their server and client certificates (90 days)
        are made again at the first handshake after 30 days (`tls::Rotating`), so a manager that runs for months never
        shows an expired one. Workers (5 years, done 2026-11-12): in its last year the welcome says
@@ -305,4 +308,5 @@ address across nodes later.
    the direct-Docker code goes with the standalone mode.
 7. ~~The deployer's suggested pool address~~ Answered 2026-11-13: a Compose port is offered as an exposure on a free
    pool address, as built ("i think thats fine").
-8. ~~Storage for G11~~ Given 2026-11-13: an NFS share for the test cluster, `192.0.2.190:/export/freightdock`.
+8. ~~Storage for G11~~ Given 2026-11-13: an NFS share on the owner's LAN for the test cluster (its address is not
+   written here).

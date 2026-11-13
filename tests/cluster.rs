@@ -193,12 +193,12 @@ async fn a_worker_heard_by_one_manager_is_healthy_on_all() {
     assert_eq!(a.m.sessions.liveness("n1").health, Health::Unreachable);
 
     let (tx, _rx) = tokio::sync::mpsc::channel(8);
-    b.m.sessions.open("n1", tx, "10.0.0.5:4000".into(), None);
+    b.m.sessions.open("n1", tx, "192.0.2.5:4000".into(), None);
     a.m.gather_heard().await;
     let l = a.m.sessions.liveness("n1");
     assert_eq!(l.health, Health::Healthy, "{l:?}");
     assert_eq!(l.via.as_deref(), Some(b.addr.as_str()), "and a says who hears it");
-    assert_eq!(l.peer.as_deref(), Some("10.0.0.5:4000"));
+    assert_eq!(l.peer.as_deref(), Some("192.0.2.5:4000"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
