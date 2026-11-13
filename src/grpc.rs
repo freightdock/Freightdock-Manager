@@ -174,18 +174,7 @@ impl WorkerSession for SessionSvc {
         }
 
         let (tx, rx) = mpsc::channel(256);
-        let welcome = v1::ManagerMessage {
-            body: Some(manager_message::Body::Welcome(v1::Welcome {
-                cluster_id: m.store.read(|s| s.cluster_id.clone()).unwrap_or_default(),
-                manager_id: m.manager_id.clone(),
-                heartbeat_interval_ms: m.sessions.thresholds.heartbeat.as_millis() as u32,
-                managers: m.managers(),
-                fence_stop_s: m.fencing.stop_s,
-                fence_storage_s: m.fencing.storage_s,
-                fence_reboot_s: m.fencing.reboot_s,
-                renew_certificate: crate::ca::expires_within(cert, RENEW_BEFORE),
-            })),
-        };
+        let welcome = m.welcome(crate::ca::expires_within(cert, RENEW_BEFORE));
         tx.send(Ok(welcome)).await.map_err(|_| Status::cancelled("gone"))?;
         let fenced = hello.fencing_state == v1::FencingState::AwaitingAuthorization as i32;
         let generation = m.sessions.open_fenced(&node_id, tx.clone(), peer.addr.to_string(), hello.workloads.clone(), fenced);

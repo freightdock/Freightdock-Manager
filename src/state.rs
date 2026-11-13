@@ -110,6 +110,8 @@ pub enum Entry {
     StorageAdded { storage: Storage },
     /// Refused while a stack keeps a volume on it.
     StorageRemoved { name: String, at: Ms },
+    /// The cluster's settings, replaced whole (`settings.rs`).
+    SettingsSet { settings: crate::settings::Settings, at: Ms },
     /// A volume for one writer (`stack/volume`) leased to the node about to run its workload. Refused while another
     /// node holds it, unless that node is fenced (or back, fenced, awaiting authorization) or gone: a second writer
     /// never starts while the first may still write (plan 7.2).
@@ -169,6 +171,8 @@ pub enum Rejected {
     VolumeShared,
     /// A volume another node may still be writing to.
     LeaseHeld,
+    /// Settings out of their range or order, or a Proxmox provider that cannot be.
+    BadSettings,
 }
 
 impl std::fmt::Display for Rejected {
@@ -204,6 +208,7 @@ impl std::fmt::Display for Rejected {
             Rejected::BadStorage => "storage is named 1 to 40 of a-z, 0-9 and -; nfs is host:/export with options of letters, digits and = , . _ : - /; path is an absolute directory other than /",
             Rejected::VolumeShared => "a volume for one writer (access: one) is used by one workload only: one service with one replica, or access: many",
             Rejected::LeaseHeld => "another node holds that volume and may still be writing to it",
+            Rejected::BadSettings => "a setting is out of its range or order, or the Proxmox provider's settings do not hold",
         })
     }
 }
@@ -852,6 +857,9 @@ pub struct ClusterState {
     /// Volumes for one writer and the node each is leased to, by `stack/volume`.
     #[serde(default)]
     pub leases: BTreeMap<String, Lease>,
+    /// The cluster's settings; what is not set here each manager takes from its own environment.
+    #[serde(default)]
+    pub settings: crate::settings::Settings,
 }
 
 /// A floating address: on its holder's LAN, answering the published ports as the nodes' own addresses do.
@@ -1404,6 +1412,12 @@ impl ClusterState {
                     return Err(Rejected::StorageExists);
                 }
                 self.storage.insert(storage.name.clone(), storage.clone());
+            }
+            Entry::SettingsSet { settings, .. } => {
+                if settings.check().is_err() {
+                    return Err(Rejected::BadSettings);
+                }
+                self.settings = settings.clone();
             }
             Entry::StorageRemoved { name, .. } => {
                 if !self.storage.contains_key(name) {
@@ -2124,6 +2138,19 @@ pub(crate) mod tests {
             }
             _ => unreachable!(),
         }
+    }
+
+    #[test]
+    fn the_cluster_s_settings_are_replaced_whole_and_checked() {
+        let mut s = with_nodes(&["n1"]);
+        let set = crate::settings::Settings { fence_stop_s: Some(40), ..Default::default() };
+        next(&mut s, &Entry::SettingsSet { settings: set.clone(), at: 1 }).unwrap();
+        assert_eq!(s.settings, set);
+        let bad = crate::settings::Settings { fence_stop_s: Some(0), ..Default::default() };
+        assert_eq!(next(&mut s, &Entry::SettingsSet { settings: bad, at: 2 }), Err(Rejected::BadSettings));
+        assert_eq!(s.settings, set, "unchanged");
+        let old: ClusterState = serde_json::from_str(r#"{"cluster_id":null,"applied":0,"join_tokens":{},"nodes":{},"commands":{}}"#).unwrap();
+        assert_eq!(old.settings, Default::default(), "a state from before has none");
     }
 
     #[test]

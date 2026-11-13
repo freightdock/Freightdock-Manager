@@ -611,3 +611,44 @@ async fn storage_is_given_to_the_cluster_and_a_stack_keeps_its_volumes_on_it() {
     a.server.abort();
 }
 
+
+#[tokio::test]
+async fn the_cluster_s_settings_are_changed_through_the_api_and_win_over_a_manager_s_own() {
+    let a = start(None).await;
+    until("a leader", || a.m.store.leader().is_some()).await;
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap().to_string();
+    tokio::spawn(freightdock_manager::serve_admin_tls(a.m.clone(), l));
+    let admin = Some(a.m.admin_token.as_str());
+    let get = || async { serde_json::from_str::<serde_json::Value>(&https_with(&a.m, &addr, "GET", "/v1/settings", admin, "").await.1).unwrap() };
+    let v = get().await;
+    assert_eq!((v["settings"]["fence_stop_s"]["value"].as_u64(), v["settings"]["fence_stop_s"]["source"].as_str()), (Some(30), Some("default")), "{v}");
+    assert!(v["manager"]["FREIGHTDOCK_MANAGER_BIND"].is_string(), "what only the environment sets is shown: {v}");
+
+    let (s, b) = https_with(&a.m, &addr, "PUT", "/v1/settings", admin, r#"{"fence_stop_s":45,"recovery_delay_s":10}"#).await;
+    assert_eq!(s, 200, "{b}");
+    assert_eq!((a.m.fence().stop_s, a.m.fence().recovery_delay_s), (45, 10));
+    assert_eq!(get().await["settings"]["fence_stop_s"]["source"], "cluster");
+    let Some(freightdock_proto::v1::manager_message::Body::Welcome(w)) = a.m.welcome(false).body else { panic!() };
+    assert_eq!(w.fence_stop_s, 45, "the workers are told");
+
+    let (s, b) = https_with(&a.m, &addr, "PUT", "/v1/settings", admin, r#"{"fence_stop_s":0}"#).await;
+    assert!(s == 400 && b.contains("fence_stop_s"), "{s} {b}");
+    let (s, b) = https_with(&a.m, &addr, "PUT", "/v1/settings", admin, r#"{"suspect_ms":20000}"#).await;
+    assert!(s == 400 && b.contains("unreachable"), "checked with the values in use: {s} {b}");
+    let (s, _) = https_with(&a.m, &addr, "PUT", "/v1/settings", admin, r#"{"fence_stop_s":null}"#).await;
+    assert_eq!((s, a.m.fence().stop_s), (200, 30), "null: back to the manager's own");
+
+    let fp = "AB:".repeat(31) + "AB";
+    let (s, b) = https_with(&a.m, &addr, "PUT", "/v1/settings", admin, &format!(r#"{{"proxmox":{{"url":"https://pve.example","fingerprint":"{fp}","token":"fd@pve!fence=s3cret"}}}}"#)).await;
+    assert_eq!(s, 200, "{b}");
+    assert_eq!(a.m.fence().proxmox.map(|p| p.token), Some("fd@pve!fence=s3cret".to_string()));
+    let v = get().await;
+    assert!(!v.to_string().contains("s3cret"), "the secret never comes back: {v}");
+    assert_eq!(v["settings"]["proxmox"]["token_id"], "fd@pve!fence");
+    let (s, b) = https_with(&a.m, &addr, "POST", "/v1/settings/proxmox/fingerprint", admin, r#"{"url":"https://127.0.0.1:1"}"#).await;
+    assert!(s == 502 && b.contains("127.0.0.1:1"), "{s} {b}");
+    let (s, b) = https_with(&a.m, &addr, "POST", "/v1/settings/proxmox/test", admin, "{}").await;
+    assert!(s == 502 && b.contains("pve.example"), "the stored settings are tried: {s} {b}");
+    a.server.abort();
+}

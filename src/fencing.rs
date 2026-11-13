@@ -148,13 +148,14 @@ impl Manager {
 
     /// The leader's round (see the module).
     pub async fn fence_round(self: &std::sync::Arc<Self>) {
-        if !self.fencing.enabled || self.store.leader() != Some(self.store.id) || self.started.elapsed() < STARTUP_GRACE {
+        let cfg = self.fence();
+        if !cfg.enabled || self.store.leader() != Some(self.store.id) || self.started.elapsed() < STARTUP_GRACE {
             return;
         }
         let nodes: Vec<(crate::state::Node, String)> = self.store.read(|s| s.nodes.values().map(|n| (n.clone(), crate::proxmox::provider_of(n))).collect());
         for (n, provider) in nodes {
             let health = self.sessions.liveness(&n.id).health;
-            if let Some((state, message)) = leader_step(&n.fencing, &provider, health, n.report.is_some(), now_ms(), &self.fencing) {
+            if let Some((state, message)) = leader_step(&n.fencing, &provider, health, n.report.is_some(), now_ms(), &cfg) {
                 self.set_fencing(&n.id, state, &provider, message).await;
             } else if n.fencing.state == FenceState::InProgress && n.fencing.provider == "proxmox" {
                 self.proxmox_task(n);
@@ -171,7 +172,7 @@ impl Manager {
         let m = self.clone();
         tokio::spawn(async move {
             let r = async {
-                let cfg = m.fencing.proxmox.clone().ok_or_else(|| anyhow::anyhow!("this manager has no Proxmox settings (FREIGHTDOCK_FENCE_PROXMOX_URL)"))?;
+                let cfg = m.fence().proxmox.ok_or_else(|| anyhow::anyhow!("the cluster has no Proxmox provider set (Integrations, or FREIGHTDOCK_FENCE_PROXMOX_URL)"))?;
                 let g = crate::proxmox::guest_of(&n)?;
                 crate::proxmox::Proxmox::new(cfg)?.fence(&g, Duration::from_secs(60)).await
             }
@@ -186,9 +187,10 @@ impl Manager {
 
     /// The round for the workers connected here (see the module).
     pub async fn fence_local(&self) {
+        let auto = self.fence().auto_authorize;
         for (id, worker_fenced) in self.sessions.local_fencing() {
             let Some(state) = self.store.read(|s| s.nodes.get(&id).map(|n| n.fencing.state)) else { continue };
-            match local_step(state, worker_fenced, self.fencing.auto_authorize) {
+            match local_step(state, worker_fenced, auto) {
                 Some(LocalStep::Set(to, why)) => self.set_fencing(&id, to, "worker", why.to_string()).await,
                 Some(LocalStep::Authorize) => {
                     if self.authorize(&id, "the managers (automatic)").await.is_ok() {

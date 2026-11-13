@@ -182,6 +182,11 @@ Ranked inside the goal:
        Tried on the test cluster 2026-11-13 against a real Proxmox VE 9 (a token for the workers' LXCs only): a
        worker cut off was requested at 12 s, powered off by Proxmox and fenced, verified, at 16 s (the self-fencing
        path takes about 85 s); started again, it was authorized and at rest within 2 s.
+6. [x] Every setting from the UI (owner, 2026-11-13): the timings, fencing and the Proxmox provider are the
+       cluster's replicated settings (`SettingsSet`, `/v1/settings`, CLI `settings`), each over a manager's own
+       variable; the workers take new timers on the same stream. The UI's Integrations page ("Cluster" 23). Tried on
+       the test cluster: timers changed live on both workers, the Proxmox provider moved from the managers' files into
+       the settings (files removed), and w4 fenced through it, verified, in 8 s.
 
 ## G7: Failure detection and stateless recovery
 

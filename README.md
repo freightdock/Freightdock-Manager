@@ -89,10 +89,35 @@ it, filled in by the manager that sends it, never written to the cluster's state
 | `FREIGHTDOCK_MANAGER_JOIN` | | First start only: join the cluster of the manager at `host[:port]` |
 | `FREIGHTDOCK_MANAGER_JOIN_TOKEN` | | With it: a token from `manager-token` (`FDMT1-...`) |
 | `FREIGHTDOCK_MANAGER_LOCAL_WORKER_TOKEN` | | Leave a worker join token in this file for the worker on this node |
-| `FREIGHTDOCK_HEARTBEAT_MS` | `2000` | How often workers send a heartbeat |
+| `FREIGHTDOCK_HEARTBEAT_MS` | `2000` | How often workers send a heartbeat (a cluster setting too) |
 | `FREIGHTDOCK_SUSPECT_MS` | `5000` | Silent this long: suspect |
 | `FREIGHTDOCK_UNREACHABLE_MS` | `12000` | Silent this long: unreachable (which never means stopped) |
 | `RUST_LOG` | `freightdock_manager=info,warn` | How much it logs |
+
+### The cluster's settings
+
+The timings, fencing and the Proxmox provider are also the cluster's settings, kept in the replicated state and changed
+from the UI's Integrations page, `freightdock-manager settings set k=v ...` (`default` to let one go) or
+`PUT /v1/settings`. A value the cluster sets wins on every manager; one it does not set is the manager's own variable,
+else the default. `GET /v1/settings` says where each comes from and shows what only a manager's environment sets
+(its addresses, data directory, join); the Proxmox token goes in once and never comes back. The workers connected to
+a manager are sent a Welcome again when the heartbeat or the fencing timers change, so they take them on the same
+stream. `POST /v1/settings/proxmox/fingerprint {url}` reads the certificate the API shows (nothing is sent), and
+`POST /v1/settings/proxmox/test` (the settings given, or the ones in use) answers Proxmox's version and each
+worker's guest as Proxmox sees it.
+
+| Setting | Variable | Default |
+|---|---|---|
+| `heartbeat_ms`, `suspect_ms`, `unreachable_ms` | `FREIGHTDOCK_HEARTBEAT_MS`, `_SUSPECT_MS`, `_UNREACHABLE_MS` | 2000, 5000, 12000 |
+| `fence`, `auto_authorize` | `FREIGHTDOCK_FENCE`, `FREIGHTDOCK_FENCE_AUTO_AUTHORIZE` | on, on |
+| `fence_stop_s`, `fence_storage_s`, `fence_reboot_s` | `FREIGHTDOCK_FENCE_STOP_S`, `_STORAGE_S`, `_REBOOT_S` | 30, 15, 15 |
+| `recovery_delay_s` | `FREIGHTDOCK_RECOVERY_DELAY_S` | 0 |
+| `proxmox` (`{url, fingerprint, token}`) | `FREIGHTDOCK_FENCE_PROXMOX_URL`, `_TOKEN_FILE`, `_FINGERPRINT` | none |
+
+```sh
+freightdock-manager settings proxmox https://192.0.2.20:8006 AB:CD:... /root/fence.token
+freightdock-manager settings set fence_stop_s=45 recovery_delay_s=default
+```
 
 ## Admin API
 
@@ -215,6 +240,8 @@ openssl x509 -in /etc/pve/local/pve-ssl.pem -noout -fingerprint -sha256
 | `FREIGHTDOCK_FENCE_PROXMOX_TOKEN_FILE` | none | A file holding `user@realm!name=secret` |
 | `FREIGHTDOCK_FENCE_PROXMOX_FINGERPRINT` | none | The server certificate's SHA-256, `AA:BB:...` |
 | `FREIGHTDOCK_RECOVERY_DELAY_S` | `0` | How long a node stays fenced before its workloads move |
+
+Each of these but `FREIGHTDOCK_FENCE_REBOOT` (a worker's own) is also a cluster setting (above), which wins.
 
 ### Recovery
 

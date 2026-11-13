@@ -35,6 +35,10 @@ freightdock-manager storage ls                  the cluster's shared storage, th
 freightdock-manager storage add <name> nfs <host:/export> [options]   an NFS export the workers mount themselves
 freightdock-manager storage add <name> path <dir>   a directory that is the same shared storage on every node
 freightdock-manager storage rm <name>           take it away (no stack may keep a volume on it)
+freightdock-manager settings                    the cluster's settings, each with where its value comes from
+freightdock-manager settings set <k=v> ...      set some for the whole cluster (v default: back to each manager's own)
+freightdock-manager settings proxmox <https://host:port> <fingerprint> [token-file]   the Proxmox fencing provider
+freightdock-manager settings proxmox off        take it away
 freightdock-manager ca                      the cluster CA's certificate (PEM), for a client of the API over TLS
 freightdock-manager ui <image> [address]|off|status   run the Freightdock UI on the cluster, at https://<address>, an
                                        address of the pool (by default the one it has, else the first free one)
@@ -228,6 +232,52 @@ async fn main() -> Result<()> {
                     call(&config, Method::DELETE, &format!("/v1/floating/{a}"), None).await?;
                 }
                 _ => bail!("{USAGE}"),
+            }
+            Ok(())
+        }
+        Some("settings") => {
+            use reqwest::Method;
+            match args.get(1).map(String::as_str) {
+                None | Some("ls") => {}
+                Some("set") if args.len() > 2 => {
+                    let mut patch = serde_json::Map::new();
+                    for kv in &args[2..] {
+                        let (k, v) = kv.split_once('=').with_context(|| format!("{kv}: a setting is key=value"))?;
+                        let v = match v {
+                            "default" => Value::Null,
+                            "on" | "true" => Value::Bool(true),
+                            "off" | "false" => Value::Bool(false),
+                            n => Value::from(n.parse::<u64>().with_context(|| format!("{k}: a number, on, off or default"))?),
+                        };
+                        patch.insert(k.to_string(), v);
+                    }
+                    call(&config, Method::PUT, "/v1/settings", Some(Value::Object(patch))).await?;
+                }
+                Some("proxmox") => {
+                    let p = match (args.get(2).map(String::as_str), args.get(3), args.get(4)) {
+                        (Some("off"), ..) => Value::Null,
+                        (Some(url), Some(fp), file) => {
+                            let mut p = serde_json::json!({ "url": url, "fingerprint": fp });
+                            if let Some(f) = file {
+                                p["token"] = Value::String(std::fs::read_to_string(f).with_context(|| format!("reading {f}"))?.trim().to_string());
+                            }
+                            p
+                        }
+                        _ => bail!("{USAGE}"),
+                    };
+                    call(&config, Method::PUT, "/v1/settings", Some(serde_json::json!({ "proxmox": p }))).await?;
+                }
+                _ => bail!("{USAGE}"),
+            }
+            let v = call(&config, Method::GET, "/v1/settings", None).await?;
+            println!("{:<20} {:<10} {:<9} DEFAULT", "SETTING", "VALUE", "FROM");
+            for (k, x) in v["settings"].as_object().into_iter().flatten().filter(|(k, _)| *k != "proxmox") {
+                println!("{:<20} {:<10} {:<9} {}", k, x["value"].to_string(), x["source"].as_str().unwrap_or(""), x["default"]);
+            }
+            let p = &v["settings"]["proxmox"];
+            match p.is_null() {
+                true => println!("proxmox              not set"),
+                false => println!("proxmox              {} token {} ({}), certificate {}", p["url"].as_str().unwrap_or(""), p["token_id"].as_str().unwrap_or(""), p["source"].as_str().unwrap_or(""), p["fingerprint"].as_str().unwrap_or("")),
             }
             Ok(())
         }

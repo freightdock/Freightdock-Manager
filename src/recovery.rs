@@ -88,7 +88,7 @@ impl Manager {
         if self.store.leader() != Some(self.store.id) || self.started.elapsed() < crate::fencing::STARTUP_GRACE {
             return;
         }
-        let delay = self.fencing.recovery_delay_s as Ms * 1000;
+        let delay = self.fence().recovery_delay_s as Ms * 1000;
         let now = now_ms();
         let todo: Vec<(Option<String>, Plan)> = self.store.read(|s| {
             let eligible = self.eligible(s);

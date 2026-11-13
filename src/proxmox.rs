@@ -18,7 +18,7 @@ use serde_json::Value;
 
 use crate::state::Node;
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ProxmoxConfig {
     /// `host:port` of the API.
     pub host: String,
@@ -40,21 +40,45 @@ pub fn fingerprint(s: &str) -> Option<String> {
     (h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit())).then_some(h)
 }
 
+/// `https://host[:port][/]` to `host:port` (8006 when not given); nothing but a host and a port.
+pub fn host_of(url: &str) -> Result<String> {
+    let host = url.trim().strip_prefix("https://").context("the Proxmox API's address is https://host:port")?.trim_end_matches('/');
+    let ok = !host.is_empty() && host.bytes().all(|b| b.is_ascii_alphanumeric() || b"-.:[]".contains(&b));
+    anyhow::ensure!(ok, "the Proxmox API's address is https://host:port, nothing after it");
+    Ok(if host.rsplit_once(':').is_some_and(|(_, p)| p.parse::<u16>().is_ok()) && !host.ends_with(']') { host.to_string() } else { format!("{host}:8006") })
+}
+
 impl ProxmoxConfig {
+    /// From the API's address, the token and the certificate's fingerprint, each checked.
+    pub fn checked(url: &str, token: &str, fp: &str) -> Result<Self> {
+        let host = host_of(url)?;
+        let token = token.trim().to_string();
+        let (id, secret) = token.split_once('=').unwrap_or_default();
+        if !id.contains('@') || !id.contains('!') || secret.is_empty() || token.chars().any(char::is_whitespace) {
+            bail!("the Proxmox token is user@realm!tokenid=secret");
+        }
+        let fingerprint = fingerprint(fp).context("the fingerprint is the API certificate's SHA-256 (as Proxmox shows it)")?;
+        Ok(ProxmoxConfig { host, token, fingerprint })
+    }
+
     pub fn from(get: &impl Fn(&str) -> Option<String>) -> Result<Option<Self>> {
         let Some(url) = get("FREIGHTDOCK_FENCE_PROXMOX_URL").map(|u| u.trim().to_string()).filter(|u| !u.is_empty()) else { return Ok(None) };
-        let host = url.strip_prefix("https://").context("FREIGHTDOCK_FENCE_PROXMOX_URL is https://host:port")?.trim_end_matches('/').to_string();
-        let host = if host.contains(':') { host } else { format!("{host}:8006") };
         let token = match (get("FREIGHTDOCK_FENCE_PROXMOX_TOKEN_FILE"), get("FREIGHTDOCK_FENCE_PROXMOX_TOKEN")) {
             (Some(f), _) => std::fs::read_to_string(f.trim()).with_context(|| format!("reading {f}"))?.trim().to_string(),
             (None, Some(t)) => t.trim().to_string(),
             (None, None) => bail!("FREIGHTDOCK_FENCE_PROXMOX_URL needs FREIGHTDOCK_FENCE_PROXMOX_TOKEN_FILE (or _TOKEN)"),
         };
-        if !token.contains('!') || !token.contains('=') {
-            bail!("the Proxmox token is user@realm!tokenid=secret");
-        }
-        let fingerprint = get("FREIGHTDOCK_FENCE_PROXMOX_FINGERPRINT").and_then(|f| fingerprint(&f)).context("FREIGHTDOCK_FENCE_PROXMOX_FINGERPRINT is the API certificate's SHA-256 (as Proxmox shows it)")?;
-        Ok(Some(ProxmoxConfig { host, token, fingerprint }))
+        let fp = get("FREIGHTDOCK_FENCE_PROXMOX_FINGERPRINT").unwrap_or_default();
+        Self::checked(&url, &token, &fp).map(Some).context("the FREIGHTDOCK_FENCE_PROXMOX_* settings")
+    }
+
+    pub fn url(&self) -> String {
+        format!("https://{}", self.host)
+    }
+
+    /// The token's `user@realm!tokenid`, without its secret: what may be shown.
+    pub fn token_id(&self) -> &str {
+        self.token.split_once('=').map_or("", |t| t.0)
     }
 }
 
@@ -117,6 +141,46 @@ impl rustls::client::danger::ServerCertVerifier for PinnedLeaf {
     }
 }
 
+/// Accepts any certificate and keeps the leaf's SHA-256: only to show an administrator what to pin.
+#[derive(Debug)]
+struct Seen {
+    leaf: std::sync::Mutex<Option<String>>,
+    provider: Arc<rustls::crypto::CryptoProvider>,
+}
+
+impl rustls::client::danger::ServerCertVerifier for Seen {
+    fn verify_server_cert(&self, end: &CertificateDer<'_>, _: &[CertificateDer<'_>], _: &rustls::pki_types::ServerName<'_>, _: &[u8], _: rustls::pki_types::UnixTime) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        *self.leaf.lock().expect("seen lock") = Some(freightdock_proto::sha256_hex(end));
+        Err(rustls::Error::General("only looking".into()))
+    }
+
+    fn verify_tls12_signature(&self, message: &[u8], cert: &CertificateDer<'_>, dss: &rustls::DigitallySignedStruct) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.provider.signature_verification_algorithms)
+    }
+
+    fn verify_tls13_signature(&self, message: &[u8], cert: &CertificateDer<'_>, dss: &rustls::DigitallySignedStruct) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.provider.signature_verification_algorithms)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.provider.signature_verification_algorithms.supported_schemes()
+    }
+}
+
+/// The SHA-256 of the certificate the API at `url` shows, read in the handshake, which is then broken off: nothing
+/// is sent. For an administrator to compare with the one Proxmox shows, and pin.
+pub async fn fingerprint_of(url: &str) -> Result<String> {
+    let host = host_of(url)?;
+    let p = Arc::new(rustls::crypto::ring::default_provider());
+    let seen = Arc::new(Seen { leaf: Default::default(), provider: p.clone() });
+    let tls = rustls::ClientConfig::builder_with_provider(p).with_safe_default_protocol_versions()?.dangerous().with_custom_certificate_verifier(seen.clone()).with_no_client_auth();
+    let tcp = tokio::time::timeout(Duration::from_secs(5), tokio::net::TcpStream::connect(&host)).await.map_err(|_| anyhow!("{host} did not answer"))?.with_context(|| format!("connecting to {host}"))?;
+    let name = rustls::pki_types::ServerName::try_from("proxmox").expect("a name");
+    let _ = tokio::time::timeout(Duration::from_secs(5), tokio_rustls::TlsConnector::from(Arc::new(tls)).connect(name, tcp)).await;
+    let fp = seen.leaf.lock().expect("seen lock").clone().with_context(|| format!("{host} showed no certificate"))?;
+    Ok(fp)
+}
+
 pub struct Proxmox {
     cfg: ProxmoxConfig,
     tls: Arc<rustls::ClientConfig>,
@@ -156,6 +220,12 @@ impl Proxmox {
             bail!("Proxmox answered {status}: {}", v.get("message").and_then(Value::as_str).unwrap_or_else(|| std::str::from_utf8(&body).unwrap_or("")).trim());
         }
         Ok(v["data"].clone())
+    }
+
+    /// Proxmox's version: proof that the address, the pin and the token all work.
+    pub async fn version(&self) -> Result<String> {
+        let d = self.call(hyper::Method::GET, "/api2/json/version").await?;
+        d["version"].as_str().map(str::to_string).context("Proxmox gave no version")
     }
 
     pub async fn status(&self, g: &Guest) -> Result<String> {
@@ -240,7 +310,9 @@ mod tests {
                         async move {
                             let auth = req.headers().get("authorization").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
                             seen.lock().unwrap().push(format!("{} {} {}", req.method(), req.uri().path(), auth));
-                            let body = if req.method() == hyper::Method::POST {
+                            let body = if req.uri().path() == "/api2/json/version" {
+                                r#"{"data":{"version":"9.2.26","release":"9.2"}}"#.to_string()
+                            } else if req.method() == hyper::Method::POST {
                                 if stops {
                                     *stopped.lock().unwrap() = true;
                                 }
@@ -276,6 +348,33 @@ mod tests {
         let (cfg, _) = fake(false).await;
         let e = Proxmox::new(cfg).unwrap().fence(&guest(), Duration::from_secs(2)).await.unwrap_err();
         assert!(e.to_string().contains("still says pve1/lxc/110 is running"), "{e}");
+    }
+
+    #[test]
+    fn settings_from_fields_are_checked_like_the_environment() {
+        let fp = "AB:".repeat(31) + "AB";
+        let c = ProxmoxConfig::checked("https://pve.example/", "fd@pve!fence=s3cret", &fp).unwrap();
+        assert_eq!((c.host.as_str(), c.url().as_str(), c.token_id()), ("pve.example:8006", "https://pve.example:8006", "fd@pve!fence"));
+        assert!(ProxmoxConfig::checked("http://pve", "fd@pve!fence=s", &fp).is_err(), "https only");
+        assert!(ProxmoxConfig::checked("https://pve", "nope", &fp).is_err());
+        assert!(ProxmoxConfig::checked("https://pve", "fd@pve!fence=s", "12").is_err());
+        assert!(ProxmoxConfig::checked("https://pve/x y", "fd@pve!fence=s", &fp).is_err(), "a host and port only");
+        let json = serde_json::to_string(&c).unwrap();
+        assert_eq!(serde_json::from_str::<ProxmoxConfig>(&json).unwrap(), c, "kept in the replicated settings");
+    }
+
+    #[tokio::test]
+    async fn the_certificate_s_fingerprint_is_read_from_the_server() {
+        let (cfg, seen) = fake(true).await;
+        assert_eq!(fingerprint_of(&format!("https://{}", cfg.host)).await.unwrap(), cfg.fingerprint);
+        assert!(seen.lock().unwrap().is_empty(), "nothing sent, not even a request");
+        assert!(fingerprint_of("https://127.0.0.1:1").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_test_answers_proxmox_s_version() {
+        let (cfg, _) = fake(true).await;
+        assert_eq!(Proxmox::new(cfg).unwrap().version().await.unwrap(), "9.2.26");
     }
 
     #[tokio::test]

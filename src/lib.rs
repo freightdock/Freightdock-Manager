@@ -11,6 +11,7 @@ pub mod proxmox;
 pub mod raft;
 pub mod recovery;
 pub mod sessions;
+pub mod settings;
 pub mod stacks;
 pub mod state;
 pub mod store;
@@ -74,6 +75,20 @@ fn env_ms(name: &str, default: Duration) -> Result<Duration> {
 
 impl Config {
     /// Where the cluster CA is kept: `ca.pem`, `ca.key`.
+    /// What only the environment sets, for the API to show: the addresses, the data directory, how it joined.
+    pub fn local(&self) -> serde_json::Value {
+        let opt = |a: Option<SocketAddr>| a.map_or("off".to_string(), |a| a.to_string());
+        serde_json::json!({
+            "FREIGHTDOCK_MANAGER_BIND": self.bind.to_string(),
+            "FREIGHTDOCK_MANAGER_API_BIND": opt(self.api_bind),
+            "FREIGHTDOCK_MANAGER_API_TLS_BIND": opt(self.api_tls_bind),
+            "FREIGHTDOCK_MANAGER_ADVERTISE": self.advertise.join(","),
+            "FREIGHTDOCK_MANAGER_DATA": self.data_dir.display().to_string(),
+            "FREIGHTDOCK_MANAGER_JOIN": self.join.as_ref().map_or(String::new(), |j| j.addr.clone()),
+            "FREIGHTDOCK_MANAGER_LOCAL_WORKER_TOKEN": self.local_worker_token.as_ref().map_or(String::new(), |p| p.display().to_string()),
+        })
+    }
+
     pub fn ca_dir(&self) -> PathBuf {
         self.data_dir.join("ca")
     }
@@ -124,7 +139,12 @@ pub struct Manager {
     local_worker_token: Option<PathBuf>,
     /// The reconcile's pace per workload.
     paced: stacks::Paced,
-    pub fencing: fencing::FenceConfig,
+    /// This manager's own settings (its environment over the defaults); the cluster's settings win over them.
+    pub own: settings::Settings,
+    /// What this manager was started with that only its environment sets: shown, not changed, by the API.
+    pub local: serde_json::Value,
+    /// The heartbeat and fencing timers last sent to the workers here, to send them again when they change.
+    timers_sent: std::sync::Mutex<Option<(u32, u32, u32, u32)>>,
     /// When this manager started: the fencing waits a while after it, until it has heard from the workers.
     pub started: std::time::Instant,
     /// Since when this manager has been cut off from a majority of managers, if it is.
@@ -145,6 +165,52 @@ fn kept(path: &std::path::Path, make: impl FnOnce() -> String) -> Result<String>
 }
 
 impl Manager {
+    /// The settings in use: the cluster's where set, else this manager's own.
+    pub fn settings(&self) -> settings::Settings {
+        self.store.read(|s| s.settings.clone()).over(&self.own)
+    }
+
+    pub fn fence(&self) -> fencing::FenceConfig {
+        self.settings().fencing()
+    }
+
+    /// The Welcome a worker gets when it connects, and again when the settings it carries change.
+    pub fn welcome(&self, renew_certificate: bool) -> freightdock_proto::v1::ManagerMessage {
+        let (s, f) = (self.settings(), self.fence());
+        freightdock_proto::v1::ManagerMessage {
+            body: Some(freightdock_proto::v1::manager_message::Body::Welcome(freightdock_proto::v1::Welcome {
+                cluster_id: self.store.read(|s| s.cluster_id.clone()).unwrap_or_default(),
+                manager_id: self.manager_id.clone(),
+                heartbeat_interval_ms: s.thresholds().heartbeat.as_millis() as u32,
+                managers: self.managers(),
+                fence_stop_s: f.stop_s,
+                fence_storage_s: f.storage_s,
+                fence_reboot_s: f.reboot_s,
+                renew_certificate,
+            })),
+        }
+    }
+
+    /// Each second: health is judged by the settings in use, and the workers here are sent a Welcome again when
+    /// the heartbeat or the fencing timers changed, so they take them without reconnecting.
+    pub fn apply_settings(&self) {
+        let (t, f) = (self.settings().thresholds(), self.fence());
+        if self.sessions.thresholds() != t {
+            self.sessions.set_thresholds(t);
+        }
+        let timers = (t.heartbeat.as_millis() as u32, f.stop_s, f.storage_s, f.reboot_s);
+        let before = self.timers_sent.lock().expect("timers lock").replace(timers);
+        if before.is_some_and(|b| b != timers) {
+            let welcome = self.welcome(false);
+            for node in self.sessions.local_nodes() {
+                if let Some(tx) = self.sessions.sender(&node) {
+                    let _ = tx.try_send(Ok(welcome.clone()));
+                }
+            }
+            tracing::info!("settings changed: the workers here were sent the new heartbeat and fencing timers");
+        }
+    }
+
     pub async fn open(config: &Config) -> Result<Arc<Self>> {
         std::fs::create_dir_all(&config.data_dir).with_context(|| format!("making {}", config.data_dir.display()))?;
         // The Raft node id: a number for the manager's whole life, never given to another (openraft's rule).
@@ -169,7 +235,7 @@ impl Manager {
         let manager_id = kept(&config.data_dir.join("manager.id"), || uuid::Uuid::new_v4().to_string())?;
         let admin_token = kept(&config.data_dir.join("admin.token"), || hex::encode(rand::random::<[u8; 32]>()))?;
         let commands = store.commands();
-        let m = Arc::new(Manager { store, events: Default::default(), sessions: Sessions::new(config.thresholds), ca, manager_id, advertise: config.advertise.clone(), admin_token, peer_tls, peer_channels: Default::default(), local_worker_token: config.local_worker_token.clone(), paced: Default::default(), fencing: config.fencing.clone(), started: std::time::Instant::now(), cut_off_since: Default::default(), fence_tasks: Default::default() });
+        let m = Arc::new(Manager { store, events: Default::default(), sessions: Sessions::new(config.thresholds), ca, manager_id, advertise: config.advertise.clone(), admin_token, peer_tls, peer_channels: Default::default(), local_worker_token: config.local_worker_token.clone(), paced: Default::default(), own: settings::Settings::of(&config.thresholds, &config.fencing), local: config.local(), timers_sent: Default::default(), started: std::time::Instant::now(), cut_off_since: Default::default(), fence_tasks: Default::default() });
         tokio::spawn(deliver_applied(Arc::downgrade(&m), commands));
         Ok(m)
     }
@@ -467,6 +533,7 @@ pub async fn housekeeping(m: Arc<Manager>) {
         if ticks.is_multiple_of(5) {
             m.replace_round().await;
         }
+        m.apply_settings();
         m.quorum_guard();
         m.gather_heard().await;
         m.expire_overdue().await;

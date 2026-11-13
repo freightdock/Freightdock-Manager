@@ -30,7 +30,7 @@ impl From<ProposeError> for ApiError {
     fn from(e: ProposeError) -> Self {
         match e {
             ProposeError::Rejected(r @ (Rejected::NodeUnknown | Rejected::CommandUnknown | Rejected::StackUnknown | Rejected::FloatingUnknown | Rejected::StorageUnknown)) => ApiError(StatusCode::NOT_FOUND, r.to_string()),
-            ProposeError::Rejected(r @ (Rejected::BadAddress | Rejected::BadExposure | Rejected::BadStorage | Rejected::VolumeShared)) => ApiError(StatusCode::BAD_REQUEST, r.to_string()),
+            ProposeError::Rejected(r @ (Rejected::BadAddress | Rejected::BadExposure | Rejected::BadStorage | Rejected::VolumeShared | Rejected::BadSettings)) => ApiError(StatusCode::BAD_REQUEST, r.to_string()),
             ProposeError::Rejected(r) => ApiError(StatusCode::CONFLICT, r.to_string()),
             e @ (ProposeError::Unavailable(_) | ProposeError::NotLeader(_)) => ApiError(StatusCode::SERVICE_UNAVAILABLE, e.to_string()),
             ProposeError::Io(e) => {
@@ -95,6 +95,9 @@ pub fn router(m: Arc<Manager>) -> Router {
         .route("/v1/floating/{address}", axum::routing::delete(remove_floating))
         .route("/v1/storage", get(storage).post(add_storage))
         .route("/v1/storage/{name}", axum::routing::delete(remove_storage))
+        .route("/v1/settings", get(settings).put(set_settings))
+        .route("/v1/settings/proxmox/fingerprint", post(proxmox_fingerprint))
+        .route("/v1/settings/proxmox/test", post(proxmox_test))
         .route("/v1/cluster", get(cluster))
         .route("/v1/nodes", get(nodes))
         .route("/v1/nodes/{id}", get(node).delete(remove_node))
@@ -434,6 +437,70 @@ async fn remove_storage(State(m): State<Arc<Manager>>, h: HeaderMap, Path(name):
     m.store.propose(Entry::StorageRemoved { name: name.clone(), at: now_ms() }).await?;
     m.events.push("storage", None, format!("storage {name} removed"));
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// The cluster's settings, each with where its value comes from, and what only this manager's environment sets.
+async fn settings(State(m): State<Arc<Manager>>, h: HeaderMap) -> R<Json<Value>> {
+    authed(&m, &h)?;
+    let cluster = m.store.read(|s| s.settings.clone());
+    Ok(Json(json!({ "settings": crate::settings::view(&cluster, &m.own), "manager_id": m.manager_id, "manager": m.local })))
+}
+
+/// Changes some of the cluster's settings (`Settings::patched`): checked with the values they are used with.
+async fn set_settings(State(m): State<Arc<Manager>>, h: HeaderMap, Json(patch): Json<Value>) -> R<Json<Value>> {
+    authed(&m, &h)?;
+    let bad = |e: String| ApiError(StatusCode::BAD_REQUEST, e);
+    let next = m.store.read(|s| s.settings.clone()).patched(&patch).map_err(bad)?;
+    next.check().map_err(bad)?;
+    next.over(&m.own).check().map_err(bad)?;
+    m.store.propose(Entry::SettingsSet { settings: next.clone(), at: now_ms() }).await?;
+    let keys: Vec<&str> = patch.as_object().into_iter().flatten().map(|(k, _)| k.as_str()).collect();
+    m.events.push("settings", None, format!("settings changed: {}", keys.join(", ")));
+    Ok(Json(json!({ "settings": crate::settings::view(&next, &m.own) })))
+}
+
+#[derive(Deserialize)]
+struct UrlBody {
+    url: String,
+}
+
+/// The certificate the Proxmox API at `url` shows, to compare with the one Proxmox shows and pin.
+async fn proxmox_fingerprint(State(m): State<Arc<Manager>>, h: HeaderMap, Json(b): Json<UrlBody>) -> R<Json<Value>> {
+    authed(&m, &h)?;
+    let fp = crate::proxmox::fingerprint_of(&b.url).await.map_err(|e| ApiError(StatusCode::BAD_GATEWAY, format!("{e:#}")))?;
+    Ok(Json(json!({ "fingerprint": crate::settings::colons(&fp) })))
+}
+
+/// Tries the Proxmox provider: the settings given (`{url, fingerprint, token}`, the token kept when left out) or
+/// the ones in use. Answers Proxmox's version and what it says of each node's guest; changes nothing.
+async fn proxmox_test(State(m): State<Arc<Manager>>, h: HeaderMap, body: Option<Json<Value>>) -> R<Json<Value>> {
+    authed(&m, &h)?;
+    let given = body.map(|b| b.0).filter(|b| b.get("url").is_some());
+    let cfg = match given {
+        Some(p) => m.settings().patched(&json!({ "proxmox": p })).map_err(|e| ApiError(StatusCode::BAD_REQUEST, e))?.proxmox,
+        None => m.fence().proxmox,
+    }
+    .ok_or_else(|| ApiError(StatusCode::BAD_REQUEST, "no Proxmox provider is set".into()))?;
+    let url = cfg.url();
+    let px = crate::proxmox::Proxmox::new(cfg).map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    let version = px.version().await.map_err(|e| ApiError(StatusCode::BAD_GATEWAY, format!("the Proxmox API at {url}: {e:#}")))?;
+    let nodes: Vec<crate::state::Node> = m.store.read(|s| s.nodes.values().filter(|n| crate::proxmox::provider_of(n) == "proxmox").cloned().collect());
+    let mut guests = vec![];
+    for n in nodes {
+        let name = n.all_labels().get("name").cloned().unwrap_or_else(|| n.hostname.clone());
+        let r = match crate::proxmox::guest_of(&n) {
+            Ok(g) => match px.status(&g).await {
+                Ok(st) => json!({ "guest": g.to_string(), "status": st }),
+                Err(e) => json!({ "guest": g.to_string(), "error": format!("{e:#}") }),
+            },
+            Err(e) => json!({ "error": format!("{e:#}") }),
+        };
+        let mut r = r;
+        r["node"] = json!(n.id);
+        r["name"] = json!(name);
+        guests.push(r);
+    }
+    Ok(Json(json!({ "version": version, "guests": guests })))
 }
 
 /// A token for another manager to join with (`FREIGHTDOCK_MANAGER_JOIN_TOKEN`). Good once, an hour by default.

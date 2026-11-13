@@ -14,7 +14,7 @@ use tokio::sync::mpsc;
 
 use freightdock_proto::v1::{HeardNode, ManagerMessage, NodeResources, WorkloadReport, WorkloadState};
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Thresholds {
     pub heartbeat: Duration,
     pub suspect: Duration,
@@ -98,12 +98,21 @@ pub struct Sessions {
     inner: Mutex<(u64, HashMap<String, Session>)>,
     /// Per other manager (by address): when it last reported, and what.
     remote: Mutex<HashMap<String, (Instant, Vec<HeardNode>)>>,
-    pub thresholds: Thresholds,
+    thresholds: std::sync::RwLock<Thresholds>,
 }
 
 impl Sessions {
     pub fn new(thresholds: Thresholds) -> Self {
-        Sessions { inner: Mutex::default(), remote: Mutex::default(), thresholds }
+        Sessions { inner: Mutex::default(), remote: Mutex::default(), thresholds: std::sync::RwLock::new(thresholds) }
+    }
+
+    pub fn thresholds(&self) -> Thresholds {
+        *self.thresholds.read().expect("thresholds lock")
+    }
+
+    /// The cluster's settings changed: health is judged by these from now on.
+    pub fn set_thresholds(&self, t: Thresholds) {
+        *self.thresholds.write().expect("thresholds lock") = t;
     }
 
     /// A new stream for `node`, replacing any older one (whose sender is dropped, which ends it). Answers its
@@ -210,7 +219,7 @@ impl Sessions {
     /// suspect threshold is left out: one cut off without a close stays open here until keepalive ends it, and its
     /// last word is no news of the node now.
     pub fn local_fencing(&self) -> Vec<(String, bool)> {
-        let t = self.thresholds;
+        let t = self.thresholds();
         self.inner.lock().expect("sessions lock").1.iter().filter(|(_, s)| s.last_heard.elapsed() < t.suspect).map(|(id, s)| (id.clone(), s.fenced)).collect()
     }
 
@@ -270,7 +279,7 @@ impl Sessions {
 
     /// Whether manager `via` reported what it hears lately (they do each second): online, as far as this one knows.
     pub fn manager_online(&self, via: &str) -> bool {
-        self.remote.lock().expect("remote lock").get(via).is_some_and(|(at, _)| at.elapsed() < self.thresholds.suspect)
+        self.remote.lock().expect("remote lock").get(via).is_some_and(|(at, _)| at.elapsed() < self.thresholds().suspect)
     }
 
     /// Forgets a manager's reports (it left the cluster).
@@ -306,7 +315,7 @@ impl Sessions {
         let since = best.as_ref().map(|b| b.1);
         let r = best.as_ref().and_then(|b| b.4.as_ref());
         Liveness {
-            health: health(since, &self.thresholds),
+            health: health(since, &self.thresholds()),
             via: best.as_ref().and_then(|b| b.0.clone()),
             last_heard_ms_ago: since.map(|d| d.as_millis() as u64),
             connected_for_ms: best.as_ref().map(|b| b.2.as_millis() as u64),
@@ -463,7 +472,7 @@ mod manager_tests {
         assert!(!s.manager_online("192.0.2.2:7450"), "never heard");
         s.reports("192.0.2.2:7450", vec![]);
         assert!(s.manager_online("192.0.2.2:7450"));
-        s.remote.lock().unwrap().get_mut("192.0.2.2:7450").unwrap().0 = Instant::now() - s.thresholds.suspect;
+        s.remote.lock().unwrap().get_mut("192.0.2.2:7450").unwrap().0 = Instant::now() - s.thresholds().suspect;
         assert!(!s.manager_online("192.0.2.2:7450"), "silent as long as a suspect worker");
     }
 }
