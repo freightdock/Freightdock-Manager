@@ -90,13 +90,16 @@ pub fn place(s: &ClusterState, stack: &str, services: &BTreeMap<String, ServiceS
             let (mine, theirs) = if other_stack == stack { (other.to_string(), svc.to_string()) } else { (format!("{other_stack}/{other}"), format!("{stack}/{svc}")) };
             p.apart.contains(&mine) || other_spec.is_some_and(|o| o.placement.apart.contains(&theirs))
         };
+        let mut in_the_way = BTreeSet::new();
         let away: Vec<&Node> = room
             .iter()
             .copied()
             .filter(|n| {
-                let here_mine = replicas.iter().any(|(sv, on)| *on == n.id && *sv != svc.as_str() && apart(stack, sv, services.get(*sv)));
-                let here_other = s.workloads.values().any(|w| w.stack != stack && w.node_id.as_deref() == Some(n.id.as_str()) && apart(&w.stack, &w.service, spec_of(w)));
-                !here_mine && !here_other
+                let mine: Vec<String> = replicas.iter().filter(|(sv, on)| *on == n.id && *sv != svc.as_str() && apart(stack, sv, services.get(*sv))).map(|(sv, _)| sv.to_string()).collect();
+                let other: Vec<String> = s.workloads.values().filter(|w| w.stack != stack && w.node_id.as_deref() == Some(n.id.as_str()) && apart(&w.stack, &w.service, spec_of(w))).map(|w| format!("{}/{}", w.stack, w.service)).collect();
+                let clear = mine.is_empty() && other.is_empty();
+                in_the_way.extend(mine.into_iter().chain(other));
+                clear
             })
             .collect();
         let why = if nodes.is_empty() && !only.is_empty() {
@@ -110,7 +113,7 @@ pub fn place(s: &ClusterState, stack: &str, services: &BTreeMap<String, ServiceS
         } else if room.is_empty() {
             Some("none has room for its reservation".to_string())
         } else if away.is_empty() {
-            Some(format!("every node that could holds a service it is kept apart from ({})", p.apart.join(", ")))
+            Some(format!("every node that could holds a service it is kept apart from ({})", in_the_way.into_iter().collect::<Vec<_>>().join(", ")))
         } else {
             None
         };
@@ -502,7 +505,7 @@ mod tests {
         let p = place(&s, "st", &svc(&[("db", apart(spec("pg", 2), &["cache"])), ("cache", spec("redis", 1))]), &all, &[]).unwrap();
         assert!(p["st.cache.1"] != p["st.db.1"] && p["st.cache.1"] != p["st.db.2"], "named on the other side: {p:?}");
         let e = place(&s, "st", &svc(&[("db", spec("pg", 1)), ("cache", apart(spec("redis", 1), &["db"]))]), &eligible(&["a"]), &[]).unwrap_err();
-        assert!(e.contains("apart"), "{e}");
+        assert!(e.contains("st.db.1") && e.contains("kept apart from (cache)"), "names the one in the way: {e}");
         let mut s = s;
         let p = place(&s, "other", &svc(&[("pg", spec("pg", 1))]), &all, &[]).unwrap();
         deploy(&mut s, "other", &svc(&[("pg", spec("pg", 1))]), p.clone());
