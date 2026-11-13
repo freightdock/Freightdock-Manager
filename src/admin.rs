@@ -98,6 +98,9 @@ pub fn router(m: Arc<Manager>) -> Router {
         .route("/v1/settings", get(settings).put(set_settings))
         .route("/v1/settings/proxmox/fingerprint", post(proxmox_fingerprint))
         .route("/v1/settings/proxmox/test", post(proxmox_test))
+        .route("/v1/backup", post(take_backup))
+        .route("/v1/backups", get(backups))
+        .route("/v1/backups/{name}", get(backup_file))
         .route("/v1/cluster", get(cluster))
         .route("/v1/nodes", get(nodes))
         .route("/v1/nodes/{id}", get(node).delete(remove_node))
@@ -457,6 +460,42 @@ async fn set_settings(State(m): State<Arc<Manager>>, h: HeaderMap, Json(patch): 
     let keys: Vec<&str> = patch.as_object().into_iter().flatten().map(|(k, _)| k.as_str()).collect();
     m.events.push("settings", None, format!("settings changed: {}", keys.join(", ")));
     Ok(Json(json!({ "settings": crate::settings::view(&next, &m.own) })))
+}
+
+#[derive(Deserialize)]
+struct BackupBody {
+    passphrase: String,
+}
+
+fn backup_response(name: &str, bytes: Vec<u8>) -> Response {
+    ([("content-type", "application/octet-stream".to_string()), ("content-disposition", format!("attachment; filename=\"{name}\""))], bytes).into_response()
+}
+
+/// A backup of the cluster now, sealed with the passphrase given, handed out and kept nowhere.
+async fn take_backup(State(m): State<Arc<Manager>>, h: HeaderMap, Json(b): Json<BackupBody>) -> R<Response> {
+    authed(&m, &h)?;
+    if b.passphrase.chars().count() < crate::backup::MIN_PASSPHRASE {
+        return Err(ApiError(StatusCode::BAD_REQUEST, format!("a backup's passphrase is at least {} characters", crate::backup::MIN_PASSPHRASE)));
+    }
+    let bytes = m.backup(b.passphrase).await.map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    m.events.push("backup", None, "a backup was downloaded".to_string());
+    Ok(backup_response(&crate::backup::file_name(now_ms()), bytes))
+}
+
+/// This manager's scheduled backups, newest first.
+async fn backups(State(m): State<Arc<Manager>>, h: HeaderMap) -> R<Json<Value>> {
+    authed(&m, &h)?;
+    let list: Vec<Value> = crate::backup::list(&crate::backup::dir(&m.data_dir))
+        .into_iter()
+        .map(|(name, size)| json!({ "taken_at": crate::backup::taken_at(&name), "name": name, "size": size, "manager": m.manager_id }))
+        .collect();
+    Ok(Json(json!({ "backups": list })))
+}
+
+async fn backup_file(State(m): State<Arc<Manager>>, h: HeaderMap, Path(name): Path<String>) -> R<Response> {
+    authed(&m, &h)?;
+    let bytes = crate::backup::read(&crate::backup::dir(&m.data_dir), &name).ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "no such backup on this manager".into()))?;
+    Ok(backup_response(&name, bytes))
 }
 
 #[derive(Deserialize)]

@@ -18,6 +18,7 @@ http-body-util = "0.1"
 hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
 libc = "0.2"
 rand = "0.9"
+ring = "0.17"
 reqwest = { version = "0.12", default-features = false, features = ["json"] }
 socket2 = "0.6"
 rcgen = { version = "0.14", features = ["pem", "x509-parser"] }

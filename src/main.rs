@@ -39,6 +39,11 @@ freightdock-manager settings                    the cluster's settings, each wit
 freightdock-manager settings set <k=v> ...      set some for the whole cluster (v default: back to each manager's own)
 freightdock-manager settings proxmox <https://host:port> <fingerprint> [token-file]   the Proxmox fencing provider
 freightdock-manager settings proxmox off        take it away
+freightdock-manager settings backup-passphrase [off]   the passphrase the scheduled backups are sealed with
+                                       (read from FREIGHTDOCK_BACKUP_PASSPHRASE or the first line of stdin)
+freightdock-manager backup <file>           a backup of the cluster (its state and CA), sealed with the passphrase
+freightdock-manager restore <file>          on a new manager, before its first start: bring the backed up cluster
+                                       back (its CA and state); then start it as a new cluster's first manager
 freightdock-manager ca                      the cluster CA's certificate (PEM), for a client of the API over TLS
 freightdock-manager ui <image> [address]|off|status   run the Freightdock UI on the cluster, at https://<address>, an
                                        address of the pool (by default the one it has, else the first free one)
@@ -267,18 +272,41 @@ async fn main() -> Result<()> {
                     };
                     call(&config, Method::PUT, "/v1/settings", Some(serde_json::json!({ "proxmox": p }))).await?;
                 }
+                Some("backup-passphrase") => {
+                    let p = match args.get(2).map(String::as_str) {
+                        Some("off") => Value::Null,
+                        None => Value::String(passphrase()?),
+                        _ => bail!("{USAGE}"),
+                    };
+                    call(&config, Method::PUT, "/v1/settings", Some(serde_json::json!({ "backup_passphrase": p }))).await?;
+                }
                 _ => bail!("{USAGE}"),
             }
             let v = call(&config, Method::GET, "/v1/settings", None).await?;
             println!("{:<20} {:<10} {:<9} DEFAULT", "SETTING", "VALUE", "FROM");
-            for (k, x) in v["settings"].as_object().into_iter().flatten().filter(|(k, _)| *k != "proxmox") {
+            for (k, x) in v["settings"].as_object().into_iter().flatten().filter(|(k, x)| *k != "proxmox" && x.is_object()) {
                 println!("{:<20} {:<10} {:<9} {}", k, x["value"].to_string(), x["source"].as_str().unwrap_or(""), x["default"]);
             }
+            println!("backup_passphrase    {}", if v["settings"]["backup_passphrase_set"] == true { "set" } else { "not set (no scheduled backups)" });
             let p = &v["settings"]["proxmox"];
             match p.is_null() {
                 true => println!("proxmox              not set"),
                 false => println!("proxmox              {} token {} ({}), certificate {}", p["url"].as_str().unwrap_or(""), p["token_id"].as_str().unwrap_or(""), p["source"].as_str().unwrap_or(""), p["fingerprint"].as_str().unwrap_or("")),
             }
+            Ok(())
+        }
+        Some("backup") => {
+            let file = args.get(1).context(USAGE)?;
+            let bytes = call_bytes(&config, reqwest::Method::POST, "/v1/backup", Some(serde_json::json!({ "passphrase": passphrase()? }))).await?;
+            freightdock_manager::ca::write_private(std::path::Path::new(file), &bytes)?;
+            println!("wrote {file} ({} bytes): keep it and its passphrase apart", bytes.len());
+            Ok(())
+        }
+        Some("restore") => {
+            let file = args.get(1).context(USAGE)?;
+            let bytes = std::fs::read(file).with_context(|| format!("reading {file}"))?;
+            let cluster = freightdock_manager::backup::stage_restore(&config.data_dir, &bytes, &passphrase()?)?;
+            println!("cluster {cluster} is ready in {}: start this manager now, without FREIGHTDOCK_MANAGER_JOIN, and point the workers' FREIGHTDOCK_MANAGERS at it", config.data_dir.display());
             Ok(())
         }
         Some("storage") => {
@@ -539,7 +567,31 @@ async fn shutdown() {
     let _ = tokio::signal::ctrl_c().await;
 }
 
+/// A backup's passphrase: FREIGHTDOCK_BACKUP_PASSPHRASE, else the first line of stdin. Never an argument (it would
+/// be in the shell's history and the process list).
+fn passphrase() -> Result<String> {
+    let p = match std::env::var("FREIGHTDOCK_BACKUP_PASSPHRASE") {
+        Ok(p) => p,
+        Err(_) => {
+            eprintln!("the backup passphrase (one line on stdin):");
+            let mut line = String::new();
+            std::io::stdin().read_line(&mut line)?;
+            line
+        }
+    };
+    let p = p.trim_end_matches(['\r', '\n']).to_string();
+    if p.chars().count() < freightdock_manager::backup::MIN_PASSPHRASE {
+        bail!("a backup's passphrase is at least {} characters", freightdock_manager::backup::MIN_PASSPHRASE);
+    }
+    Ok(p)
+}
+
 async fn call(config: &Config, method: reqwest::Method, path: &str, body: Option<Value>) -> Result<Value> {
+    let bytes = call_bytes(config, method, path, body).await?;
+    Ok(serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+}
+
+async fn call_bytes(config: &Config, method: reqwest::Method, path: &str, body: Option<Value>) -> Result<Vec<u8>> {
     let addr = config.api_bind.context("the admin API is off (FREIGHTDOCK_MANAGER_API_BIND=off)")?;
     let host = if addr.ip().is_unspecified() { format!("127.0.0.1:{}", addr.port()) } else { addr.to_string() };
     let token = std::fs::read_to_string(config.data_dir.join("admin.token")).with_context(|| format!("reading the admin token in {}", config.data_dir.display()))?;
@@ -549,12 +601,13 @@ async fn call(config: &Config, method: reqwest::Method, path: &str, body: Option
     }
     let r = req.send().await.with_context(|| format!("is the manager running? (http://{host})"))?;
     let status = r.status();
-    let text = r.text().await?;
-    let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+    let bytes = r.bytes().await?.to_vec();
     if !status.is_success() {
+        let text = String::from_utf8_lossy(&bytes);
+        let v: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
         bail!("{status}: {}", v["error"].as_str().unwrap_or(&text));
     }
-    Ok(v)
+    Ok(bytes)
 }
 
 /// How each service of a stack is reached from outside the cluster: on its pool addresses, on every node's address

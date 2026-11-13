@@ -113,11 +113,37 @@ worker's guest as Proxmox sees it.
 | `fence_stop_s`, `fence_storage_s`, `fence_reboot_s` | `FREIGHTDOCK_FENCE_STOP_S`, `_STORAGE_S`, `_REBOOT_S` | 30, 15, 15 |
 | `recovery_delay_s` | `FREIGHTDOCK_RECOVERY_DELAY_S` | 0 |
 | `proxmox` (`{url, fingerprint, token}`) | `FREIGHTDOCK_FENCE_PROXMOX_URL`, `_TOKEN_FILE`, `_FINGERPRINT` | none |
+| `backup_every_h` (0: none), `backup_keep` | | 24, 7 |
+| `backup_passphrase` (set, never shown) | | none: no scheduled backups |
 
 ```sh
 freightdock-manager settings proxmox https://192.0.2.20:8006 AB:CD:... /root/fence.token
 freightdock-manager settings set fence_stop_s=45 recovery_delay_s=default
 ```
+
+### Backups
+
+A backup is the cluster's replicated state (stacks, nodes, storage, settings and secrets, the UI's database) and the
+cluster CA with its key, sealed with a passphrase of at least 12 characters (PBKDF2-HMAC-SHA256, 600 000 rounds, to
+AES-256-GCM). Without the passphrase it is unreadable; with it, it is the whole cluster, so keep the two apart. The
+passphrase is read from `FREIGHTDOCK_BACKUP_PASSPHRASE` or the first line of stdin, never taken as an argument.
+
+```sh
+freightdock-manager backup /root/cluster.fdbk            # one now, from the running manager
+freightdock-manager settings backup-passphrase           # scheduled backups: each manager writes to <data>/backups/
+freightdock-manager settings set backup_every_h=12 backup_keep=14
+```
+
+To bring a lost cluster back, on a new manager before its first start:
+
+```sh
+freightdock-manager restore /root/cluster.fdbk           # the CA in place, the state staged in <data>/restore.json
+systemctl start freightdock-manager                      # as a new cluster's first manager (no FREIGHTDOCK_MANAGER_JOIN)
+```
+
+It starts as the cluster it was: the same identity and CA, so the workers' certificates are still good; point their
+`FREIGHTDOCK_MANAGERS` at it if its address changed, then join the other managers to it. Commands that were not yet
+sent are expired, never sent twice. A data folder where a manager has already run is refused.
 
 ## Admin API
 
@@ -138,6 +164,8 @@ a client trusts that CA alone and checks that name. `GET /v1/health` and `GET /v
 | `POST /v1/manager-tokens` | `{"ttl_s": 3600}` gives `{"token": "FDMT1-..."}`, for a manager |
 | `GET /v1/events?after=&node=` | recent node events |
 | `GET /v1/recoveries?stack=` | the recovery history, newest first |
+| `POST /v1/backup` | `{"passphrase"}`: a sealed backup of the cluster now, as a download (kept nowhere) |
+| `GET /v1/backups`, `GET /v1/backups/{name}` | this manager's scheduled backups (`name`, `taken_at`, `size`, `manager`), newest first; one as a download |
 | `GET /v1/api-tokens`, `POST /v1/api-tokens`, `DELETE /v1/api-tokens/{id}` | API tokens: `{"name", "role": "read" or "admin"}` gives the token once |
 | `GET /v1/ca` | the cluster CA's certificate (PEM), no token |
 | `GET /v1/floating`, `POST /v1/floating`, `DELETE /v1/floating/{address}` | the pool of floating addresses (G10.3), each with its holder and what stacks expose on it; `{"address"}` adds one (400 if not a LAN's unicast IPv4 address outside 10.240.0.0/16, 409 if there) or a range, `192.0.2.10-20` or `192.0.2.8/29` (at most 1024, those already there kept), answering `{"added": n}`; an address is announced on the LAN only once a stack exposes on it; one in use is not removed (409) |

@@ -22,7 +22,10 @@ fn free_port() -> u16 {
 
 /// A manager: a new cluster's first, or joining through another manager with a manager join token.
 async fn start(join: Option<(&str, String)>) -> Running {
-    let dir = tempfile::tempdir().unwrap();
+    start_in(tempfile::tempdir().unwrap(), join).await
+}
+
+async fn start_in(dir: tempfile::TempDir, join: Option<(&str, String)>) -> Running {
     let port = free_port();
     let addr = format!("127.0.0.1:{port}");
     let join = join.map(|(a, token)| Join { addr: a.to_string(), token });
@@ -276,6 +279,12 @@ async fn https(m: &Manager, addr: &str, method: &str, path: &str, token: Option<
 }
 
 async fn https_with(m: &Manager, addr: &str, method: &str, path: &str, token: Option<&str>, body: &str) -> (u16, String) {
+    let (s, b) = https_bytes(m, addr, method, path, token, body).await;
+    (s, String::from_utf8_lossy(&b).into_owned())
+}
+
+/// As `https_with`, the body as bytes (a backup is not text).
+async fn https_bytes(m: &Manager, addr: &str, method: &str, path: &str, token: Option<&str>, body: &str) -> (u16, Vec<u8>) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut roots = rustls::RootCertStore::empty();
     roots.add(m.ca.cert_der.clone()).unwrap();
@@ -286,10 +295,12 @@ async fn https_with(m: &Manager, addr: &str, method: &str, path: &str, token: Op
     let mut tls = tokio_rustls::TlsConnector::from(Arc::new(cfg)).connect(name, tcp).await.unwrap();
     let auth = token.map(|t| format!("Authorization: Bearer {t}\r\n")).unwrap_or_default();
     tls.write_all(format!("{method} {path} HTTP/1.1\r\nHost: m\r\n{auth}Content-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
-    let mut out = String::new();
-    let _ = tls.read_to_string(&mut out).await;
-    let status = out.split(' ').nth(1).and_then(|s| s.parse().ok()).unwrap_or(0);
-    (status, out.split("\r\n\r\n").nth(1).unwrap_or("").to_string())
+    let mut out = Vec::new();
+    let _ = tls.read_to_end(&mut out).await;
+    let end = out.windows(4).position(|w| w == b"\r\n\r\n").map_or(out.len(), |i| i + 4);
+    let head = String::from_utf8_lossy(&out[..end]);
+    let status = head.split(' ').nth(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+    (status, out[end..].to_vec())
 }
 
 #[tokio::test]
@@ -651,4 +662,50 @@ async fn the_cluster_s_settings_are_changed_through_the_api_and_win_over_a_manag
     let (s, b) = https_with(&a.m, &addr, "POST", "/v1/settings/proxmox/test", admin, "{}").await;
     assert!(s == 502 && b.contains("pve.example"), "the stored settings are tried: {s} {b}");
     a.server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_backup_brings_the_cluster_back_on_a_new_manager_with_its_identity() {
+    let a = start(None).await;
+    until("a leader", || a.m.store.leader().is_some()).await;
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap().to_string();
+    tokio::spawn(freightdock_manager::serve_admin_tls(a.m.clone(), l));
+    let admin = Some(a.m.admin_token.as_str());
+    assert_eq!(https_with(&a.m, &addr, "PUT", "/v1/settings", admin, r#"{"fence_stop_s":45}"#).await.0, 200);
+
+    let (s, b) = https_with(&a.m, &addr, "POST", "/v1/backup", admin, r#"{"passphrase":"short"}"#).await;
+    assert!(s == 400 && b.contains("12"), "{s} {b}");
+    let (s, sealed) = https_bytes(&a.m, &addr, "POST", "/v1/backup", admin, r#"{"passphrase":"correct horse battery"}"#).await;
+    assert_eq!((s, &sealed[..5]), (200, &b"FDBK1"[..]));
+    assert_eq!(https(&a.m, &addr, "POST", "/v1/backup", None).await.0, 401);
+
+    assert_eq!(a.m.scheduled_backup().await.unwrap(), None, "no passphrase set: no scheduled backup");
+    let (s, b) = https_with(&a.m, &addr, "PUT", "/v1/settings", admin, r#"{"backup_passphrase":"correct horse battery","backup_keep":2}"#).await;
+    assert!(s == 200 && !b.contains("horse"), "{b}");
+    let name = a.m.scheduled_backup().await.unwrap().expect("one is due");
+    assert_eq!(a.m.scheduled_backup().await.unwrap(), None, "not due again yet");
+    let (_, list) = https_with(&a.m, &addr, "GET", "/v1/backups", admin, "").await;
+    let list: serde_json::Value = serde_json::from_str(&list).unwrap();
+    assert_eq!(list["backups"][0]["name"], name.as_str(), "{list}");
+    assert_eq!(list["backups"][0]["manager"], a.m.manager_id.as_str());
+    let (s, file) = https_bytes(&a.m, &addr, "GET", &format!("/v1/backups/{name}"), admin, "").await;
+    assert_eq!((s, &file[..5]), (200, &b"FDBK1"[..]));
+    assert_eq!(https(&a.m, &addr, "GET", "/v1/backups/..%2Fadmin.token", admin).await.0, 404);
+
+    let dir = tempfile::tempdir().unwrap();
+    assert!(freightdock_manager::backup::stage_restore(dir.path(), &file, "wrong horse battery").is_err());
+    freightdock_manager::backup::stage_restore(dir.path(), &file, "correct horse battery").unwrap();
+    let b = start_in(dir, None).await;
+    until("the restored state", || b.m.store.read(|s| s.cluster_id.clone()) == a.m.store.read(|s| s.cluster_id.clone())).await;
+    assert_eq!(b.m.ca.fingerprint(), a.m.ca.fingerprint(), "the same CA: the workers' certificates stay good");
+    assert_eq!(b.m.fence().stop_s, 45);
+    assert!(b.m.settings().backup_passphrase.is_some());
+
+    let busy = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(busy.path().join("raft")).unwrap();
+    std::fs::write(busy.path().join("raft").join("x"), b"x").unwrap();
+    assert!(freightdock_manager::backup::stage_restore(busy.path(), &file, "correct horse battery").unwrap_err().to_string().contains("already"));
+    a.server.abort();
+    b.server.abort();
 }

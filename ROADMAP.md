@@ -238,6 +238,14 @@ same host. Each later goal adds its pages there (stacks with G4, and so on).
          still trusted after a move.
        - A worker whose pull fails runs the image already on its node, if there is one (images built or loaded on
          the node, never pushed).
+6. [x] Backups of the managers' state (2026-11-13), the first of item 3's set-aside features to come back: the
+       replicated state (stacks, nodes, storage, settings, the UI's database) and the cluster CA, sealed with a
+       passphrase (PBKDF2-HMAC-SHA256, 600 000 rounds, to AES-256-GCM; `backup.rs`). Downloaded on demand
+       (`POST /v1/backup`, CLI `backup <file>`, the Integrations page) or written by each manager to `<data>/backups/`
+       on a schedule (settings `backup_every_h`, `backup_keep`, a write-only `backup_passphrase`; none without it).
+       `restore <file>` readies a new manager's empty data folder: the CA in place, the state taken whole at its first
+       start (`Entry::StateRestored`, only by a cluster that has none; commands not yet sent are expired, never sent
+       twice). The workers' certificates stay good, since the CA is the same.
 
 ## G9 to G12
 

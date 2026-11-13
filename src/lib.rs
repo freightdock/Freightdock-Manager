@@ -1,6 +1,7 @@
 //! freightdock-manager: the control plane. See README.md for the shape of the whole and ROADMAP.md for what comes next.
 
 pub mod admin;
+pub mod backup;
 pub mod ca;
 pub mod compose;
 pub mod events;
@@ -151,6 +152,8 @@ pub struct Manager {
     cut_off_since: std::sync::Mutex<Option<std::time::Instant>>,
     /// Nodes a fencing provider is working on here.
     fence_tasks: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// This manager's data folder: its scheduled backups are in `backups/` there.
+    pub data_dir: PathBuf,
 }
 
 /// How long a manager may be cut off from the majority before it sends its workers away.
@@ -168,6 +171,35 @@ impl Manager {
     /// The settings in use: the cluster's where set, else this manager's own.
     pub fn settings(&self) -> settings::Settings {
         self.store.read(|s| s.settings.clone()).over(&self.own)
+    }
+
+    /// What a backup holds now: the replicated state and the cluster CA.
+    pub fn bundle(&self) -> backup::Bundle {
+        let state = self.store.read(|s| s.clone());
+        backup::Bundle { format: backup::Bundle::FORMAT.into(), taken_at: now_ms(), cluster_id: state.cluster_id.clone(), state, ca_pem: self.ca.cert_pem.clone(), ca_key: self.ca.key_pem() }
+    }
+
+    /// A backup sealed with `passphrase`, to hand out (PBKDF2 is slow on purpose, so off the async threads).
+    pub async fn backup(&self, passphrase: String) -> Result<Vec<u8>> {
+        let b = self.bundle();
+        tokio::task::spawn_blocking(move || backup::seal(&b, &passphrase)).await?
+    }
+
+    /// Writes this manager's scheduled backup if one is due (a passphrase set, the interval passed since the newest).
+    /// Answers the new file's name.
+    pub async fn scheduled_backup(&self) -> Result<Option<String>> {
+        let s = self.settings();
+        let Some(passphrase) = s.backup_passphrase.clone() else { return Ok(None) };
+        let dir = backup::dir(&self.data_dir);
+        let newest = backup::list(&dir).first().and_then(|(n, _)| backup::taken_at(n));
+        if !backup::due(newest, now_ms(), s.backup_every_h.unwrap_or(settings::BACKUP_EVERY_H)) {
+            return Ok(None);
+        }
+        let b = self.bundle();
+        let keep = s.backup_keep.unwrap_or(settings::BACKUP_KEEP) as usize;
+        let name = tokio::task::spawn_blocking(move || backup::write(&dir, &b, &passphrase.0, keep)).await??;
+        tracing::info!(file = %name, "wrote a scheduled backup");
+        Ok(Some(name))
     }
 
     pub fn fence(&self) -> fencing::FenceConfig {
@@ -227,7 +259,13 @@ impl Manager {
         let peer_tls = tls::peer_client_config(&ca, tls::Rotating::new(move || c.manager_client_identity(raft_id), tls::RENEW_AFTER)?)?;
         let store = Store::open(&config.data_dir, raft_id, &addr, config.bootstrap && config.join.is_none(), raft::network::Network::new(raft_id, peer_tls.clone()), Some(peer_tls.clone())).await?;
         store.migrate_pre_raft(&config.data_dir).await?;
-        if config.bootstrap && store.read(|s| s.cluster_id.is_none()) {
+        let restore = if config.bootstrap && store.read(|s| s.cluster_id.is_none()) { backup::staged(&config.data_dir)? } else { None };
+        if let Some(state) = restore {
+            let cluster_id = state.cluster_id.clone().unwrap_or_default();
+            store.propose(Entry::StateRestored { state: Box::new(state), at: now_ms() }).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+            backup::done(&config.data_dir);
+            tracing::info!(%cluster_id, "brought the cluster back from a backup");
+        } else if config.bootstrap && store.read(|s| s.cluster_id.is_none()) {
             let cluster_id = uuid::Uuid::new_v4().to_string();
             store.propose(Entry::ClusterCreated { cluster_id: cluster_id.clone(), at: now_ms() }).await.map_err(|e| anyhow::anyhow!("{e}"))?;
             tracing::info!(%cluster_id, "made a new cluster");
@@ -235,7 +273,7 @@ impl Manager {
         let manager_id = kept(&config.data_dir.join("manager.id"), || uuid::Uuid::new_v4().to_string())?;
         let admin_token = kept(&config.data_dir.join("admin.token"), || hex::encode(rand::random::<[u8; 32]>()))?;
         let commands = store.commands();
-        let m = Arc::new(Manager { store, events: Default::default(), sessions: Sessions::new(config.thresholds), ca, manager_id, advertise: config.advertise.clone(), admin_token, peer_tls, peer_channels: Default::default(), local_worker_token: config.local_worker_token.clone(), paced: Default::default(), own: settings::Settings::of(&config.thresholds, &config.fencing), local: config.local(), timers_sent: Default::default(), started: std::time::Instant::now(), cut_off_since: Default::default(), fence_tasks: Default::default() });
+        let m = Arc::new(Manager { store, events: Default::default(), sessions: Sessions::new(config.thresholds), ca, manager_id, advertise: config.advertise.clone(), admin_token, peer_tls, peer_channels: Default::default(), local_worker_token: config.local_worker_token.clone(), paced: Default::default(), own: settings::Settings::of(&config.thresholds, &config.fencing), local: config.local(), timers_sent: Default::default(), started: std::time::Instant::now(), cut_off_since: Default::default(), fence_tasks: Default::default(), data_dir: config.data_dir.clone() });
         tokio::spawn(deliver_applied(Arc::downgrade(&m), commands));
         Ok(m)
     }
@@ -529,6 +567,13 @@ pub async fn housekeeping(m: Arc<Manager>) {
         if pruned.elapsed() >= Duration::from_secs(60) {
             pruned = std::time::Instant::now();
             m.prune_commands().await;
+            let b = m.clone();
+            tokio::spawn(async move {
+                if let Err(e) = b.scheduled_backup().await {
+                    tracing::warn!("the scheduled backup failed: {e:#}");
+                    b.events.push("backup", None, format!("the scheduled backup failed: {e:#}"));
+                }
+            });
         }
         if ticks.is_multiple_of(5) {
             m.replace_round().await;

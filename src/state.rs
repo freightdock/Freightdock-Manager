@@ -20,6 +20,8 @@ pub type Ms = i64;
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Entry {
     ClusterCreated { cluster_id: String, at: Ms },
+    /// A backup's state, taken whole by a cluster that has none yet (`backup.rs`): the cluster it was comes back.
+    StateRestored { state: Box<ClusterState>, at: Ms },
     JoinTokenIssued {
         secret_hash: String,
         expires_at: Ms,
@@ -179,6 +181,8 @@ pub enum Rejected {
     LeaseHeld,
     /// Settings out of their range or order, or a Proxmox provider that cannot be.
     BadSettings,
+    /// A backup restored over a cluster that has a state already.
+    NotEmpty,
 }
 
 impl std::fmt::Display for Rejected {
@@ -214,6 +218,7 @@ impl std::fmt::Display for Rejected {
             Rejected::BadStorage => "storage is named 1 to 40 of a-z, 0-9 and -; nfs is host:/export with options of letters, digits and = , . _ : - /; path is an absolute directory other than /",
             Rejected::VolumeShared => "a volume for one writer (access: one) is used by one workload only: one service with one replica, or access: many",
             Rejected::LeaseHeld => "another node holds that volume and may still be writing to it",
+            Rejected::NotEmpty => "a backup is restored into a new cluster only, not over one that has a state",
             Rejected::BadSettings => "a setting is out of its range or order, or the Proxmox provider's settings do not hold",
         })
     }
@@ -1211,13 +1216,25 @@ impl ClusterState {
     /// replicated log carries refused entries too).
     pub fn apply_at(&mut self, index: u64, entry: &Entry) -> Result<(), Rejected> {
         self.applied = index;
-        if self.cluster_id.is_none() && !matches!(entry, Entry::ClusterCreated { .. }) {
+        if self.cluster_id.is_none() && !matches!(entry, Entry::ClusterCreated { .. } | Entry::StateRestored { .. }) {
             return Err(Rejected::NoCluster);
         }
         match entry {
             Entry::ClusterCreated { cluster_id, .. } => {
                 if self.cluster_id.is_none() {
                     self.cluster_id = Some(cluster_id.clone());
+                }
+            }
+            Entry::StateRestored { state, at } => {
+                if self.cluster_id.is_some() || state.cluster_id.is_none() {
+                    return Err(Rejected::NotEmpty);
+                }
+                *self = (**state).clone();
+                self.applied = index;
+                for c in self.commands.values_mut().filter(|c| !c.status.is_terminal()) {
+                    c.status = CommandStatus::Expired;
+                    c.message = "restored from a backup: not sent".into();
+                    c.updated_at = *at;
                 }
             }
             Entry::JoinTokenIssued { secret_hash, expires_at, for_manager, .. } => {
@@ -2202,6 +2219,23 @@ pub(crate) mod tests {
             }
             _ => unreachable!(),
         }
+    }
+
+    #[test]
+    fn a_backup_is_restored_into_a_new_cluster_only_and_its_open_commands_expire() {
+        let mut old = with_nodes(&["n1"]);
+        next(&mut old, &Entry::CommandCreated { command: command("c1", "n1") }).unwrap();
+        old.settings.fence_stop_s = Some(40);
+        let mut s = ClusterState::default();
+        s.apply_at(1, &Entry::StateRestored { state: Box::new(old.clone()), at: 5 }).unwrap();
+        assert_eq!(s.cluster_id, old.cluster_id, "the same cluster, its identity kept");
+        assert_eq!(s.applied, 1, "this log's index, not the backup's");
+        assert_eq!((s.nodes.len(), s.settings.fence_stop_s), (1, Some(40)));
+        assert_eq!(s.commands["c1"].status, CommandStatus::Expired, "nothing runs late from an old backup");
+        assert_eq!(s.apply_at(2, &Entry::StateRestored { state: Box::new(old), at: 6 }), Err(Rejected::NotEmpty));
+        let mut fresh = ClusterState::default();
+        fresh.apply_at(1, &Entry::ClusterCreated { cluster_id: "other".into(), at: 1 }).unwrap();
+        assert_eq!(fresh.apply_at(2, &Entry::StateRestored { state: Box::new(s), at: 7 }), Err(Rejected::NotEmpty), "not over a cluster of its own");
     }
 
     #[test]
