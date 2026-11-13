@@ -279,6 +279,13 @@ address across nodes later.
              `stack expose`, `stack ps` says how each service is reached.
        - [x] The UI (`freightdock:cluster-ui-12`): "Reached from outside" per stack (pool, every worker, internal
              only), the exposures editor, what each pool address exposes ("Cluster" 17).
+6. [x] Only the pool and inside (owner, 2026-11-13: "it should only be accessable via the ip pool adresses and
+       internally"): a Compose `ports:` opens nothing anywhere (no mesh rule, no Docker publishing) but for the
+       managers' own UI stack; it is what the file asks for, offered by the UI as an exposure on a free pool address.
+       The cross-stack port check went with it. Pool ranges (`192.0.2.10-20`, a prefix), an unused address not
+       announced. A stack runs on the nodes chosen for it (`Stack.nodes`, `stack deploy --on`), moved there when the
+       choice changes; a deploy takes its exposures too, checked whole; `POST /v1/stack-check` answers what a deploy
+       would do. In the UI (`freightdock:cluster-ui-15`): the deployer page, search and filters ("Cluster" 19, 20).
 
 ## Open questions for the owner
 
