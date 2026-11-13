@@ -594,6 +594,7 @@ fn stack_json(m: &Manager, s: &crate::state::ClusterState, st: &crate::state::St
             let fenced = w.node_id.as_ref().and_then(|n| s.nodes.get(n)).is_some_and(|n| n.fencing.state != crate::state::FenceState::None);
             json!({
                 "id": w.id,
+                "container_name": w.container_name(),
                 "service": w.service,
                 "slot": w.slot,
                 "node_id": w.node_id,
