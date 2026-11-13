@@ -142,6 +142,13 @@ mod tests {
         assert!(!format!("{all:?}").contains("\"p\""), "the password is never in a debug line");
     }
 
+    #[tokio::test]
+    async fn a_registry_is_asked_over_https() {
+        let e = test("127.0.0.1:1", "u", "p").await.unwrap_err();
+        let said = format!("{e:#}");
+        assert!(said.contains("https://127.0.0.1:1") && !said.contains("scheme is not http"), "a client that speaks TLS: {said}");
+    }
+
     #[test]
     fn a_registry_s_challenge_says_how_to_sign_in() {
         assert_eq!(parse_challenge(r#"Basic realm="Registry""#), Challenge::Basic);
