@@ -709,3 +709,63 @@ async fn a_backup_brings_the_cluster_back_on_a_new_manager_with_its_identity() {
     a.server.abort();
     b.server.abort();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_node_s_docker_is_asked_through_the_manager_that_holds_its_stream() {
+    use freightdock_manager::state::NodeReport;
+    use freightdock_proto::v1::{DockerReply, manager_message::Body};
+    let a = start(None).await;
+    let b = start(Some((&a.addr, issue(&a.m, true).await))).await;
+    until("b a voter", || a.m.store.voters().len() == 2).await;
+    let t = JoinToken::parse(&issue(&a.m, false).await).unwrap();
+    a.m.store.propose(Entry::NodeEnrolled { node_id: "n1".into(), hostname: "h".into(), secret_hash: t.secret_hash(), cert_sha256: "c".into(), at: now_ms() }).await.unwrap();
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap().to_string();
+    tokio::spawn(freightdock_manager::serve_admin_tls(a.m.clone(), l));
+    let admin = Some(a.m.admin_token.as_str());
+
+    let (s, body) = https_with(&a.m, &addr, "GET", "/v1/nodes/n1/docker?action=containers", admin, "").await;
+    assert!(s == 503 && body.contains("not connected"), "no stream anywhere: {s} {body}");
+
+    // The worker is connected to b and answers as a worker does: the reply with the request's id.
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+    b.m.sessions.open("n1", tx, "test".into(), None);
+    let bm = b.m.clone();
+    tokio::spawn(async move {
+        while let Some(Ok(msg)) = rx.recv().await {
+            if let Some(Body::Docker(r)) = msg.body {
+                let reply = match r.action.as_str() {
+                    "containers" => DockerReply { request_id: r.request_id, error: String::new(), json: r#"[{"id":"c1","names":["web"]}]"#.into() },
+                    "volumes" => continue,
+                    _ => DockerReply { request_id: r.request_id, error: format!("{} refused: {}", r.action, r.target), json: String::new() },
+                };
+                bm.docker_replied(reply);
+            }
+        }
+    });
+    a.m.gather_heard().await;
+    let (s, body) = https_with(&a.m, &addr, "GET", "/v1/nodes/n1/docker?action=containers", admin, "").await;
+    assert!(s == 409 && body.contains("update"), "an older worker is told apart: {s} {body}");
+    let report = NodeReport { docker: true, docker_requests: true, ..Default::default() };
+    a.m.store.propose(Entry::NodeReported { node_id: "n1".into(), report, at: now_ms() }).await.unwrap();
+
+    let (s, body) = https_with(&a.m, &addr, "GET", "/v1/nodes/n1/docker?action=containers", admin, "").await;
+    assert_eq!(s, 200, "{body}");
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&body).unwrap()[0]["names"][0], "web", "through b");
+    let v = b.m.docker("n1", "containers", "", Default::default()).await.unwrap();
+    assert_eq!(v[0]["id"], "c1", "on b itself");
+
+    let (s, body) = https_with(&a.m, &addr, "POST", "/v1/nodes/n1/docker", admin, r#"{"action":"container.stop","target":"web"}"#).await;
+    assert!(s == 400 && body.contains("container.stop refused: web"), "the worker's sentence: {s} {body}");
+    let (s, _) = https_with(&a.m, &addr, "GET", "/v1/nodes/n1/docker?action=container.stop&target=web", admin, "").await;
+    assert_eq!(s, 400, "a change is never a GET");
+    let (s, _) = https_with(&a.m, &addr, "POST", "/v1/nodes/n1/docker", admin, r#"{"action":"containers"}"#).await;
+    assert_eq!(s, 400, "a read is never a POST");
+    let (s, _) = https_with(&a.m, &addr, "GET", "/v1/nodes/nope/docker?action=containers", admin, "").await;
+    assert_eq!(s, 404);
+    let started = std::time::Instant::now();
+    let e = b.m.docker_within("n1", "volumes", "", Default::default(), Duration::from_millis(300)).await.unwrap_err();
+    assert!(e.to_string().contains("did not answer") && started.elapsed() < Duration::from_secs(2), "{e}");
+    a.server.abort();
+    b.server.abort();
+}

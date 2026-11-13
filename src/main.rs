@@ -44,6 +44,10 @@ freightdock-manager settings backup-passphrase [off]   the passphrase the schedu
 freightdock-manager backup <file>           a backup of the cluster (its state and CA), sealed with the passphrase
 freightdock-manager restore <file>          on a new manager, before its first start: bring the backed up cluster
                                        back (its CA and state); then start it as a new cluster's first manager
+freightdock-manager docker <node> <action> [target] [k=v ...]   a node's Docker through its worker: info,
+                                       containers, container <c>, logs <c> [tail=N], images, volumes, networks;
+                                       container.start|stop|restart|remove <c>, image.remove <i>, image.pull image=<i>,
+                                       images.prune, volume.remove <v>, network.remove <n> (never the cluster's own)
 freightdock-manager ca                      the cluster CA's certificate (PEM), for a client of the API over TLS
 freightdock-manager ui <image> [address]|off|status   run the Freightdock UI on the cluster, at https://<address>, an
                                        address of the pool (by default the one it has, else the first free one)
@@ -292,6 +296,36 @@ async fn main() -> Result<()> {
             match p.is_null() {
                 true => println!("proxmox              not set"),
                 false => println!("proxmox              {} token {} ({}), certificate {}", p["url"].as_str().unwrap_or(""), p["token_id"].as_str().unwrap_or(""), p["source"].as_str().unwrap_or(""), p["fingerprint"].as_str().unwrap_or("")),
+            }
+            Ok(())
+        }
+        Some("docker") => {
+            let (Some(node), Some(action)) = (args.get(1), args.get(2)) else { bail!("{USAGE}") };
+            let mut target = String::new();
+            let mut params = serde_json::Map::new();
+            for a in &args[3..] {
+                match a.split_once('=') {
+                    Some((k, v)) => {
+                        params.insert(k.to_string(), Value::String(v.to_string()));
+                    }
+                    None => target = a.clone(),
+                }
+            }
+            let v = if freightdock_manager::docker::READS.contains(&action.as_str()) {
+                let mut q = format!("action={}&target={}", encode(action), encode(&target));
+                for (k, v) in &params {
+                    q.push_str(&format!("&{}={}", encode(k), encode(v.as_str().unwrap_or(""))));
+                }
+                call(&config, reqwest::Method::GET, &format!("/v1/nodes/{node}/docker?{q}"), None).await?
+            } else {
+                call(&config, reqwest::Method::POST, &format!("/v1/nodes/{node}/docker"), Some(serde_json::json!({ "action": action, "target": target, "params": params }))).await?
+            };
+            if action == "logs" {
+                for l in v["lines"].as_array().into_iter().flatten() {
+                    println!("{}", l.as_str().unwrap_or(""));
+                }
+            } else {
+                println!("{}", serde_json::to_string_pretty(&v)?);
             }
             Ok(())
         }
@@ -565,6 +599,11 @@ async fn shutdown() {
     }
     #[cfg(not(unix))]
     let _ = tokio::signal::ctrl_c().await;
+}
+
+/// A query string's value: everything but letters, digits and `-._~` as %XX.
+fn encode(s: &str) -> String {
+    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-._~".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") }).collect()
 }
 
 /// A backup's passphrase: FREIGHTDOCK_BACKUP_PASSPHRASE, else the first line of stdin. Never an argument (it would

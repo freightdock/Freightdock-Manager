@@ -4,6 +4,7 @@ pub mod admin;
 pub mod backup;
 pub mod ca;
 pub mod compose;
+pub mod docker;
 pub mod events;
 pub mod fencing;
 pub mod grpc;
@@ -154,6 +155,8 @@ pub struct Manager {
     fence_tasks: std::sync::Mutex<std::collections::HashSet<String>>,
     /// This manager's data folder: its scheduled backups are in `backups/` there.
     pub data_dir: PathBuf,
+    /// Docker requests sent to the workers here, waiting for their replies (`docker.rs`).
+    docker_waits: docker::Waits,
 }
 
 /// How long a manager may be cut off from the majority before it sends its workers away.
@@ -273,7 +276,7 @@ impl Manager {
         let manager_id = kept(&config.data_dir.join("manager.id"), || uuid::Uuid::new_v4().to_string())?;
         let admin_token = kept(&config.data_dir.join("admin.token"), || hex::encode(rand::random::<[u8; 32]>()))?;
         let commands = store.commands();
-        let m = Arc::new(Manager { store, events: Default::default(), sessions: Sessions::new(config.thresholds), ca, manager_id, advertise: config.advertise.clone(), admin_token, peer_tls, peer_channels: Default::default(), local_worker_token: config.local_worker_token.clone(), paced: Default::default(), own: settings::Settings::of(&config.thresholds, &config.fencing), local: config.local(), timers_sent: Default::default(), started: std::time::Instant::now(), cut_off_since: Default::default(), fence_tasks: Default::default(), data_dir: config.data_dir.clone() });
+        let m = Arc::new(Manager { store, events: Default::default(), sessions: Sessions::new(config.thresholds), ca, manager_id, advertise: config.advertise.clone(), admin_token, peer_tls, peer_channels: Default::default(), local_worker_token: config.local_worker_token.clone(), paced: Default::default(), own: settings::Settings::of(&config.thresholds, &config.fencing), local: config.local(), timers_sent: Default::default(), started: std::time::Instant::now(), cut_off_since: Default::default(), fence_tasks: Default::default(), data_dir: config.data_dir.clone(), docker_waits: Default::default() });
         tokio::spawn(deliver_applied(Arc::downgrade(&m), commands));
         Ok(m)
     }

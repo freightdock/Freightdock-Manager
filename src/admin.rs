@@ -107,6 +107,7 @@ pub fn router(m: Arc<Manager>) -> Router {
         .route("/v1/nodes/{id}/commands", post(create_command))
         .route("/v1/nodes/{id}/labels", axum::routing::put(set_labels))
         .route("/v1/nodes/{id}/authorize", post(authorize))
+        .route("/v1/nodes/{id}/docker", get(docker_read).post(docker_change))
         .route("/v1/join-tokens", post(join_token))
         .route("/v1/manager-tokens", post(manager_token))
         .route("/v1/commands", get(commands))
@@ -172,6 +173,54 @@ async fn nodes(State(m): State<Arc<Manager>>, h: HeaderMap) -> R<Json<Value>> {
     authed(&m, &h)?;
     let list: Vec<Value> = m.store.read(|s| s.nodes.values().map(|n| node_json(&m, n)).collect());
     Ok(Json(json!(list)))
+}
+
+impl From<crate::docker::DockerError> for ApiError {
+    fn from(e: crate::docker::DockerError) -> Self {
+        use crate::docker::DockerError::*;
+        let status = match &e {
+            UnknownNode => StatusCode::NOT_FOUND,
+            UnknownAction(_) | Refused(_) => StatusCode::BAD_REQUEST,
+            NotConnected => StatusCode::SERVICE_UNAVAILABLE,
+            Older => StatusCode::CONFLICT,
+            NoAnswer => StatusCode::GATEWAY_TIMEOUT,
+            Peer(_) => StatusCode::BAD_GATEWAY,
+        };
+        ApiError(status, e.to_string())
+    }
+}
+
+#[derive(Deserialize)]
+struct DockerAsk {
+    action: String,
+    #[serde(default)]
+    target: String,
+    #[serde(default)]
+    params: std::collections::HashMap<String, String>,
+}
+
+/// A look at the node's Docker (`?action=containers`, `&target=` for one container's inspect or logs, other query
+/// keys passed on as the request's params): through the worker, now.
+async fn docker_read(State(m): State<Arc<Manager>>, h: HeaderMap, Path(id): Path<String>, Query(mut q): Query<std::collections::HashMap<String, String>>) -> R<Json<Value>> {
+    authed(&m, &h)?;
+    let action = q.remove("action").unwrap_or_default();
+    if !crate::docker::READS.contains(&action.as_str()) {
+        return Err(ApiError(StatusCode::BAD_REQUEST, format!("{action:?} is not a read of a node's Docker; a change is a POST")));
+    }
+    let target = q.remove("target").unwrap_or_default();
+    Ok(Json(m.docker(&id, &action, &target, q).await?))
+}
+
+/// A change to the node's Docker: `{action, target, params}`. Never one of the cluster's own (the worker refuses).
+async fn docker_change(State(m): State<Arc<Manager>>, h: HeaderMap, Path(id): Path<String>, Json(b): Json<DockerAsk>) -> R<Json<Value>> {
+    authed(&m, &h)?;
+    if !crate::docker::CHANGES.contains(&b.action.as_str()) {
+        return Err(ApiError(StatusCode::BAD_REQUEST, format!("{:?} is not a change to a node's Docker; a read is a GET", b.action)));
+    }
+    let what = if b.target.is_empty() { b.action.clone() } else { format!("{} {}", b.action, b.target) };
+    let v = m.docker(&id, &b.action, &b.target, b.params).await?;
+    m.events.push("docker", Some(&id), format!("Docker: {what}"));
+    Ok(Json(v))
 }
 
 async fn node(State(m): State<Arc<Manager>>, h: HeaderMap, Path(id): Path<String>) -> R<Json<Value>> {

@@ -246,6 +246,13 @@ same host. Each later goal adds its pages there (stacks with G4, and so on).
        `restore <file>` readies a new manager's empty data folder: the CA in place, the state taken whole at its first
        start (`Entry::StateRestored`, only by a cluster that has none; commands not yet sent are expired, never sent
        twice). The workers' certificates stay good, since the CA is the same.
+7. [x] A node's Docker through its worker (2026-11-13), item 3's next: `DockerRequest`/`DockerReply` on the worker's
+       stream, not commands (a read is large and only for now, so nothing goes to the log). The manager holding the
+       stream waits for the reply by id; another forwards through `ManagerPeer.Docker`. Reads: info, containers,
+       inspect, logs (at most 5000 lines, 1 MiB), images, volumes, networks. Changes: start, stop, restart and remove
+       a container, remove, pull and prune images, remove a volume or network; never the cluster's own (a workload's
+       container, a stack's network or volume), which the worker refuses. `GET`/`POST /v1/nodes/{id}/docker`, CLI
+       `docker <node> <action>`, a worker's `docker_requests` capability (an older worker is told apart).
 
 ## G9 to G12
 

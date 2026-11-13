@@ -7,7 +7,7 @@ use serde::{Serialize, de::DeserializeOwned};
 use tonic::{Request, Response, Status};
 
 use freightdock_proto::token::JoinToken;
-use freightdock_proto::v1::{HeardReply, HeardRequest, AddVoterReply, AddVoterRequest, JoinReply, JoinRequest, ProposeReply, ProposeRequest, RaftReply, RaftRequest, RaftRpc, manager_peer_server::ManagerPeer};
+use freightdock_proto::v1::{DockerReply, PeerDockerRequest, HeardReply, HeardRequest, AddVoterReply, AddVoterRequest, JoinReply, JoinRequest, ProposeReply, ProposeRequest, RaftReply, RaftRequest, RaftRpc, manager_peer_server::ManagerPeer};
 
 use crate::{Manager, now_ms};
 use crate::raft::{Snapshot, SnapshotMeta, TypeConfig, Vote};
@@ -118,5 +118,20 @@ impl ManagerPeer for PeerSvc {
     async fn heard(&self, req: Request<HeardRequest>) -> Result<Response<HeardReply>, Status> {
         caller(&req)?;
         Ok(Response::new(HeardReply { nodes: self.0.sessions.connected() }))
+    }
+
+    async fn docker(&self, req: Request<PeerDockerRequest>) -> Result<Response<DockerReply>, Status> {
+        caller(&req)?;
+        let r = req.into_inner();
+        let d = r.request.ok_or_else(|| Status::invalid_argument("no request"))?;
+        if !crate::docker::READS.contains(&d.action.as_str()) && !crate::docker::CHANGES.contains(&d.action.as_str()) {
+            return Err(Status::invalid_argument(format!("{:?} is not something a node's Docker is asked", d.action)));
+        }
+        let wait = crate::docker::patience(&d.action);
+        match self.0.docker_local(&r.node_id, d, wait).await {
+            Ok(reply) => Ok(Response::new(reply)),
+            Err(crate::docker::DockerError::NoAnswer) => Err(Status::deadline_exceeded("the worker did not answer in time")),
+            Err(e) => Err(Status::unavailable(e.to_string())),
+        }
     }
 }

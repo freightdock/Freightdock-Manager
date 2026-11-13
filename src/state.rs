@@ -243,6 +243,9 @@ pub struct NodeReport {
     /// The node's WireGuard public key (G9); empty for a worker without the overlay.
     #[serde(default)]
     pub wg_public_key: String,
+    /// The worker answers DockerRequest (the per-node Docker pages); an older one does not.
+    #[serde(default)]
+    pub docker_requests: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -164,6 +164,8 @@ a client trusts that CA alone and checks that name. `GET /v1/health` and `GET /v
 | `POST /v1/manager-tokens` | `{"ttl_s": 3600}` gives `{"token": "FDMT1-..."}`, for a manager |
 | `GET /v1/events?after=&node=` | recent node events |
 | `GET /v1/recoveries?stack=` | the recovery history, newest first |
+| `GET /v1/nodes/{id}/docker?action=&target=` | a look at the node's Docker through its worker, now: `info`, `containers`, `container` (inspect), `logs` (`tail`, `timestamps`), `images`, `volumes`, `networks`. Not in the log; asked through the manager that holds the node's stream |
+| `POST /v1/nodes/{id}/docker` | `{action, target, params}`: a change to it: `container.start`, `.stop`, `.restart`, `.remove` (`force`), `image.remove`, `image.pull` (`image`), `images.prune`, `volume.remove`, `network.remove`. The worker refuses the cluster's own (labelled `io.freightdock.managed`): they belong to their stack |
 | `POST /v1/backup` | `{"passphrase"}`: a sealed backup of the cluster now, as a download (kept nowhere) |
 | `GET /v1/backups`, `GET /v1/backups/{name}` | this manager's scheduled backups (`name`, `taken_at`, `size`, `manager`), newest first; one as a download |
 | `GET /v1/api-tokens`, `POST /v1/api-tokens`, `DELETE /v1/api-tokens/{id}` | API tokens: `{"name", "role": "read" or "admin"}` gives the token once |

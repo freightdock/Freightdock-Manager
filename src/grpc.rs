@@ -97,6 +97,7 @@ fn report_of(h: &v1::Hello) -> NodeReport {
         cpu_count: res.cpu_count,
         memory_total_bytes: res.memory_total_bytes,
         wg_public_key: h.network.as_ref().map(|n| n.public_key.clone()).unwrap_or_default(),
+        docker_requests: caps.docker_requests,
     }
 }
 
@@ -229,6 +230,10 @@ impl WorkerSession for SessionSvc {
                         if let Err(e) = m.store.propose(e).await {
                             tracing::warn!(node = %node_id, command = %u.command_id, "{e}");
                         }
+                    }
+                    Some(worker_message::Body::DockerReply(r)) => {
+                        m.sessions.heard(&node_id, generation, None, None);
+                        m.docker_replied(r);
                     }
                     Some(worker_message::Body::Hello(_)) | None => {}
                 }
