@@ -3,8 +3,8 @@
 The manager-agent of a Freightdock cluster: the control plane and its database. It owns the cluster's state,
 replicated between managers with Raft (openraft), enrols workers and managers with join tokens, keeps a long-lived
 mutual-TLS gRPC stream to each worker that connects to it, tracks their health with the other managers, and sends
-them commands. One manager is a whole cluster; add managers to survive losing one. The plan is in
-[ROADMAP.md](ROADMAP.md), what has been done in [PROGRESS.md](PROGRESS.md).
+them commands. One manager is a whole cluster; add managers to survive losing one. The plan, and what has been done, is in
+[ROADMAP.md](ROADMAP.md).
 
 ```
 src/state.rs      the cluster state as a deterministic state machine over log entries

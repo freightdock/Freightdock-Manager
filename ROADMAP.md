@@ -2,7 +2,7 @@
 
 The plan (`Freightdock-plan.md`) split into goals, ranked by importance and in the order they have to be done. Each
 goal ends with something that runs on the test cluster, not just code that compiles. Tick items off in the change that
-does them, and write what was done in [PROGRESS.md](PROGRESS.md) so the next person can pick up from there.
+does them, so the next person can pick up from there.
 
 Status marks: **[x]** done, **[~]** in progress, **[ ]** not started.
 
@@ -99,7 +99,7 @@ While nothing is published the crates point at each other by path (`../Freightdo
       executor (ping, docker info, run / stop / remove container by workload), failover over a manager list.
 - [x] In-process end-to-end test (`Agent/worker/tests/e2e.rs`).
 - [x] Static binaries (`Freightdock-Manager/deploy/build-static.sh`) and systemd units.
-- [x] Running on the test cluster (three Proxmox LXCs), all tests in PROGRESS.md passing.
+- [x] Running on the test cluster (three Proxmox LXCs), all cluster tests passing.
 
 ## G2: The link is hardened and observable (done, 2026-11-11; 6 and 7 since)
 
@@ -112,9 +112,7 @@ Ranked inside the goal:
 4. [x] Node events (connected, disconnected, health changes, enrolled, removed) in memory, `GET /v1/events`.
 5. [x] A `status` CLI command: cluster, managers, nodes and recent events in one view.
 6. [x] CI for Contracts, Network, Manager and Worker (gitleaks with Freightdock's rules, tests, clippy as errors),
-       each checking out the repositories it needs beside it; written 2026-11-13, runs from the first push. Before
-       that push: the earlier commits of Manager hold the test LAN's addresses in PROGRESS.md (the tree no longer
-       does), so publish from a fresh first commit or accept them (the owner's call).
+       each checking out the repositories it needs beside it; written 2026-11-13, runs from the first push.
 7. [x] Certificate renewal before expiry. Managers (done 2026-11-12): their server and client certificates (90 days)
        are made again at the first handshake after 30 days (`tls::Rotating`), so a manager that runs for months never
        shows an expired one. Workers (5 years, done 2026-11-12): in its last year the welcome says
