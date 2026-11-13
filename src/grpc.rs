@@ -36,7 +36,7 @@ pub fn op_to_proto(op: &Op) -> v1::command::Op {
     match op.clone() {
         Op::Ping => P::Ping(v1::Ping {}),
         Op::DockerInfo => P::DockerInfo(v1::DockerInfo {}),
-        Op::RunContainer { workload_id, image, name, command, env, labels, generation, ports, volumes, limits, net } => P::RunContainer(v1::RunContainer {
+        Op::RunContainer { workload_id, image, name, command, env, labels, generation, ports, volumes, limits, net, storage } => P::RunContainer(v1::RunContainer {
             workload_id,
             image,
             name,
@@ -51,6 +51,10 @@ pub fn op_to_proto(op: &Op) -> v1::command::Op {
             network_stack: net.as_ref().map(|n| n.stack.clone()).unwrap_or_default(),
             address: net.as_ref().map(|n| n.address.clone()).unwrap_or_default(),
             hosts: net.map(|n| n.hosts).unwrap_or_default(),
+            storage: storage
+                .into_iter()
+                .map(|m| v1::StorageVolume { volume: m.volume, storage: m.storage, driver: match m.driver { crate::state::StorageDriver::Nfs => "nfs", crate::state::StorageDriver::Path => "path" }.into(), source: m.source, options: m.options, dir: m.dir })
+                .collect(),
         }),
         Op::StopContainer { workload_id, timeout_s } => P::StopContainer(v1::StopContainer { workload_id, timeout_s }),
         Op::RemoveContainer { workload_id } => P::RemoveContainer(v1::RemoveContainer { workload_id }),

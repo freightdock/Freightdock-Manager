@@ -129,7 +129,7 @@ pub fn place(s: &ClusterState, stack: &str, services: &BTreeMap<String, ServiceS
 }
 
 /// The op that brings one workload from what its node reported to what the state wants, if one is needed.
-fn op_for(w: &Workload, net: Option<crate::state::Attach>, run: bool, actual: Option<&WorkloadState>) -> Option<Op> {
+fn op_for(w: &Workload, net: Option<crate::state::Attach>, storage: Vec<crate::state::StorageMount>, run: bool, actual: Option<&WorkloadState>) -> Option<Op> {
     let up = actual.is_some_and(|a| matches!(a.state.as_str(), "running" | "restarting" | "paused" | "removing"));
     let current = actual.is_some_and(|a| a.generation == w.generation);
     if run && !(up && current) {
@@ -147,6 +147,7 @@ fn op_for(w: &Workload, net: Option<crate::state::Attach>, run: bool, actual: Op
             volumes: w.spec.volumes.clone(),
             limits: w.spec.limits,
             net,
+            storage,
         });
     }
     if !run && actual.is_some_and(|a| a.state == "running") {
@@ -171,7 +172,7 @@ pub fn reconcile(s: &ClusterState, node: &str, actual: &[WorkloadState], busy: &
         if busy.contains(&w.id) {
             continue;
         }
-        if let Some(op) = op_for(w, s.attach(w), s.should_run(w), actual.iter().find(|a| a.workload_id == w.id)) {
+        if let Some(op) = op_for(w, s.attach(w), s.storage_mounts(w), s.should_run(w), actual.iter().find(|a| a.workload_id == w.id)) {
             out.push((w.id.clone(), op));
         }
     }
@@ -181,6 +182,23 @@ pub fn reconcile(s: &ClusterState, node: &str, actual: &[WorkloadState], busy: &
         }
     }
     out
+}
+
+/// The volumes for one writer `node` holds and may let go: no workload placed there to run uses one, and nothing of
+/// the volume's stack runs there that may (a container the state no longer holds is counted as using it).
+pub fn releasable(s: &ClusterState, node: &str, actual: &[WorkloadState]) -> Vec<String> {
+    let up = |a: &WorkloadState| matches!(a.state.as_str(), "running" | "restarting" | "paused" | "removing" | "created");
+    s.leases
+        .iter()
+        .filter(|(_, l)| l.node_id == node)
+        .filter(|(vol, _)| {
+            let Some((stack, name)) = vol.split_once('/') else { return true };
+            let wanted = s.volume_users(stack, name).any(|w| w.node_id.as_deref() == Some(node) && s.should_run(w));
+            let running = actual.iter().filter(|a| up(a) && a.workload_id.starts_with(&format!("{stack}."))).any(|a| s.workloads.get(&a.workload_id).is_none_or(|w| w.spec.volumes.iter().any(|v| v.split(':').next() == Some(name))));
+            !wanted && !running
+        })
+        .map(|(vol, _)| vol.clone())
+        .collect()
 }
 
 /// How soon a workload is acted on again: 5s after one action, doubling for each one in a row, to 5 minutes, so a
@@ -219,6 +237,7 @@ impl Manager {
             return;
         }
         let mut todo = vec![];
+        let mut release = vec![];
         self.store.read(|s| {
             let busy = s.busy_workloads();
             for (node, actual) in &reports {
@@ -226,19 +245,47 @@ impl Manager {
                 if s.nodes.get(node).is_none_or(|n| n.fencing.state != crate::state::FenceState::None) {
                     continue;
                 }
+                release.extend(releasable(s, node, actual).into_iter().map(|v| (node.clone(), v)));
                 let ops = reconcile(s, node, actual, &busy);
                 for w in s.workloads_on(node) {
                     if !busy.contains(&w.id) && !ops.iter().any(|(id, _)| *id == w.id) {
                         self.paced.settled(&w.id);
                     }
                 }
-                todo.extend(ops.into_iter().map(|(id, op)| (node.clone(), id, op)));
+                todo.extend(ops.into_iter().map(|(id, op)| {
+                    // A volume for one writer is leased to the node before its workload runs there (G11).
+                    let leases = if matches!(op, Op::RunContainer { .. }) { s.workloads.get(&id).map(|w| s.exclusive_volumes(w)).unwrap_or_default().into_iter().filter(|v| s.leases.get(v).is_none_or(|l| l.node_id != *node)).collect() } else { vec![] };
+                    (node.clone(), id, op, leases)
+                }));
             }
         });
-        for (node, id, op) in todo {
+        for (node, volume) in release {
+            match self.store.propose(Entry::LeaseReleased { volume: volume.clone(), node_id: node.clone(), at: now_ms() }).await {
+                Ok(_) => tracing::info!(node = %node, volume = %volume, "storage: lease let go"),
+                Err(e) => tracing::debug!(node = %node, volume = %volume, "storage: lease not let go: {e}"),
+            }
+        }
+        // Stops and removals first: a run on one node may be waiting for a lease the other lets go once its own
+        // container of the workload is gone.
+        todo.sort_by_key(|(_, _, op, _)| matches!(op, Op::RunContainer { .. }));
+        'next: for (node, id, op, leases) in todo {
             if !self.paced.ready(&id) {
                 continue;
             }
+            // A run waiting for a lease is paced on its own, so it never holds back what the other node has to do.
+            let waiting = format!("lease:{node}:{id}");
+            if !leases.is_empty() && !self.paced.ready(&waiting) {
+                continue;
+            }
+            for volume in leases {
+                if let Err(e) = self.store.propose(Entry::LeaseTaken { volume: volume.clone(), node_id: node.clone(), at: now_ms() }).await {
+                    let holder = self.store.read(|s| s.leases.get(&volume).map(|l| l.node_id.clone())).unwrap_or_default();
+                    tracing::info!(node = %node, workload = %id, volume = %volume, holder = %holder, "storage: waits for the volume ({e})");
+                    self.paced.acted(&waiting);
+                    continue 'next;
+                }
+            }
+            self.paced.settled(&waiting);
             self.paced.acted(&id);
             let now = now_ms();
             let what = match &op {
@@ -294,7 +341,7 @@ mod tests {
 
     fn deploy(s: &mut ClusterState, stack: &str, services: &BTreeMap<String, ServiceSpec>, placements: BTreeMap<String, String>) {
         let i = s.applied + 1;
-        s.apply_at(i, &Entry::StackDeployed { name: stack.into(), compose: String::new(), services: services.clone(), placements, at: 1, nodes: vec![], exposures: None }).unwrap();
+        s.apply_at(i, &Entry::StackDeployed { name: stack.into(), compose: String::new(), services: services.clone(), placements, at: 1, nodes: vec![], exposures: None, volumes: Default::default() }).unwrap();
     }
 
     fn svc(list: &[(&str, ServiceSpec)]) -> BTreeMap<String, ServiceSpec> {
@@ -338,7 +385,7 @@ mod tests {
         // Off it (the range full) Docker publishes the port on the node, once.
         for n in 1..=254u8 {
             let name = format!("s{n}");
-            s.stacks.insert(name.clone(), crate::state::Stack { name, compose: String::new(), services: BTreeMap::new(), stopped: false, created_at: 0, updated_at: 0, net: Some(n), exposures: vec![], nodes: vec![] });
+            s.stacks.insert(name.clone(), crate::state::Stack { name, compose: String::new(), services: BTreeMap::new(), stopped: false, created_at: 0, updated_at: 0, net: Some(n), exposures: vec![], nodes: vec![] , volumes: Default::default() });
         }
         let p = place(&s, "web", &svc(&[("x", published("nginx", 2, 8080))]), &eligible(&["a", "b"]), &[]).unwrap();
         assert_ne!(p["web.x.1"], p["web.x.2"]);
@@ -430,6 +477,36 @@ mod tests {
         let services = svc(services);
         let p = place(s, "web", &services, &eligible(&["a"]), &[]).unwrap();
         deploy(s, "web", &services, p);
+    }
+
+    #[test]
+    fn a_volume_on_storage_is_bound_from_it_and_its_lease_let_go_once_nothing_there_uses_it() {
+        use crate::state::{Access, StackVolume, Storage, StorageDriver};
+        let mut s = state_with(&["a", "b"]);
+        let i = s.applied + 1;
+        s.apply_at(i, &Entry::StorageAdded { storage: Storage { name: "nas".into(), driver: StorageDriver::Nfs, source: "192.0.2.50:/fd".into(), options: "vers=4.2".into(), added_at: 1 } }).unwrap();
+        let services = svc(&[("db", ServiceSpec { volumes: vec!["pg:/var/lib/pg".into(), "cache:/cache".into()], ..spec("postgres", 1) })]);
+        let i = s.applied + 1;
+        let volumes = [("pg".to_string(), StackVolume { storage: "nas".into(), access: Access::One })].into();
+        s.apply_at(i, &Entry::StackDeployed { name: "app".into(), compose: String::new(), services, placements: [("app.db.1".to_string(), "a".to_string())].into(), at: 1, nodes: vec![], exposures: None, volumes }).unwrap();
+        let ops = reconcile(&s, "a", &[], &BTreeSet::new());
+        let Some((_, Op::RunContainer { storage, volumes, .. })) = ops.first() else { panic!("{ops:?}") };
+        assert_eq!(storage.len(), 1, "only pg is on storage; cache is local");
+        assert_eq!((storage[0].volume.as_str(), storage[0].dir.as_str(), storage[0].source.as_str(), storage[0].options.as_str()), ("pg", "app/pg", "192.0.2.50:/fd", "vers=4.2"));
+        assert_eq!(volumes, &vec!["pg:/var/lib/pg".to_string(), "cache:/cache".to_string()], "as written: the worker binds it");
+        assert_eq!(s.exclusive_volumes(&s.workloads["app.db.1"]), vec!["app/pg".to_string()]);
+
+        let i = s.applied + 1;
+        s.apply_at(i, &Entry::LeaseTaken { volume: "app/pg".into(), node_id: "a".into(), at: 2 }).unwrap();
+        assert!(releasable(&s, "a", &[]).is_empty(), "placed here and to run: kept");
+        assert!(releasable(&s, "a", &[running("app.db.1", 1)]).is_empty());
+        s.workloads.get_mut("app.db.1").unwrap().node_id = Some("b".into());
+        assert!(releasable(&s, "a", &[running("app.db.1", 1)]).is_empty(), "moved away but its container still runs here: kept");
+        assert_eq!(releasable(&s, "a", &[WorkloadState { state: "exited".into(), ..running("app.db.1", 1) }]), vec!["app/pg".to_string()], "stopped here: let go");
+        assert_eq!(releasable(&s, "a", &[]), vec!["app/pg".to_string()]);
+        assert!(releasable(&s, "b", &[]).is_empty(), "b holds nothing");
+        s.workloads.remove("app.db.1");
+        assert!(releasable(&s, "a", &[running("app.db.1", 1)]).is_empty(), "its stack's container still runs, though the state forgot it");
     }
 
     #[test]

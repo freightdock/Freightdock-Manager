@@ -62,6 +62,9 @@ pub enum Entry {
         nodes: Vec<String>,
         #[serde(default)]
         exposures: Option<Vec<Exposure>>,
+        /// Its named volumes kept on shared storage (G11); the others are local to each node.
+        #[serde(default)]
+        volumes: BTreeMap<String, StackVolume>,
     },
     /// The stack's workloads are to run (`stopped: false`) or not.
     StackStopped { name: String, stopped: bool, at: Ms },
@@ -96,6 +99,16 @@ pub enum Entry {
     /// fenced, awaiting authorization), or is the one named; and a node named must be at rest. So an address is never
     /// given to a second node while the first may still answer for it.
     FloatingHeld { address: String, node_id: Option<String>, at: Ms },
+    /// Shared storage given to the cluster (G11). Refused if the name is taken or it is not well formed.
+    StorageAdded { storage: Storage },
+    /// Refused while a stack keeps a volume on it.
+    StorageRemoved { name: String, at: Ms },
+    /// A volume for one writer (`stack/volume`) leased to the node about to run its workload. Refused while another
+    /// node holds it, unless that node is fenced (or back, fenced, awaiting authorization) or gone: a second writer
+    /// never starts while the first may still write (plan 7.2).
+    LeaseTaken { volume: String, node_id: String, at: Ms },
+    /// Its holder lets the volume go: nothing of it runs there any more.
+    LeaseReleased { volume: String, node_id: String, at: Ms },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -135,6 +148,16 @@ pub enum Rejected {
     BadExposure,
     /// An address, port and protocol another exposure has.
     ExposureTaken,
+    StorageExists,
+    StorageUnknown,
+    /// Storage a stack keeps a volume on.
+    StorageInUse,
+    /// A storage name, source or options that cannot be.
+    BadStorage,
+    /// A volume for one writer used by more than one workload.
+    VolumeShared,
+    /// A volume another node may still be writing to.
+    LeaseHeld,
 }
 
 impl std::fmt::Display for Rejected {
@@ -163,6 +186,12 @@ impl std::fmt::Display for Rejected {
             Rejected::ExposureTaken => "that address already has that port (and protocol) exposed",
             Rejected::BadAddress => "a floating address must be a unicast IPv4 address of a LAN, outside the cluster's range 10.240.0.0/16",
             Rejected::BadName => "a stack or service name must be 1 to 40 of a-z, 0-9 and - (services may have _), starting with a letter or digit",
+            Rejected::StorageExists => "the cluster has storage of that name already",
+            Rejected::StorageUnknown => "no such storage (or volume on it)",
+            Rejected::StorageInUse => "a stack keeps a volume on that storage: remove the stack first",
+            Rejected::BadStorage => "storage is named 1 to 40 of a-z, 0-9 and -; nfs is host:/export with options of letters, digits and = , . _ : - /; path is an absolute directory other than /",
+            Rejected::VolumeShared => "a volume for one writer (access: one) is used by one workload only: one service with one replica, or access: many",
+            Rejected::LeaseHeld => "another node holds that volume and may still be writing to it",
         })
     }
 }
@@ -310,6 +339,9 @@ pub enum Op {
         /// On its stack's network (G9); none: Docker's default network.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         net: Option<Attach>,
+        /// Its named volumes on shared storage (G11), for the worker to make ready and bind.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        storage: Vec<StorageMount>,
     },
     StopContainer {
         workload_id: String,
@@ -469,6 +501,100 @@ pub struct Stack {
     /// The nodes chosen for it to run on; none: any.
     #[serde(default)]
     pub nodes: Vec<String>,
+    /// Its named volumes kept on shared storage (G11), by volume name.
+    #[serde(default)]
+    pub volumes: BTreeMap<String, StackVolume>,
+}
+
+/// Where a stack keeps a named volume (G11): on the cluster's storage of that name, for one writer at a time or many.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StackVolume {
+    pub storage: String,
+    #[serde(default)]
+    pub access: Access,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Access {
+    /// One workload writes it, on one node at a time (leased): a database's files.
+    #[default]
+    One,
+    /// Any number of workloads, on any nodes at once: what the application itself keeps safe to share.
+    Many,
+}
+
+/// Shared storage given to the cluster (G11, plan 8). The workers make it ready where a workload needs it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Storage {
+    pub name: String,
+    pub driver: StorageDriver,
+    /// nfs: `host:/export`; path: an absolute directory that is the same shared storage on every node.
+    pub source: String,
+    /// nfs: mount options, as `mount -o` takes them; none for path.
+    #[serde(default)]
+    pub options: String,
+    pub added_at: Ms,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StorageDriver {
+    /// An NFS export the worker mounts itself.
+    Nfs,
+    /// A directory made shared outside Freightdock (a mount the host has, a bind mount into a container).
+    Path,
+}
+
+/// What a storage driver can do (plan 8.3), for the scheduler and the person reading.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct Capabilities {
+    pub multi_host_mount: bool,
+    pub multi_host_write: bool,
+    /// The worker can take writes away itself when it fences (it unmounts).
+    pub write_revocation: bool,
+    /// The managers keep one writer at a time on a volume for one writer.
+    pub leases: bool,
+}
+
+impl StorageDriver {
+    pub fn capabilities(self) -> Capabilities {
+        Capabilities { multi_host_mount: true, multi_host_write: true, write_revocation: self == StorageDriver::Nfs, leases: true }
+    }
+}
+
+impl Storage {
+    /// Whether it is well formed: a name like a stack's; an nfs source `host:/export` and options of plain
+    /// characters; a path source absolute, not `/`, and nothing that would read as another part of a bind.
+    pub fn valid(&self) -> bool {
+        let plain = |s: &str, extra: &str| s.chars().all(|c| c.is_ascii_alphanumeric() || extra.contains(c));
+        let abs = |p: &str| p.starts_with('/') && p != "/" && !p.split('/').any(|c| c == "..") && plain(p, "/._-");
+        valid_stack_name(&self.name)
+            && match self.driver {
+                StorageDriver::Nfs => self.source.split_once(":/").is_some_and(|(host, path)| !host.is_empty() && plain(host, ".-[]") && abs(&format!("/{path}"))) && plain(&self.options, "=,._:-/"),
+                StorageDriver::Path => abs(&self.source) && self.options.is_empty(),
+            }
+    }
+}
+
+/// A named volume on shared storage as a worker needs it (G11): the storage, and the volume's directory on it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageMount {
+    pub volume: String,
+    pub storage: String,
+    pub driver: StorageDriver,
+    pub source: String,
+    #[serde(default)]
+    pub options: String,
+    /// `<stack>/<volume>`.
+    pub dir: String,
+}
+
+/// A volume for one writer held by a node (G11).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Lease {
+    pub node_id: String,
+    pub since: Ms,
 }
 
 /// One of a stack's services reached from outside the cluster on a pool address (G10.5): `address:port` goes to the
@@ -613,6 +739,12 @@ pub struct ClusterState {
     /// The floating addresses (G10.3), the pool, by address.
     #[serde(default)]
     pub floating: BTreeMap<String, Floating>,
+    /// Shared storage (G11), by name.
+    #[serde(default)]
+    pub storage: BTreeMap<String, Storage>,
+    /// Volumes for one writer and the node each is leased to, by `stack/volume`.
+    #[serde(default)]
+    pub leases: BTreeMap<String, Lease>,
 }
 
 /// A floating address: on its holder's LAN, answering the published ports as the nodes' own addresses do.
@@ -725,8 +857,10 @@ pub struct Recovery {
 pub enum RecoveryKind {
     /// No data of its own: started again elsewhere once its node is fenced.
     Stateless,
-    /// Has volumes, which live on its node: it waits for the node (G11 brings shared storage).
+    /// Has volumes, which live on its node: it waits for the node.
     LocalData,
+    /// Its volumes are all on shared storage (G11): it moves once its node is fenced, as a stateless one does.
+    SharedStorage,
     /// `x-freightdock: {ha: false}`: stays until someone moves it.
     Pinned,
 }
@@ -808,11 +942,48 @@ impl ClusterState {
         let sp = self.stacks.get(&w.stack).and_then(|s| s.services.get(&w.service));
         if sp.is_some_and(|sp| !sp.ha) {
             RecoveryKind::Pinned
-        } else if !w.spec.volumes.is_empty() {
-            RecoveryKind::LocalData
-        } else {
+        } else if w.spec.volumes.is_empty() {
             RecoveryKind::Stateless
+        } else if w.spec.volumes.iter().all(|v| self.shared_volume(&w.stack, v).is_some()) {
+            RecoveryKind::SharedStorage
+        } else {
+            RecoveryKind::LocalData
         }
+    }
+
+    /// The stack's volume on shared storage that `volume` (`source:target[:mode]`) names, if it is one.
+    pub fn shared_volume(&self, stack: &str, volume: &str) -> Option<(&str, &StackVolume)> {
+        let src = volume.split(':').next()?;
+        self.stacks.get(stack)?.volumes.get_key_value(src).map(|(k, v)| (k.as_str(), v))
+    }
+
+    /// What the worker needs to bind the workload's volumes on shared storage.
+    pub fn storage_mounts(&self, w: &Workload) -> Vec<StorageMount> {
+        w.spec
+            .volumes
+            .iter()
+            .filter_map(|v| self.shared_volume(&w.stack, v))
+            .filter_map(|(name, v)| {
+                let st = self.storage.get(&v.storage)?;
+                Some(StorageMount { volume: name.to_string(), storage: st.name.clone(), driver: st.driver, source: st.source.clone(), options: st.options.clone(), dir: format!("{}/{name}", w.stack) })
+            })
+            .collect()
+    }
+
+    /// The workload's volumes for one writer, as leases are named (`stack/volume`).
+    pub fn exclusive_volumes(&self, w: &Workload) -> Vec<String> {
+        w.spec.volumes.iter().filter_map(|v| self.shared_volume(&w.stack, v)).filter(|(_, v)| v.access == Access::One).map(|(name, _)| format!("{}/{name}", w.stack)).collect()
+    }
+
+    /// The workloads of `stack` that use its volume `name`.
+    pub fn volume_users<'a>(&'a self, stack: &'a str, name: &'a str) -> impl Iterator<Item = &'a Workload> + 'a {
+        self.workloads.values().filter(move |w| w.stack == stack && w.spec.volumes.iter().any(|v| v.split(':').next() == Some(name)))
+    }
+
+    /// Whether `node` may hold a volume another node holds now: that one is fenced (or back, fenced, awaiting
+    /// authorization) or gone.
+    fn may_take_over(&self, holder: &str) -> bool {
+        self.nodes.get(holder).is_none_or(|n| matches!(n.fencing.state, FenceState::Fenced | FenceState::AwaitingAuthorization))
     }
 
     pub fn should_run(&self, w: &Workload) -> bool {
@@ -916,6 +1087,7 @@ impl ClusterState {
                 for f in self.floating.values_mut().filter(|f| f.holder.as_ref() == Some(node_id)) {
                     f.holder = None;
                 }
+                self.leases.retain(|_, l| l.node_id != *node_id);
             }
             Entry::FloatingAdded { address, at } => {
                 if !floating_ok(address) {
@@ -986,9 +1158,18 @@ impl ClusterState {
                 }
                 self.commands.insert(command.id.clone(), command.clone());
             }
-            Entry::StackDeployed { name, compose, services, placements, at, nodes, exposures: given } => {
+            Entry::StackDeployed { name, compose, services, placements, at, nodes, exposures: given, volumes } => {
                 if !valid_stack_name(name) || !services.keys().all(|s| valid_service_name(s)) {
                     return Err(Rejected::BadName);
+                }
+                for (vol, v) in volumes {
+                    if !self.storage.contains_key(&v.storage) {
+                        return Err(Rejected::StorageUnknown);
+                    }
+                    let users: u32 = services.values().filter(|sp| sp.volumes.iter().any(|x| x.split(':').next() == Some(vol.as_str()))).map(|sp| sp.replicas).sum();
+                    if v.access == Access::One && users > 1 {
+                        return Err(Rejected::VolumeShared);
+                    }
                 }
                 if nodes.iter().any(|n| !self.nodes.contains_key(n)) {
                     return Err(Rejected::NodeUnknown);
@@ -1048,7 +1229,7 @@ impl ClusterState {
                     Some(list) => list.clone(),
                     None => self.stacks.get(name).map(|s| s.exposures.iter().filter(|e| services.contains_key(&e.service)).cloned().collect()).unwrap_or_default(),
                 };
-                self.stacks.insert(name.clone(), Stack { name: name.clone(), compose: compose.clone(), services: services.clone(), stopped: false, created_at, updated_at: *at, net, exposures, nodes: nodes.clone() });
+                self.stacks.insert(name.clone(), Stack { name: name.clone(), compose: compose.clone(), services: services.clone(), stopped: false, created_at, updated_at: *at, net, exposures, nodes: nodes.clone(), volumes: volumes.clone() });
             }
             Entry::StackExposed { name, exposures, at } => {
                 let st = self.stacks.get(name).ok_or(Rejected::StackUnknown)?;
@@ -1057,6 +1238,48 @@ impl ClusterState {
                 st.exposures = exposures.clone();
                 st.updated_at = *at;
             }
+            Entry::StorageAdded { storage } => {
+                if !storage.valid() {
+                    return Err(Rejected::BadStorage);
+                }
+                if self.storage.contains_key(&storage.name) {
+                    return Err(Rejected::StorageExists);
+                }
+                self.storage.insert(storage.name.clone(), storage.clone());
+            }
+            Entry::StorageRemoved { name, .. } => {
+                if !self.storage.contains_key(name) {
+                    return Err(Rejected::StorageUnknown);
+                }
+                if self.stacks.values().any(|st| st.volumes.values().any(|v| v.storage == *name)) {
+                    return Err(Rejected::StorageInUse);
+                }
+                self.storage.remove(name);
+            }
+            Entry::LeaseTaken { volume, node_id, at } => {
+                if !self.nodes.contains_key(node_id) {
+                    return Err(Rejected::NodeUnknown);
+                }
+                let (stack, vol) = volume.split_once('/').ok_or(Rejected::StorageUnknown)?;
+                let v = self.stacks.get(stack).and_then(|st| st.volumes.get(vol)).ok_or(Rejected::StorageUnknown)?;
+                if v.access != Access::One {
+                    return Err(Rejected::BadStorage);
+                }
+                match self.leases.get(volume) {
+                    Some(l) if l.node_id == *node_id => {}
+                    Some(l) if !self.may_take_over(&l.node_id) => return Err(Rejected::LeaseHeld),
+                    _ => {
+                        self.leases.insert(volume.clone(), Lease { node_id: node_id.clone(), since: *at });
+                    }
+                }
+            }
+            Entry::LeaseReleased { volume, node_id, .. } => match self.leases.get(volume) {
+                Some(l) if l.node_id == *node_id => {
+                    self.leases.remove(volume);
+                }
+                Some(_) => return Err(Rejected::LeaseHeld),
+                None => {}
+            },
             Entry::StackStopped { name, stopped, at } => {
                 let s = self.stacks.get_mut(name).ok_or(Rejected::StackUnknown)?;
                 s.stopped = *stopped;
@@ -1071,7 +1294,7 @@ impl ClusterState {
                 }
                 for (id, to) in moves {
                     let w = self.workloads.get(id).ok_or(Rejected::NotRecoverable)?;
-                    if w.node_id != *from || (from.is_some() && self.recovery_kind(w) != RecoveryKind::Stateless) {
+                    if w.node_id != *from || (from.is_some() && !matches!(self.recovery_kind(w), RecoveryKind::Stateless | RecoveryKind::SharedStorage)) {
                         return Err(Rejected::NotRecoverable);
                     }
                     if !self.nodes.contains_key(to) || Some(to) == from.as_ref() {
@@ -1362,6 +1585,7 @@ pub(crate) mod tests {
             at: 50,
             nodes: vec![],
             exposures: None,
+            volumes: Default::default(),
         }
     }
 
@@ -1545,7 +1769,7 @@ pub(crate) mod tests {
         next(&mut s, &Entry::FloatingAdded { address: "192.0.2.10".into(), at: 1 }).unwrap();
         let x = |port: u16| Exposure { service: "web".into(), container_port: 80, protocol: "tcp".into(), address: "192.0.2.10".into(), port };
         let with = |nodes: &[&str], exposures: Option<Vec<Exposure>>| match deploy("a", &[("web", spec("nginx", 1))], &[("a.web.1", "n2")]) {
-            Entry::StackDeployed { name, compose, services, placements, at, .. } => Entry::StackDeployed { name, compose, services, placements, at, nodes: nodes.iter().map(|n| n.to_string()).collect(), exposures },
+            Entry::StackDeployed { name, compose, services, placements, at, .. } => Entry::StackDeployed { name, compose, services, placements, at, nodes: nodes.iter().map(|n| n.to_string()).collect(), exposures, volumes: Default::default() },
             _ => unreachable!(),
         };
         next(&mut s, &with(&["n2"], Some(vec![x(80)]))).unwrap();
@@ -1557,7 +1781,7 @@ pub(crate) mod tests {
         assert_eq!(s.stacks["a"].exposures, vec![x(80)], "and a refusal changes nothing");
         next(&mut s, &deploy("b", &[("web", spec("nginx", 1))], &[("b.web.1", "n1")])).unwrap();
         let b = match with(&[], Some(vec![Exposure { ..x(80) }])) {
-            Entry::StackDeployed { services, at, nodes, exposures, .. } => Entry::StackDeployed { name: "b".into(), compose: String::new(), services, placements: Default::default(), at, nodes, exposures },
+            Entry::StackDeployed { services, at, nodes, exposures, .. } => Entry::StackDeployed { name: "b".into(), compose: String::new(), services, placements: Default::default(), at, nodes, exposures, volumes: Default::default() },
             _ => unreachable!(),
         };
         assert_eq!(next(&mut s, &b), Err(Rejected::ExposureTaken), "80 on .10 is a's");
@@ -1645,7 +1869,7 @@ pub(crate) mod tests {
         assert_eq!(s.recovery_kind(&s.workloads["app.web.1"]), RecoveryKind::Stateless);
         assert_eq!(s.recovery_kind(&s.workloads["app.db.1"]), RecoveryKind::LocalData);
         assert_eq!(s.recovery_kind(&s.workloads["app.cron.1"]), RecoveryKind::Pinned);
-        let c = CommandRecord { op: Op::RunContainer { workload_id: "app.web.1".into(), image: "nginx".into(), name: String::new(), command: vec![], env: Default::default(), labels: Default::default(), generation: 0, ports: vec![], volumes: vec![], limits: Default::default(), net: Default::default() }, ..command("c", "n1") };
+        let c = CommandRecord { op: Op::RunContainer { workload_id: "app.web.1".into(), image: "nginx".into(), name: String::new(), command: vec![], env: Default::default(), labels: Default::default(), generation: 0, ports: vec![], volumes: vec![], limits: Default::default(), net: Default::default(), storage: vec![] }, ..command("c", "n1") };
         next(&mut s, &Entry::CommandCreated { command: c }).unwrap();
 
         let web = recovered(Some("n1"), &[("app.web.1", "n2")], &[("app.db.1", "keeps local data")]);
@@ -1663,6 +1887,87 @@ pub(crate) mod tests {
         assert_eq!(s.recoveries.len(), 2);
         assert_eq!(s.recoveries[1].to, Option::None);
         assert_eq!(next(&mut s, &web), Err(Rejected::NotRecoverable), "not on n1 any more");
+    }
+
+    fn nas() -> Storage {
+        Storage { name: "nas".into(), driver: StorageDriver::Nfs, source: "192.0.2.50:/export/fd".into(), options: String::new(), added_at: 1 }
+    }
+
+    fn on_storage(name: &str, services: &[(&str, ServiceSpec)], placements: &[(&str, &str)], volumes: &[(&str, &str, Access)]) -> Entry {
+        match deploy(name, services, placements) {
+            Entry::StackDeployed { name, compose, services, placements, at, nodes, exposures, .. } => {
+                let volumes = volumes.iter().map(|(v, st, a)| (v.to_string(), StackVolume { storage: st.to_string(), access: *a })).collect();
+                Entry::StackDeployed { name, compose, services, placements, at, nodes, exposures, volumes }
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn storage_is_added_once_checked_and_kept_while_a_stack_uses_it() {
+        let mut s = with_nodes(&["n1"]);
+        next(&mut s, &Entry::StorageAdded { storage: nas() }).unwrap();
+        assert_eq!(next(&mut s, &Entry::StorageAdded { storage: nas() }), Err(Rejected::StorageExists));
+        for bad in [
+            Storage { name: "Bad name".into(), ..nas() },
+            Storage { source: "no-export".into(), ..nas() },
+            Storage { source: "192.0.2.50:relative".into(), ..nas() },
+            Storage { name: "p".into(), driver: StorageDriver::Path, source: "relative/dir".into(), ..nas() },
+            Storage { name: "p".into(), driver: StorageDriver::Path, source: "/".into(), ..nas() },
+            Storage { name: "o".into(), options: "rw;reboot".into(), ..nas() },
+        ] {
+            assert_eq!(next(&mut s, &Entry::StorageAdded { storage: bad.clone() }), Err(Rejected::BadStorage), "{bad:?}");
+        }
+        next(&mut s, &Entry::StorageAdded { storage: Storage { name: "shared".into(), driver: StorageDriver::Path, source: "/mnt/shared".into(), ..nas() } }).unwrap();
+        let db = ServiceSpec { volumes: vec!["data:/var/lib/data".into()], ..spec("postgres", 1) };
+        assert_eq!(next(&mut s, &on_storage("app", &[("db", db.clone())], &[("app.db.1", "n1")], &[("data", "nope", Access::One)])), Err(Rejected::StorageUnknown));
+        next(&mut s, &on_storage("app", &[("db", db.clone())], &[("app.db.1", "n1")], &[("data", "nas", Access::One)])).unwrap();
+        assert_eq!(s.stacks["app"].volumes["data"].storage, "nas");
+        assert_eq!(s.recovery_kind(&s.workloads["app.db.1"]), RecoveryKind::SharedStorage, "its data is on shared storage: it may move");
+        assert_eq!(next(&mut s, &Entry::StorageRemoved { name: "nas".into(), at: 2 }), Err(Rejected::StorageInUse));
+        let two = ServiceSpec { replicas: 2, ..db.clone() };
+        assert_eq!(next(&mut s, &on_storage("app", &[("db", two.clone())], &[("app.db.1", "n1"), ("app.db.2", "n1")], &[("data", "nas", Access::One)])), Err(Rejected::VolumeShared), "one writer: one workload");
+        next(&mut s, &on_storage("app", &[("db", two)], &[("app.db.1", "n1"), ("app.db.2", "n1")], &[("data", "nas", Access::Many)])).unwrap();
+        let mixed = ServiceSpec { volumes: vec!["data:/d".into(), "/srv/local:/l".into()], ..spec("x", 1) };
+        next(&mut s, &on_storage("mix", &[("x", mixed)], &[("mix.x.1", "n1")], &[("data", "nas", Access::One)])).unwrap();
+        assert_eq!(s.recovery_kind(&s.workloads["mix.x.1"]), RecoveryKind::LocalData, "a path on its node keeps it there");
+        next(&mut s, &Entry::StackRemoved { name: "mix".into(), at: 3 }).unwrap();
+        next(&mut s, &Entry::StackRemoved { name: "app".into(), at: 3 }).unwrap();
+        next(&mut s, &Entry::StorageRemoved { name: "nas".into(), at: 4 }).unwrap();
+        assert_eq!(next(&mut s, &Entry::StorageRemoved { name: "nas".into(), at: 4 }), Err(Rejected::StorageUnknown));
+    }
+
+    #[test]
+    fn a_volume_for_one_writer_is_leased_to_one_node_and_taken_over_only_once_it_is_fenced() {
+        use FenceState::*;
+        let mut s = with_nodes(&["n1", "n2"]);
+        next(&mut s, &Entry::StorageAdded { storage: nas() }).unwrap();
+        let db = ServiceSpec { volumes: vec!["data:/var/lib/data".into()], ..spec("postgres", 1) };
+        next(&mut s, &on_storage("app", &[("db", db)], &[("app.db.1", "n1")], &[("data", "nas", Access::One)])).unwrap();
+        let take = |n: &str| Entry::LeaseTaken { volume: "app/data".into(), node_id: n.into(), at: 5 };
+        let give = |n: &str| Entry::LeaseReleased { volume: "app/data".into(), node_id: n.into(), at: 6 };
+        assert_eq!(next(&mut s, &Entry::LeaseTaken { volume: "app/nope".into(), node_id: "n1".into(), at: 5 }), Err(Rejected::StorageUnknown), "no such volume");
+        next(&mut s, &take("n1")).unwrap();
+        next(&mut s, &take("n1")).unwrap();
+        assert_eq!(s.leases["app/data"].node_id, "n1");
+        assert_eq!(next(&mut s, &take("n2")), Err(Rejected::LeaseHeld), "n1 may still write");
+        assert_eq!(next(&mut s, &give("n2")), Err(Rejected::LeaseHeld), "only its holder lets it go");
+        next(&mut s, &give("n1")).unwrap();
+        next(&mut s, &take("n2")).unwrap();
+        next(&mut s, &give("n2")).unwrap();
+        next(&mut s, &take("n1")).unwrap();
+        for st in [Requested, InProgress] {
+            fence(&mut s, st).unwrap();
+            assert_eq!(next(&mut s, &take("n2")), Err(Rejected::LeaseHeld), "{st:?}: not fenced yet");
+        }
+        fence(&mut s, Fenced).unwrap();
+        next(&mut s, &take("n2")).unwrap();
+        assert_eq!(s.leases["app/data"].node_id, "n2", "taken over from a fenced node");
+        next(&mut s, &recovered(Some("n1"), &[("app.db.1", "n2")], &[])).unwrap();
+        assert_eq!(s.workloads["app.db.1"].node_id.as_deref(), Some("n2"), "its data is shared: it moves off the fenced node");
+        next(&mut s, &Entry::NodeRemoved { node_id: "n2".into(), at: 7 }).unwrap();
+        assert!(!s.leases.contains_key("app/data"), "a removed node holds nothing");
+        assert_eq!(next(&mut s, &Entry::LeaseTaken { volume: "app/data".into(), node_id: "n9".into(), at: 5 }), Err(Rejected::NodeUnknown));
     }
 
     #[test]
@@ -1727,7 +2032,7 @@ pub(crate) mod tests {
 
     #[test]
     fn entries_read_back_as_written() {
-        let e = Entry::CommandCreated { command: CommandRecord { op: Op::RunContainer { workload_id: "w".into(), image: "nginx".into(), name: String::new(), command: vec![], env: Default::default(), labels: Default::default(), generation: 4, ports: vec![Port { host_port: 80, container_port: 8080, protocol: "tcp".into(), host_ip: String::new() }], volumes: vec!["d:/d".into()], limits: Resources { cpu_millis: 500, memory_bytes: 0 }, net: Default::default() }, ..command("c", "n1") } };
+        let e = Entry::CommandCreated { command: CommandRecord { op: Op::RunContainer { workload_id: "w".into(), image: "nginx".into(), name: String::new(), command: vec![], env: Default::default(), labels: Default::default(), generation: 4, ports: vec![Port { host_port: 80, container_port: 8080, protocol: "tcp".into(), host_ip: String::new() }], volumes: vec!["d:/d".into()], limits: Resources { cpu_millis: 500, memory_bytes: 0 }, net: Default::default(), storage: vec![] }, ..command("c", "n1") } };
         let back: Entry = serde_json::from_str(&serde_json::to_string(&e).unwrap()).unwrap();
         assert_eq!(back, e);
         let old = r#"{"type":"command_created","command":{"id":"c","node_id":"n","op":{"op":"run_container","workload_id":"w","image":"i"},"config_version":0,"created_at":0,"deadline":0,"status":"pending","message":"","result_json":"","updated_at":0}}"#;

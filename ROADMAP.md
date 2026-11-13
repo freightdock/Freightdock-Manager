@@ -21,7 +21,7 @@ Status marks: **[x]** done, **[~]** in progress, **[ ]** not started.
 | 8 | G8 UI: Freightdock as the cluster's UI | Usable by people, not just the CLI; can start in parallel once G4's API settles | G4 | **done** |
 | 9 | G9 Internal networking (Network repo) | Stable workload IPs across workers; postponed by the plan's first release | G7 | **done** (2026-11-12, small items left) |
 | 10 | G10 External networking | Exposing services without per-deploy setup | G9 | **done** (2026-11-13) |
-| 11 | G11 Shared storage | Moving stateful workloads safely; needs fencing and storage leases | G6, G7 | not started |
+| 11 | G11 Shared storage | Moving stateful workloads safely; needs fencing and storage leases | G6, G7 | first slice done (2026-11-13) |
 | 12 | G12 Advanced | Ceph, replicated storage, gateway redundancy, anti-affinity, more fencing providers | G9 to G11 | not started |
 
 G1 to G7 plus basic monitoring is the plan's **first working release** (plan section 14). G6 is ranked before G7
@@ -166,8 +166,8 @@ Ranked inside the goal:
 
 1. [x] The node fencing state machine on the manager (suspect, unreachable, fencing requested, in progress, fenced,
        failed, awaiting authorization, authorized), in the replicated state; the leader drives it.
-2. [x] Worker self-fencing timers (N, N+X, N+X+Y), configurable; stop managed workloads at N. X (storage) does
-       nothing yet: there are no storage leases until G11.
+2. [x] Worker self-fencing timers (N, N+X, N+X+Y), configurable; stop managed workloads at N; at N+X the worker
+       unmounts the cluster's NFS storage (G11).
 3. [x] A local watchdog so a frozen worker-agent still fences: systemd's (`Type=notify`, `WatchdogSec=30`). Its limit:
        a restarted worker starts fenced, but a host frozen as a whole (kernel, not the agent) is only covered by
        the reboot step or an external provider.
@@ -292,6 +292,30 @@ address across nodes later.
        announced. A stack runs on the nodes chosen for it (`Stack.nodes`, `stack deploy --on`), moved there when the
        choice changes; a deploy takes its exposures too, checked whole; `POST /v1/stack-check` answers what a deploy
        would do. In the UI (`freightdock:cluster-ui-15`): the deployer page, search and filters ("Cluster" 19, 20).
+
+### G11: shared storage
+
+Built 2026-11-13 (plan 4.6, 5.2, 7.1, 8), the first slice; the README's "Shared storage" says how it is used.
+
+1. [x] Storage definitions in the replicated state (`StorageAdded`, `StorageRemoved`, refused while a stack keeps
+       a volume on it), each driver's capabilities (plan 8.3): `nfs` (the worker mounts it; it can take writes away)
+       and `path` (a directory the host shares, for nodes that cannot mount NFS, such as unprivileged LXCs).
+       `/v1/storage`, CLI `storage ls|add|rm`.
+2. [x] A Compose volume on storage (`x-freightdock: {storage, access}`), kept on the stack; `access: one` is one
+       workload's only; the worker makes the storage ready and binds `<stack>/<volume>` from it.
+3. [x] Leases (`LeaseTaken`, `LeaseReleased`): a volume for one writer is leased to one node; another takes it only
+       once the holder let it go or is fenced (or gone). The reconcile takes the lease before a run and lets it go
+       when nothing of the volume runs on the node any more; stops and removals go before runs, so a move hands over.
+4. [x] Recovery: a workload whose volumes are all on shared storage moves once its node is fenced, as a stateless one
+       does. Fencing unmounts the node's NFS storage at N+X.
+5. [x] Tried on the test cluster with a `path` storage (a local directory on each worker; the workers are
+       unprivileged LXCs, which may not mount NFS): moves both ways handed over with no overlap, and a worker cut off
+       was fenced, its writer stopped and run on the other worker 45 s after its last write.
+6. [ ] The owner's NFS share on the test cluster: needs the workers to see it (a Proxmox bind mount into each worker
+       as a `path` storage, or NFS mounting allowed), the owner's call.
+7. [ ] The UI: storage on the Cluster page, volumes on the stack pages and the deployer.
+8. [ ] Left for later: storage health reported by the workers, read-only remounts, SMB, block storage and the
+       cluster filesystems (plan 8.2), replicated storage (G12).
 
 ## Open questions for the owner
 

@@ -29,8 +29,8 @@ impl IntoResponse for ApiError {
 impl From<ProposeError> for ApiError {
     fn from(e: ProposeError) -> Self {
         match e {
-            ProposeError::Rejected(r @ (Rejected::NodeUnknown | Rejected::CommandUnknown | Rejected::StackUnknown | Rejected::FloatingUnknown)) => ApiError(StatusCode::NOT_FOUND, r.to_string()),
-            ProposeError::Rejected(r @ (Rejected::BadAddress | Rejected::BadExposure)) => ApiError(StatusCode::BAD_REQUEST, r.to_string()),
+            ProposeError::Rejected(r @ (Rejected::NodeUnknown | Rejected::CommandUnknown | Rejected::StackUnknown | Rejected::FloatingUnknown | Rejected::StorageUnknown)) => ApiError(StatusCode::NOT_FOUND, r.to_string()),
+            ProposeError::Rejected(r @ (Rejected::BadAddress | Rejected::BadExposure | Rejected::BadStorage | Rejected::VolumeShared)) => ApiError(StatusCode::BAD_REQUEST, r.to_string()),
             ProposeError::Rejected(r) => ApiError(StatusCode::CONFLICT, r.to_string()),
             e @ (ProposeError::Unavailable(_) | ProposeError::NotLeader(_)) => ApiError(StatusCode::SERVICE_UNAVAILABLE, e.to_string()),
             ProposeError::Io(e) => {
@@ -93,6 +93,8 @@ pub fn router(m: Arc<Manager>) -> Router {
         .route("/v1/floating", get(floating).post(add_floating))
         .route("/v1/traffic", get(traffic))
         .route("/v1/floating/{address}", axum::routing::delete(remove_floating))
+        .route("/v1/storage", get(storage).post(add_storage))
+        .route("/v1/storage/{name}", axum::routing::delete(remove_storage))
         .route("/v1/cluster", get(cluster))
         .route("/v1/nodes", get(nodes))
         .route("/v1/nodes/{id}", get(node).delete(remove_node))
@@ -387,6 +389,53 @@ async fn remove_floating(State(m): State<Arc<Manager>>, h: HeaderMap, Path(addre
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// The cluster's shared storage (G11): each with what its driver can do, the stacks keeping volumes on it, and the
+/// volumes for one writer with the node each is leased to.
+async fn storage(State(m): State<Arc<Manager>>, h: HeaderMap) -> R<Json<Value>> {
+    authed(&m, &h)?;
+    Ok(Json(m.store.read(|s| {
+        Value::Array(
+            s.storage
+                .values()
+                .map(|st| {
+                    let volumes: Vec<Value> = s
+                        .stacks
+                        .values()
+                        .flat_map(|stack| stack.volumes.iter().filter(|(_, v)| v.storage == st.name).map(move |(name, v)| (stack, name, v)))
+                        .map(|(stack, name, v)| json!({ "stack": stack.name, "volume": name, "access": v.access, "holder": s.leases.get(&format!("{}/{name}", stack.name)).map(|l| &l.node_id) }))
+                        .collect();
+                    json!({ "name": st.name, "driver": st.driver, "source": st.source, "options": st.options, "added_at": st.added_at, "capabilities": st.driver.capabilities(), "volumes": volumes })
+                })
+                .collect(),
+        )
+    })))
+}
+
+#[derive(Deserialize)]
+struct StorageBody {
+    name: String,
+    driver: crate::state::StorageDriver,
+    source: String,
+    #[serde(default)]
+    options: String,
+}
+
+async fn add_storage(State(m): State<Arc<Manager>>, h: HeaderMap, Json(b): Json<StorageBody>) -> R<StatusCode> {
+    authed(&m, &h)?;
+    let storage = crate::state::Storage { name: b.name.trim().to_string(), driver: b.driver, source: b.source.trim().to_string(), options: b.options.trim().to_string(), added_at: now_ms() };
+    let name = storage.name.clone();
+    m.store.propose(Entry::StorageAdded { storage }).await?;
+    m.events.push("storage", None, format!("storage {name} added"));
+    Ok(StatusCode::CREATED)
+}
+
+async fn remove_storage(State(m): State<Arc<Manager>>, h: HeaderMap, Path(name): Path<String>) -> R<StatusCode> {
+    authed(&m, &h)?;
+    m.store.propose(Entry::StorageRemoved { name: name.clone(), at: now_ms() }).await?;
+    m.events.push("storage", None, format!("storage {name} removed"));
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// A token for another manager to join with (`FREIGHTDOCK_MANAGER_JOIN_TOKEN`). Good once, an hour by default.
 async fn manager_token(State(m): State<Arc<Manager>>, h: HeaderMap, body: Option<Json<TokenBody>>) -> R<Json<Value>> {
     authed(&m, &h)?;
@@ -546,7 +595,7 @@ fn stack_json(m: &Manager, s: &crate::state::ClusterState, st: &crate::state::St
         })
         .collect();
     let services: serde_json::Map<String, Value> = st.services.iter().map(|(k, v)| (k.clone(), json!({ "image": v.image, "replicas": v.replicas, "ports": v.ports, "ha": v.ha, "limits": v.limits, "placement": { "constraints": v.placement.constraints.iter().map(ToString::to_string).collect::<Vec<_>>(), "prefer": v.placement.prefer.iter().map(ToString::to_string).collect::<Vec<_>>(), "spread": v.placement.spread, "reserve": v.placement.reserve } }))).collect();
-    let mut v = json!({ "name": st.name, "subnet": s.subnet(&st.name), "stopped": st.stopped, "created_at": st.created_at, "updated_at": st.updated_at, "services": services, "workloads": workloads, "exposures": st.exposures, "nodes": st.nodes });
+    let mut v = json!({ "name": st.name, "subnet": s.subnet(&st.name), "stopped": st.stopped, "created_at": st.created_at, "updated_at": st.updated_at, "services": services, "workloads": workloads, "exposures": st.exposures, "nodes": st.nodes, "volumes": st.volumes.iter().map(|(k, v)| (k.clone(), json!({ "storage": v.storage, "access": v.access, "holder": s.leases.get(&format!("{}/{k}", st.name)).map(|l| &l.node_id) }))).collect::<serde_json::Map<String, Value>>() });
     if with_compose {
         v["compose"] = json!(st.compose);
     }
@@ -593,7 +642,7 @@ async fn ui_deploy(State(m): State<Arc<Manager>>, h: HeaderMap, Json(b): Json<Ui
     let compose = format!("# The managers' own stack: the Freightdock UI (PUT /v1/ui).\nservices:\n  {}:\n    image: {image}\n", crate::ui::SERVICE);
     let placements = m.store.read(|s| crate::stacks::place(s, crate::ui::STACK, &services, &m.eligible(s), &[])).map_err(|e| ApiError(StatusCode::CONFLICT, e))?;
     let existed = m.store.read(|s| s.stacks.contains_key(crate::ui::STACK));
-    m.store.propose(Entry::StackDeployed { name: crate::ui::STACK.into(), compose, services, placements, at: now_ms(), nodes: vec![], exposures: None }).await?;
+    m.store.propose(Entry::StackDeployed { name: crate::ui::STACK.into(), compose, services, placements, at: now_ms(), nodes: vec![], exposures: None, volumes: Default::default() }).await?;
     m.events.push("ui", None, format!("the UI {} ({image})", if existed { "updated" } else { "deployed" }));
     let (code, Json(v)) = (if existed { StatusCode::OK } else { StatusCode::CREATED }, ui_status(State(m), h).await?);
     Ok((code, Json(v)))
@@ -642,6 +691,11 @@ fn ready(m: &Manager, b: &DeployBody) -> R<(String, Ready)> {
     }
     let parsed = crate::compose::parse(&b.compose).map_err(|e| ApiError(StatusCode::BAD_REQUEST, e))?;
     m.store.read(|s| {
+        for (vol, v) in &parsed.volumes {
+            if !s.storage.contains_key(&v.storage) {
+                return Err(ApiError(StatusCode::BAD_REQUEST, format!("volume {vol}: the cluster has no storage named {:?} (storage add)", v.storage)));
+            }
+        }
         let nodes = match &b.nodes {
             None => s.stacks.get(&name).map(|st| st.nodes.clone()).unwrap_or_default(),
             Some(list) => {
@@ -682,7 +736,7 @@ async fn stack_check(State(m): State<Arc<Manager>>, h: HeaderMap, Json(b): Json<
         Err(why) => (Value::Null, json!(why)),
     };
     let exists = m.store.read(|s| s.stacks.contains_key(&name));
-    Ok(Json(json!({ "name": name, "exists": exists, "services": services, "warnings": r.parsed.warnings, "nodes": r.nodes, "placements": placements, "unplaced": unplaced })))
+    Ok(Json(json!({ "name": name, "exists": exists, "services": services, "warnings": r.parsed.warnings, "nodes": r.nodes, "placements": placements, "unplaced": unplaced, "volumes": r.parsed.volumes })))
 }
 
 /// Makes or changes a stack from a Compose file: its new workloads are placed on connected nodes with Docker (the
@@ -693,7 +747,7 @@ async fn deploy_stack(State(m): State<Arc<Manager>>, h: HeaderMap, Json(b): Json
     let (name, r) = ready(&m, &b)?;
     let placements = r.placements.map_err(|e| ApiError(StatusCode::CONFLICT, e))?;
     let existed = m.store.read(|s| s.stacks.contains_key(&name));
-    m.store.propose(Entry::StackDeployed { name: name.clone(), compose: b.compose, services: r.parsed.services, placements, at: now_ms(), nodes: r.nodes, exposures: b.exposures }).await?;
+    m.store.propose(Entry::StackDeployed { name: name.clone(), compose: b.compose, services: r.parsed.services, placements, at: now_ms(), nodes: r.nodes, exposures: b.exposures, volumes: r.parsed.volumes }).await?;
     m.events.push("stack_deployed", None, format!("stack {name} {}", if existed { "updated" } else { "deployed" }));
     let v = m.store.read(|s| s.stacks.get(&name).map(|st| stack_json(&m, s, st, false))).unwrap_or(Value::Null);
     Ok((if existed { StatusCode::OK } else { StatusCode::CREATED }, Json(json!({ "stack": v, "warnings": r.parsed.warnings }))))

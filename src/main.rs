@@ -25,6 +25,10 @@ freightdock-manager recoveries [stack]      workloads moved off fenced nodes, or
 freightdock-manager api-token create <name> [read|admin]   a token for the API over TLS (shown once)
 freightdock-manager api-token ls|rm <id>    list or revoke the API tokens
 freightdock-manager floating ls|add|rm [address]   the address pool; add takes a range too (192.0.2.10-20, 192.0.2.8/29)
+freightdock-manager storage ls                  the cluster's shared storage, the volumes on it and who holds each
+freightdock-manager storage add <name> nfs <host:/export> [options]   an NFS export the workers mount themselves
+freightdock-manager storage add <name> path <dir>   a directory that is the same shared storage on every node
+freightdock-manager storage rm <name>           take it away (no stack may keep a volume on it)
 freightdock-manager ca                      the cluster CA's certificate (PEM), for a client of the API over TLS
 freightdock-manager ui <image>|off|status   run the Freightdock UI on the cluster, at port 7443 of every manager
 
@@ -220,6 +224,28 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
+        Some("storage") => {
+            use reqwest::Method;
+            match (args.get(1).map(String::as_str), args.get(2), args.get(3).map(String::as_str), args.get(4)) {
+                (Some("ls") | None, ..) => {
+                    let v = call(&config, Method::GET, "/v1/storage", None).await?;
+                    println!("{:<16} {:<6} {:<40} VOLUMES", "NAME", "DRIVER", "SOURCE");
+                    for st in v.as_array().into_iter().flatten() {
+                        let vols: Vec<String> = st["volumes"].as_array().into_iter().flatten().map(|v| format!("{}/{} ({}{})", v["stack"].as_str().unwrap_or(""), v["volume"].as_str().unwrap_or(""), v["access"].as_str().unwrap_or(""), v["holder"].as_str().map(|h| format!(", on {h}")).unwrap_or_default())).collect();
+                        println!("{:<16} {:<6} {:<40} {}", st["name"].as_str().unwrap_or(""), st["driver"].as_str().unwrap_or(""), st["source"].as_str().unwrap_or(""), if vols.is_empty() { "-".to_string() } else { vols.join(", ") });
+                    }
+                }
+                (Some("add"), Some(name), Some(driver @ ("nfs" | "path")), Some(source)) => {
+                    let options = args.get(5).cloned().unwrap_or_default();
+                    call(&config, Method::POST, "/v1/storage", Some(serde_json::json!({ "name": name, "driver": driver, "source": source, "options": options }))).await?;
+                }
+                (Some("rm"), Some(name), ..) => {
+                    call(&config, Method::DELETE, &format!("/v1/storage/{name}"), None).await?;
+                }
+                _ => bail!("{USAGE}"),
+            }
+            Ok(())
+        }
         Some("ui") => {
             use reqwest::Method;
             match args.get(1).map(String::as_str) {
@@ -289,6 +315,10 @@ async fn stack(config: &Config, args: &[String]) -> Result<()> {
             println!("runs on: {}\n", if on.is_empty() { "any healthy node".to_string() } else { on.join(", ") });
             print_workloads(&v);
             print_reach(&v);
+            let vols: Vec<String> = v["volumes"].as_object().into_iter().flatten().map(|(k, x)| format!("{k} on {} ({}{})", x["storage"].as_str().unwrap_or(""), x["access"].as_str().unwrap_or(""), x["holder"].as_str().map(|h| format!(", held by {h}")).unwrap_or_default())).collect();
+            if !vols.is_empty() {
+                println!("\nvolumes on shared storage: {}", vols.join(", "));
+            }
             Ok(())
         }
         (Some("expose"), Some(name)) => {

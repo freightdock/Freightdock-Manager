@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 
 use yaml_serde::Value;
 
-use crate::state::{Constraint, Port, Resources, ServiceSpec, valid_service_name};
+use crate::state::{Access, Constraint, Port, Resources, ServiceSpec, StackVolume, valid_service_name};
 
 /// A Compose file is at most this long.
 pub const MAX_LEN: usize = 256 * 1024;
@@ -18,6 +18,8 @@ pub struct Parsed {
     pub services: BTreeMap<String, ServiceSpec>,
     /// What was set aside, for the person deploying to read.
     pub warnings: Vec<String>,
+    /// Named volumes put on the cluster's storage (`x-freightdock: {storage, access}`); the rest are local.
+    pub volumes: BTreeMap<String, StackVolume>,
 }
 
 const TOP_IGNORED: &[&str] = &["version", "name"];
@@ -31,6 +33,7 @@ pub fn parse(text: &str) -> Result<Parsed, String> {
     let top = doc.as_mapping().ok_or("a Compose file is a mapping with services in it")?;
     let mut warnings = vec![];
     let mut services = BTreeMap::new();
+    let mut volumes = BTreeMap::new();
     for (k, v) in top {
         let k = key(k)?;
         match k.as_str() {
@@ -45,13 +48,21 @@ pub fn parse(text: &str) -> Result<Parsed, String> {
                     services.insert(name, spec);
                 }
             }
-            // Named volumes are made by Docker on first use on each node; their declaration needs nothing more until
-            // a driver is set.
+            // Named volumes are made by Docker on first use on each node, unless one is put on the cluster's storage
+            // (G11); Compose's own options for them are not used.
             "volumes" => {
                 if let Some(m) = v.as_mapping() {
                     for (name, decl) in m {
-                        if decl.as_mapping().is_some_and(|d| !d.is_empty()) {
-                            warnings.push(format!("volume {}: its options are not used; it is a local volume on each node", key(name)?));
+                        let name = key(name)?;
+                        let Some(d) = decl.as_mapping() else { continue };
+                        let ours = d.get("x-freightdock");
+                        if let Some(x) = ours {
+                            volumes.insert(name.clone(), on_storage(x).map_err(|e| format!("volume {name}: {e}"))?);
+                        }
+                        let other: Vec<String> = d.keys().filter_map(|k| k.as_str()).filter(|k| *k != "x-freightdock").map(str::to_string).collect();
+                        if !other.is_empty() {
+                            let kept = if ours.is_some() { "it is on the cluster's storage" } else { "it is a local volume on each node" };
+                            warnings.push(format!("volume {name}: {} not used; {kept}", other.join(", ")));
                         }
                     }
                 }
@@ -67,7 +78,28 @@ pub fn parse(text: &str) -> Result<Parsed, String> {
     if text.contains("${") {
         warnings.push("variables (${...}) are not filled in; they are used as written".into());
     }
-    Ok(Parsed { services, warnings })
+    Ok(Parsed { services, warnings, volumes })
+}
+
+/// A volume's `x-freightdock`: `storage` (a name) and `access` (`one`, the default, or `many`).
+fn on_storage(x: &Value) -> Result<StackVolume, String> {
+    let m = x.as_mapping().ok_or("x-freightdock is a mapping")?;
+    let mut storage = None;
+    let mut access = Access::One;
+    for (k, v) in m {
+        match key(k)?.as_str() {
+            "storage" => storage = Some(v.as_str().filter(|s| !s.is_empty()).ok_or("storage is a name")?.to_string()),
+            "access" => {
+                access = match v.as_str() {
+                    Some("one") => Access::One,
+                    Some("many") => Access::Many,
+                    _ => return Err("access is one or many".into()),
+                }
+            }
+            k => return Err(format!("x-freightdock.{k} is not supported (storage, access)")),
+        }
+    }
+    Ok(StackVolume { storage: storage.ok_or("x-freightdock needs the storage it is on")?, access })
 }
 
 fn key(v: &Value) -> Result<String, String> {
@@ -449,6 +481,37 @@ volumes:
         assert_eq!(a.volumes, vec!["data:/var/lib/data", "/srv/conf:/etc/conf:ro", "/x:/y:ro"]);
         assert_eq!(a.replicas, 3);
         assert_eq!(p.warnings.len(), 1, "restart is set aside: {:?}", p.warnings);
+    }
+
+    #[test]
+    fn a_named_volume_is_put_on_the_cluster_s_storage_for_one_writer_or_many() {
+        let p = parse(
+            r#"
+services:
+  db: {image: postgres, volumes: ["pg:/var/lib/postgresql/data"]}
+  web: {image: nginx, volumes: ["site:/usr/share/nginx/html:ro", "cache:/cache"]}
+volumes:
+  pg:
+    x-freightdock: {storage: nas}
+  site:
+    driver: local
+    x-freightdock: {storage: nas, access: many}
+  cache:
+"#,
+        )
+        .unwrap();
+        assert_eq!(p.volumes["pg"], StackVolume { storage: "nas".into(), access: Access::One }, "one writer unless it says");
+        assert_eq!(p.volumes["site"].access, Access::Many);
+        assert!(!p.volumes.contains_key("cache"), "a plain volume stays local to each node");
+        assert!(p.warnings.iter().any(|w| w.contains("site") && w.contains("driver")), "{:?}", p.warnings);
+        for (y, word) in [
+            ("services: {a: {image: x}}\nvolumes: {v: {x-freightdock: {access: one}}}\n", "storage"),
+            ("services: {a: {image: x}}\nvolumes: {v: {x-freightdock: {storage: nas, access: some}}}\n", "access"),
+            ("services: {a: {image: x}}\nvolumes: {v: {x-freightdock: {storage: nas, size: 5}}}\n", "size"),
+        ] {
+            let e = parse(y).unwrap_err();
+            assert!(e.contains(word), "{e}");
+        }
     }
 
     #[test]

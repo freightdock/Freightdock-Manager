@@ -125,6 +125,8 @@ a client trusts that CA alone and checks that name. `GET /v1/health` and `GET /v
 | `POST /v1/stacks` | `{"name", "compose", "nodes"?, "exposures"?}`: make or change a stack, on the nodes named (ids, `name` labels or hostnames; `[]` any, left out as it was) with its exposures on the pool (left out: as they were); answers it and the file's warnings |
 | `POST /v1/stack-check` | the same body, changing nothing: the services with the ports the file asks for, the warnings, the nodes resolved, and where the new workloads would go (`placements`) or why not (`unplaced`) |
 | `POST /v1/stacks/{name}/start`, `/stop`, `/restart`; `DELETE /v1/stacks/{name}` | run, stop, restart (stop, and the reconcile starts it) or remove |
+| `GET /v1/storage` | the cluster's shared storage (G11): each with its driver's capabilities and the volumes on it, with the node holding each volume for one writer |
+| `POST /v1/storage`, `DELETE /v1/storage/{name}` | `{"name", "driver": "nfs"\|"path", "source", "options"?}`: add storage; take it away (refused while a stack keeps a volume on it) |
 
 ### Stacks
 
@@ -185,10 +187,39 @@ file; the server's certificate is pinned by its SHA-256 fingerprint.
 ### Recovery
 
 Once a node is fenced (and `FREIGHTDOCK_RECOVERY_DELAY_S` has passed), or comes back fenced, the leader places its
-stateless workloads on other nodes as a deploy would. A workload with volumes waits for its node (its data is
-there), and so does a pinned one (`x-freightdock: {ha: false}`); one with nowhere to go is tried again each second.
+stateless workloads, and those whose volumes are all on shared storage, on other nodes as a deploy would. A workload
+with a volume on its node waits for it (its data is there), and so does a pinned one (`x-freightdock: {ha: false}`);
+one with nowhere to go is tried again each second.
 When the node runs again, the workloads that moved are removed from it. `freightdock-manager recoveries [stack]`
 shows what moved where and what stayed and why.
+
+### Shared storage
+
+Storage is given to the cluster once, and a stack keeps a named volume on it from its Compose file:
+
+```sh
+freightdock-manager storage add nas nfs 192.0.2.50:/export/freightdock vers=4.2,hard   # the workers mount it
+freightdock-manager storage add shared path /mnt/shared   # a directory already shared on every node
+```
+
+```yaml
+services:
+  db:
+    image: postgres:17
+    volumes: ["pg:/var/lib/postgresql/data"]
+volumes:
+  pg:
+    x-freightdock: {storage: nas}                # access: one (the default) or many
+```
+
+The volume is the directory `<stack>/<volume>` on the storage. An `nfs` storage is mounted by the worker at
+`<data>/storage/<name>` the first time a workload needs it; a `path` storage is only looked for (a mount the host
+has, or a bind mount into a container that cannot mount NFS itself, such as an unprivileged LXC). A volume for one
+writer (`access: one`, a database's files) is used by one workload, and the managers lease it to one node at a time:
+a workload that moves runs on its new node only once the old one let the volume go (its container there is gone) or
+is fenced. `access: many` is for what the application itself keeps safe to share. A fencing worker unmounts its
+`nfs` storage once its workloads are stopped (`FREIGHTDOCK_FENCE_STORAGE_S` after); a `path` storage is the host's to
+take away. A plain named volume stays local to each node, as before.
 
 ## Build
 

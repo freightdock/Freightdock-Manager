@@ -239,7 +239,7 @@ async fn a_stack_deployed_on_one_manager_is_reconciled_by_the_worker_s_manager()
     let g = b.m.sessions.open("n1", tx, "test".into(), Some(WorkloadReport::default()));
     let parsed = freightdock_manager::compose::parse("services:\n  web:\n    image: nginx:alpine\n").unwrap();
     let placements = [("app.web.1".to_string(), "n1".to_string())].into();
-    a.m.store.propose(Entry::StackDeployed { name: "app".into(), compose: String::new(), services: parsed.services, placements, at: now_ms(), nodes: vec![], exposures: None }).await.unwrap();
+    a.m.store.propose(Entry::StackDeployed { name: "app".into(), compose: String::new(), services: parsed.services, placements, at: now_ms(), nodes: vec![], exposures: None, volumes: Default::default() }).await.unwrap();
     until("the stack on b", || b.m.store.read(|s| s.workloads.contains_key("app.web.1"))).await;
 
     a.m.reconcile().await;
@@ -418,7 +418,7 @@ async fn every_manager_forwards_the_ui_s_port_to_the_node_it_runs_on() {
     a.m.sessions.open("n1", tx, "127.0.0.1:50000".into(), None);
     let services: std::collections::BTreeMap<_, _> = [(freightdock_manager::ui::SERVICE.to_string(), freightdock_manager::ui::spec("i"))].into();
     let placements = [(freightdock_manager::ui::WORKLOAD.to_string(), "n1".to_string())].into();
-    a.m.store.propose(Entry::StackDeployed { name: freightdock_manager::ui::STACK.into(), compose: String::new(), services, placements, at: now_ms(), nodes: vec![], exposures: None }).await.unwrap();
+    a.m.store.propose(Entry::StackDeployed { name: freightdock_manager::ui::STACK.into(), compose: String::new(), services, placements, at: now_ms(), nodes: vec![], exposures: None, volumes: Default::default() }).await.unwrap();
     let mut c = tokio::net::TcpStream::connect(paddr).await.unwrap();
     c.write_all(b"hello").await.unwrap();
     let mut buf = [0u8; 5];
@@ -454,7 +454,7 @@ async fn a_worker_is_sent_its_network_when_it_connects_and_when_it_changes() {
     assert!(network(&mut rx).is_none(), "nothing new, nothing sent");
 
     let parsed = freightdock_manager::compose::parse("services:\n  web:\n    image: nginx\n").unwrap();
-    a.m.store.propose(Entry::StackDeployed { name: "app".into(), compose: String::new(), services: parsed.services, placements: [("app.web.1".to_string(), "n2".to_string())].into(), at: now_ms(), nodes: vec![], exposures: None }).await.unwrap();
+    a.m.store.propose(Entry::StackDeployed { name: "app".into(), compose: String::new(), services: parsed.services, placements: [("app.web.1".to_string(), "n2".to_string())].into(), at: now_ms(), nodes: vec![], exposures: None, volumes: Default::default() }).await.unwrap();
     a.m.push_network();
     let n = network(&mut rx).expect("a workload on n2: a route to it");
     assert_eq!(n.peers[0].addresses, vec!["10.240.0.2/32".to_string(), "10.240.1.2/32".to_string()], "n2's own address and its workload's");
@@ -508,7 +508,7 @@ async fn a_stack_s_exposures_are_set_shown_with_the_stack_and_on_their_pool_addr
     let t = JoinToken::parse(&issue(&a.m, false).await).unwrap();
     a.m.store.propose(Entry::NodeEnrolled { node_id: "n1".into(), hostname: "h".into(), secret_hash: t.secret_hash(), cert_sha256: "c1".into(), at: now_ms() }).await.unwrap();
     let parsed = freightdock_manager::compose::parse("services:\n  web:\n    image: nginx\n").unwrap();
-    a.m.store.propose(Entry::StackDeployed { name: "app".into(), compose: String::new(), services: parsed.services, placements: [("app.web.1".to_string(), "n1".to_string())].into(), at: now_ms(), nodes: vec![], exposures: None }).await.unwrap();
+    a.m.store.propose(Entry::StackDeployed { name: "app".into(), compose: String::new(), services: parsed.services, placements: [("app.web.1".to_string(), "n1".to_string())].into(), at: now_ms(), nodes: vec![], exposures: None, volumes: Default::default() }).await.unwrap();
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = l.local_addr().unwrap().to_string();
     tokio::spawn(freightdock_manager::serve_admin_tls(a.m.clone(), l));
@@ -564,3 +564,39 @@ async fn a_compose_file_is_checked_before_it_is_deployed_on_the_nodes_chosen_for
     assert_eq!(s, 409, "n1 is not connected: {b}");
     a.server.abort();
 }
+
+#[tokio::test]
+async fn storage_is_given_to_the_cluster_and_a_stack_keeps_its_volumes_on_it() {
+    let a = start(None).await;
+    until("a leader", || a.m.store.leader().is_some()).await;
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap().to_string();
+    tokio::spawn(freightdock_manager::serve_admin_tls(a.m.clone(), l));
+    let admin = Some(a.m.admin_token.as_str());
+    let (s, b) = https_with(&a.m, &addr, "POST", "/v1/storage", admin, r#"{"name":"nas","driver":"nfs","source":"192.0.2.50:/export/fd","options":"vers=4.2"}"#).await;
+    assert_eq!(s, 201, "{b}");
+    assert_eq!(https_with(&a.m, &addr, "POST", "/v1/storage", admin, r#"{"name":"bad","driver":"path","source":"relative"}"#).await.0, 400);
+    assert_eq!(https_with(&a.m, &addr, "POST", "/v1/storage", admin, r#"{"name":"nas","driver":"path","source":"/mnt/x"}"#).await.0, 409, "taken");
+    let (s, b) = https_with(&a.m, &addr, "GET", "/v1/storage", admin, "").await;
+    let v: serde_json::Value = serde_json::from_str(&b).unwrap();
+    assert_eq!(s, 200, "{b}");
+    assert_eq!((v[0]["name"].as_str(), v[0]["driver"].as_str(), v[0]["capabilities"]["write_revocation"].as_bool()), (Some("nas"), Some("nfs"), Some(true)), "{b}");
+    let compose = r#"services:\n  db:\n    image: postgres\n    volumes: [\"pg:/var/lib/pg\"]\nvolumes:\n  pg:\n    x-freightdock: {storage: STORE}\n"#;
+    let (s, b) = https_with(&a.m, &addr, "POST", "/v1/stack-check", admin, &format!(r#"{{"name":"app","compose":"{}"}}"#, compose.replace("STORE", "nope"))).await;
+    assert!(s == 400 && b.contains("no storage named"), "{s} {b}");
+    let (s, b) = https_with(&a.m, &addr, "POST", "/v1/stack-check", admin, &format!(r#"{{"name":"app","compose":"{}"}}"#, compose.replace("STORE", "nas"))).await;
+    let v: serde_json::Value = serde_json::from_str(&b).unwrap();
+    assert_eq!((s, v["volumes"]["pg"]["storage"].as_str(), v["volumes"]["pg"]["access"].as_str()), (200, Some("nas"), Some("one")), "{b}");
+    let p = freightdock_manager::compose::parse("services:\n  db:\n    image: postgres\n    volumes: [pg:/var/lib/pg]\nvolumes:\n  pg:\n    x-freightdock: {storage: nas}\n").unwrap();
+    a.m.store.propose(Entry::StackDeployed { name: "app".into(), compose: String::new(), services: p.services, placements: Default::default(), at: now_ms(), nodes: vec![], exposures: None, volumes: p.volumes }).await.unwrap_err();
+    a.m.store.propose(Entry::StackDeployed { name: "app".into(), compose: String::new(), services: Default::default(), placements: Default::default(), at: now_ms(), nodes: vec![], exposures: None, volumes: [("pg".to_string(), freightdock_manager::state::StackVolume { storage: "nas".into(), access: freightdock_manager::state::Access::One })].into() }).await.unwrap();
+    let (s, b) = https_with(&a.m, &addr, "DELETE", "/v1/storage/nas", admin, "").await;
+    assert!(s == 409 && b.contains("remove the stack first"), "in use: {s} {b}");
+    let (_, b) = https_with(&a.m, &addr, "GET", "/v1/stacks/app", admin, "").await;
+    assert!(b.contains(r#""pg":{"access":"one","holder":null,"storage":"nas"}"#), "{b}");
+    a.m.store.propose(Entry::StackRemoved { name: "app".into(), at: now_ms() }).await.unwrap();
+    assert_eq!(https_with(&a.m, &addr, "DELETE", "/v1/storage/nas", admin, "").await.0, 204);
+    assert_eq!(https_with(&a.m, &addr, "DELETE", "/v1/storage/nas", admin, "").await.0, 404);
+    a.server.abort();
+}
+
