@@ -330,6 +330,10 @@ Built 2026-11-13 (plan 4.6, 5.2, 7.1, 8), the first slice; the README's "Shared 
 6. [x] The owner's NFS share on the test cluster (2026-11-13): mounted on the Proxmox host, bound into each worker
        LXC and added as a `path` storage. A volume for many was written from both workers and each saw the other's
        files; a volume for one moved between them handing over the same file 7 s apart, never two writers.
+       The storage step tried 2026-11-13 on a worker in a VM that mounts the export itself (`nfs` storage): cut off
+       from the managers only (the export still in reach), it fenced at 30 s, its writer's last write was at 38 s (the
+       container's stop grace), the export was unmounted at 45 s, and the managers presumed it fenced at 85 s; back, it
+       was authorized, mounted the export again and its writer went on.
 7. [x] The UI (`freightdock:cluster-ui-17`): storage on the Cluster page (added and removed by an Administrator),
        volumes and their holders on the stacks page, the volumes on storage in the deployer ("Cluster" 21).
 8. [ ] Left for later: storage health reported by the workers, read-only remounts, SMB, block storage and the
