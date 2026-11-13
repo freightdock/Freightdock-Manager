@@ -737,6 +737,14 @@ async fn a_node_s_docker_is_asked_through_the_manager_that_holds_its_stream() {
                 let reply = match r.action.as_str() {
                     "containers" => DockerReply { request_id: r.request_id, error: String::new(), json: r#"[{"id":"c1","names":["web"]}]"#.into() },
                     "volumes" => continue,
+                    "container.restart" => {
+                        let bm = bm.clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(Duration::from_millis(600)).await;
+                            bm.docker_replied(DockerReply { request_id: r.request_id, error: String::new(), json: "{}".into() });
+                        });
+                        continue;
+                    }
                     _ => DockerReply { request_id: r.request_id, error: format!("{} refused: {}", r.action, r.target), json: String::new() },
                 };
                 bm.docker_replied(reply);
@@ -763,6 +771,15 @@ async fn a_node_s_docker_is_asked_through_the_manager_that_holds_its_stream() {
     assert_eq!(s, 400, "a read is never a POST");
     let (s, _) = https_with(&a.m, &addr, "GET", "/v1/nodes/nope/docker?action=containers", admin, "").await;
     assert_eq!(s, 404);
+    // Whoever asked for a change may go before it is done: it is done all the same, and on record.
+    let asked = tokio::spawn({
+        let (m, addr) = (a.m.clone(), addr.clone());
+        async move { https_with(&m, &addr, "POST", "/v1/nodes/n1/docker", Some(m.admin_token.as_str()), r#"{"action":"container.restart","target":"web"}"#).await }
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    asked.abort();
+    until("the restart on record", || a.m.events.last(50).iter().any(|e| e.message.contains("container.restart web"))).await;
+
     let started = std::time::Instant::now();
     let e = b.m.docker_within("n1", "volumes", "", Default::default(), Duration::from_millis(300)).await.unwrap_err();
     assert!(e.to_string().contains("did not answer") && started.elapsed() < Duration::from_secs(2), "{e}");
