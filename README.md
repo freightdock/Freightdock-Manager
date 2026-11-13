@@ -122,7 +122,7 @@ a client trusts that CA alone and checks that name. `GET /v1/health` and `GET /v
 | `POST /v1/nodes/{id}/commands` | `{"op": "ping"}` and the other ops; answers the command (202) |
 | `GET /v1/commands?node=`, `GET /v1/commands/{id}` | commands and their status |
 | `GET /v1/stacks`, `GET /v1/stacks/{name}` | stacks with each workload's node, status, container and last command; one with its Compose file |
-| `POST /v1/stacks` | `{"name", "compose", "nodes"?, "exposures"?}`: make or change a stack, on the nodes named (ids or hostnames; `[]` any, left out as it was) with its exposures on the pool (left out: as they were); answers it and the file's warnings |
+| `POST /v1/stacks` | `{"name", "compose", "nodes"?, "exposures"?}`: make or change a stack, on the nodes named (ids, `name` labels or hostnames; `[]` any, left out as it was) with its exposures on the pool (left out: as they were); answers it and the file's warnings |
 | `POST /v1/stack-check` | the same body, changing nothing: the services with the ports the file asks for, the warnings, the nodes resolved, and where the new workloads would go (`placements`) or why not (`unplaced`) |
 | `POST /v1/stacks/{name}/start`, `/stop`, `/restart`; `DELETE /v1/stacks/{name}` | run, stop, restart (stop, and the reconcile starts it) or remove |
 
@@ -136,7 +136,7 @@ file asks for, which the UI offers to expose on the pool when it deploys the sta
 Only the managers' own stack, the UI, has its port answered on every node, for the managers to forward 7443 to. The
 address and port follow the workloads wherever they run.
 
-A stack may be given the nodes it runs on (`stack deploy app app.yml --on w3,w4`, by id or hostname, or the UI): its
+A stack may be given the nodes it runs on (`stack deploy app app.yml --on w3,w4`, by id, `name` label or hostname, or the UI): its
 workloads are placed only there, moved there when the list changes, and wait (unplaced) while none of them can take
 them. None given, it runs on any healthy node.
 

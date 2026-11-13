@@ -647,13 +647,16 @@ fn ready(m: &Manager, b: &DeployBody) -> R<(String, Ready)> {
             Some(list) => {
                 let mut ids = vec![];
                 for n in list.iter().map(|n| n.trim()).filter(|n| !n.is_empty()) {
+                    let by_name: Vec<&String> = s.nodes.values().filter(|x| x.labels.get("name").is_some_and(|l| l == n)).map(|x| &x.id).collect();
                     let by_host: Vec<&String> = s.nodes.values().filter(|x| x.hostname == n).map(|x| &x.id).collect();
                     let id = if s.nodes.contains_key(n) {
                         n.to_string()
+                    } else if let [one] = by_name[..] {
+                        one.clone()
                     } else if let [one] = by_host[..] {
                         one.clone()
                     } else {
-                        return Err(ApiError(StatusCode::BAD_REQUEST, format!("{n:?} is no node's id, or no one node's hostname")));
+                        return Err(ApiError(StatusCode::BAD_REQUEST, format!("{n:?} is no node's id, nor one node's name label or hostname")));
                     };
                     if !ids.contains(&id) {
                         ids.push(id);

@@ -14,7 +14,7 @@ freightdock-manager remove <node>           forget a node; its certificate opens
 freightdock-manager authorize <node>        let a node that came back fenced run workloads again
 freightdock-manager label <node> [k=v ...]  set the node's labels (all of them; none clears them)
 freightdock-manager stack deploy <name> <compose file> [--on node,...]   make or change a stack (- reads the file
-                                            from stdin), on the nodes named (id or hostname; --on any: any node). Its
+                                            from stdin), on the nodes named (id, name label or hostname; --on any: any node). Its
                                             Compose ports open nothing: expose them on the pool with stack expose
 freightdock-manager stack ls                list the stacks
 freightdock-manager stack ps <name>         a stack's workloads: where they run and how they are

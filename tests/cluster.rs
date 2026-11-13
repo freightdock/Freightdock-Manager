@@ -552,6 +552,14 @@ async fn a_compose_file_is_checked_before_it_is_deployed_on_the_nodes_chosen_for
     assert!(a.m.store.read(|s| s.stacks.is_empty()), "a check deploys nothing");
     assert_eq!(https_with(&a.m, &addr, "POST", "/v1/stack-check", admin, r#"{"name":"app","compose":"services: ["}"#).await.0, 400);
     assert_eq!(https_with(&a.m, &addr, "POST", "/v1/stack-check", admin, &format!(r#"{{"name":"app","compose":"{compose}","nodes":["nope"]}}"#)).await.0, 400, "no such node");
+    // Two nodes of one hostname: told apart by their `name` label.
+    let t2 = JoinToken::parse(&issue(&a.m, false).await).unwrap();
+    a.m.store.propose(Entry::NodeEnrolled { node_id: "n2".into(), hostname: "w1".into(), secret_hash: t2.secret_hash(), cert_sha256: "c2".into(), at: now_ms() }).await.unwrap();
+    a.m.store.propose(Entry::NodeLabelsSet { node_id: "n2".into(), labels: [("name".to_string(), "edge".to_string())].into(), at: now_ms() }).await.unwrap();
+    assert_eq!(https_with(&a.m, &addr, "POST", "/v1/stack-check", admin, &format!(r#"{{"name":"app","compose":"{compose}","nodes":["w1"]}}"#)).await.0, 400, "a hostname two nodes have names neither");
+    let (s, b) = https_with(&a.m, &addr, "POST", "/v1/stack-check", admin, &format!(r#"{{"name":"app","compose":"{compose}","nodes":["edge"]}}"#)).await;
+    assert_eq!(s, 200, "{b}");
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&b).unwrap()["nodes"], serde_json::json!(["n2"]), "a node by its name label");
     let (s, b) = https_with(&a.m, &addr, "POST", "/v1/stacks", admin, &format!(r#"{{"name":"app","compose":"{compose}","nodes":["n1"]}}"#)).await;
     assert_eq!(s, 409, "n1 is not connected: {b}");
     a.server.abort();
