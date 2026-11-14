@@ -73,13 +73,16 @@ The other commands talk to a running manager's API (FREIGHTDOCK_MANAGER_API_BIND
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // `freightdock-manager nodes | head` ends quietly when `head` has read enough, as a command-line tool should.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    // `freightdock-manager nodes | head` ends quietly when `head` has read enough, as a command-line tool should; the
+    // server keeps Rust's default (ignored), so a peer that hangs up mid-write is an error, not the manager's end.
     #[cfg(unix)]
-    unsafe {
-        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    if quiet_on_closed_pipe(args.first().map(String::as_str)) {
+        unsafe {
+            libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+        }
     }
     tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "freightdock_manager=info,warn".into())).init();
-    let args: Vec<String> = std::env::args().skip(1).collect();
     let config = Config::from_env()?;
     match args.first().map(String::as_str) {
         None | Some("serve") => serve(config).await,
@@ -812,5 +815,22 @@ fn print_reach(stack: &Value) {
             "no: internal only (reached by name inside the stack)".to_string()
         };
         println!("{:<20} {line}", name);
+    }
+}
+
+/// Whether a command dies quietly on a closed pipe: every command-line one, never the server (`serve`, or none).
+fn quiet_on_closed_pipe(command: Option<&str>) -> bool {
+    !matches!(command, None | Some("serve"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_the_command_line_dies_on_a_closed_pipe_never_the_server() {
+        assert!(!quiet_on_closed_pipe(None), "no command is the server");
+        assert!(!quiet_on_closed_pipe(Some("serve")));
+        assert!(quiet_on_closed_pipe(Some("nodes")));
     }
 }
