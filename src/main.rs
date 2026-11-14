@@ -38,6 +38,10 @@ freightdock-manager storage add <name> cephfs <mons:/path> <name=client,fs=fs> <
                                                 a CephFS the workers' kernels mount; the fencing client evicts a fenced node
 freightdock-manager storage keys <name> <key-file> [fence-client fence-key-file]   a CephFS's keys set anew
 freightdock-manager storage rm <name>           take it away (no stack may keep a volume on it)
+freightdock-manager disks <node>                a node's disks, and which Ceph may take
+freightdock-manager ceph setup <storage> <fs> <node>=<disk>[,<disk>] ...   Ceph on those nodes and disks (the first
+                                                bootstraps), then a cephfs storage of that name
+freightdock-manager ceph [status]|retry|clear   how the setup goes; go on from a failed step; forget it
 freightdock-manager settings                    the cluster's settings, each with where its value comes from
 freightdock-manager settings set <k=v> ...      set some for the whole cluster (v default: back to each manager's own)
 freightdock-manager settings proxmox <https://host:port> <fingerprint> [token-file]   the Proxmox fencing provider
@@ -490,6 +494,52 @@ async fn main() -> Result<()> {
             let bytes = std::fs::read(file).with_context(|| format!("reading {file}"))?;
             let cluster = freightdock_manager::backup::stage_restore(&config.data_dir, &bytes, &passphrase()?)?;
             println!("cluster {cluster} is ready in {}: start this manager now, without FREIGHTDOCK_MANAGER_JOIN, and point the workers' FREIGHTDOCK_MANAGERS at it", config.data_dir.display());
+            Ok(())
+        }
+        Some("disks") => {
+            let Some(node) = args.get(1) else { bail!("{USAGE}") };
+            let v = call(&config, reqwest::Method::GET, &format!("/v1/nodes/{}/docker?action=disks", encode(node)), None).await?;
+            println!("{:<14} {:>10}  {:<5} WHY NOT", "DISK", "SIZE", "FREE");
+            for d in v.as_array().into_iter().flatten() {
+                println!("{:<14} {:>8.1}GB  {:<5} {}", d["path"].as_str().unwrap_or(""), d["size"].as_f64().unwrap_or(0.0) / 1e9, if d["free"] == true { "yes" } else { "no" }, d["why"].as_str().unwrap_or(""));
+            }
+            Ok(())
+        }
+        Some("ceph") => {
+            use reqwest::Method;
+            match args.get(1).map(String::as_str) {
+                Some("setup") => {
+                    let (Some(storage), Some(fs)) = (args.get(2), args.get(3)) else { bail!("{USAGE}") };
+                    let hosts: Vec<Value> = args[4..]
+                        .iter()
+                        .map(|h| {
+                            let (node, disks) = h.split_once('=').with_context(|| format!("{h}: a host is <node>=<disk>[,<disk>]"))?;
+                            Ok(serde_json::json!({ "node_id": node, "disks": disks.split(',').collect::<Vec<_>>() }))
+                        })
+                        .collect::<Result<_>>()?;
+                    let v = call(&config, Method::POST, "/v1/ceph/setup", Some(serde_json::json!({ "storage": storage, "fs": fs, "hosts": hosts }))).await?;
+                    println!("started: {} steps; `freightdock-manager ceph` shows how it goes", v["steps"]);
+                }
+                Some("retry") => {
+                    call(&config, Method::POST, "/v1/ceph/setup/retry", None).await?;
+                }
+                Some("clear") => {
+                    call(&config, Method::DELETE, "/v1/ceph/setup", None).await?;
+                }
+                Some("status") | None => {
+                    let v = call(&config, Method::GET, "/v1/ceph/setup", None).await?;
+                    if v.is_null() {
+                        println!("no Ceph setup");
+                        return Ok(());
+                    }
+                    println!("{} (storage {}, filesystem {}){}", v["state"].as_str().unwrap_or(""), v["storage"].as_str().unwrap_or(""), v["fs"].as_str().unwrap_or(""), v["message"].as_str().filter(|m| !m.is_empty()).map(|m| format!(": {m}")).unwrap_or_default());
+                    for st in v["steps"].as_array().into_iter().flatten() {
+                        let about = format!("{}{}", st["about_name"].as_str().unwrap_or(""), st["disk"].as_str().map(|d| format!(" {d}")).unwrap_or_default());
+                        println!("  {:<8} {:<14} {:<22} {}", st["state"].as_str().unwrap_or(""), st["kind"].as_str().unwrap_or(""), about, st["message"].as_str().unwrap_or("").lines().last().unwrap_or(""));
+                    }
+                }
+                _ => bail!("{USAGE}"),
+            }
             Ok(())
         }
         Some("storage") => {

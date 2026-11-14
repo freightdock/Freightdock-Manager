@@ -454,6 +454,23 @@ ceph fs authorize fs1 client.freightdock / rw                               # th
 ceph auth get-or-create client.fd-fence mon 'allow r' mds 'allow * fsname=fs1'   # the fencing key
 ```
 
+Freightdock can also make the Ceph cluster itself, on workers that are VMs or machines (a container's disks are its
+host's, so a container offers none): pick the nodes and their empty disks (`disks <node>` lists them, with why one
+is not free) and the leader runs the steps one at a time, each a command to one worker that runs cephadm on its host
+(fetched from download.ceph.com into the worker's data directory; lvm2 installed if missing). It prepares each node,
+bootstraps on the first (no dashboard, no monitoring stack; one node alone gets cephadm's single-host defaults),
+trusts cephadm's key on the others and adds them, places 1, 3 or 5 monitors and two managers, keeps two copies with
+two nodes, gives the OSDs a third of each node's memory, makes an OSD of each disk, the filesystem, and the clients'
+keys, which become a `cephfs` storage of the name given and are kept nowhere else (not in the command's record). The
+steps are in the replicated state, so a new leader goes on; a failed step says why, and `ceph retry` goes on from
+it once the cause is fixed. The UI does the same from the Cluster page.
+
+```sh
+freightdock-manager disks <node>
+freightdock-manager ceph setup ceph fs1 <node-a>=/dev/vdb <node-b>=/dev/vdb,/dev/vdc <node-c>=/dev/vdb
+freightdock-manager ceph            # how it goes;  ceph retry | ceph clear
+```
+
 Ceph 20 (tentacle) makes keys of a newer type (they start `Ag`) that the Linux kernel's client does not take yet
 (7.0 says "secret is not valid base64"). The mount key has to be of the older type, which Ceph makes only once its
 monitors allow it (it then warns `AUTH_INSECURE_*`); the fencing key, used by the Ceph image, may stay new:

@@ -626,6 +626,7 @@ pub async fn housekeeping(m: Arc<Manager>) {
         m.expire_overdue().await;
         m.fence_local().await;
         m.fence_round().await;
+        m.setup_round().await;
         m.recover_round().await;
         m.float_round().await;
         m.reconcile().await;

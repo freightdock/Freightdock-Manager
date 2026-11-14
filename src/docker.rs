@@ -15,7 +15,7 @@ use freightdock_proto::v1::{self, DockerReply, DockerRequest, PeerDockerRequest,
 use crate::Manager;
 
 /// What a read may ask; anything else a change.
-pub const READS: [&str; 7] = ["info", "containers", "container", "logs", "images", "volumes", "networks"];
+pub const READS: [&str; 8] = ["info", "containers", "container", "logs", "images", "volumes", "networks", "disks"];
 pub const CHANGES: [&str; 9] = ["container.start", "container.stop", "container.restart", "container.remove", "image.remove", "image.pull", "images.prune", "volume.remove", "network.remove"];
 
 /// How long a reply is waited for: a pull may take minutes, anything else seconds.

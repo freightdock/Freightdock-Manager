@@ -400,7 +400,9 @@ Scoped 2026-11-14 against the plan's phase 11. Much of it came with the earlier 
        a writer on vm2 cut off from the managers stopped at 30 s, a stray writer holding the mount stopped at the
        forced unmount (CephFS aborts the session), the writer ran on vm3 25 s after the managers presumed vm2
        fenced, and vm2's clients were evicted 33 s after (the first worker asked had to pull the image; the retry
-       on another took 1.6 s). Left: Ceph made from the UI (pick workers and disks; cephadm on the nodes).
+       on another took 1.6 s). Ceph made by the managers (`CephSetup`, `Cephadm` steps on the workers, the disks
+       each node offers): tried on the three VMs with their 16 GB disks, 16 steps done the first time, the storage
+       made from the keys step and a writer running on it. Left: the UI for it.
 
 ## Open questions for the owner
 

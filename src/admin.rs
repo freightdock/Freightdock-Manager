@@ -29,8 +29,8 @@ impl IntoResponse for ApiError {
 impl From<ProposeError> for ApiError {
     fn from(e: ProposeError) -> Self {
         match e {
-            ProposeError::Rejected(r @ (Rejected::NodeUnknown | Rejected::CommandUnknown | Rejected::StackUnknown | Rejected::FloatingUnknown | Rejected::StorageUnknown | Rejected::RegistryUnknown | Rejected::ChannelUnknown)) => ApiError(StatusCode::NOT_FOUND, r.to_string()),
-            ProposeError::Rejected(r @ (Rejected::BadAddress | Rejected::BadExposure | Rejected::BadStorage | Rejected::VolumeShared | Rejected::BadSettings | Rejected::BadRegistry | Rejected::BadChannel)) => ApiError(StatusCode::BAD_REQUEST, r.to_string()),
+            ProposeError::Rejected(r @ (Rejected::NodeUnknown | Rejected::CommandUnknown | Rejected::StackUnknown | Rejected::FloatingUnknown | Rejected::StorageUnknown | Rejected::RegistryUnknown | Rejected::ChannelUnknown | Rejected::CephSetupUnknown)) => ApiError(StatusCode::NOT_FOUND, r.to_string()),
+            ProposeError::Rejected(r @ (Rejected::BadAddress | Rejected::BadExposure | Rejected::BadStorage | Rejected::VolumeShared | Rejected::BadSettings | Rejected::BadRegistry | Rejected::BadChannel | Rejected::BadCephSetup)) => ApiError(StatusCode::BAD_REQUEST, r.to_string()),
             ProposeError::Rejected(r) => ApiError(StatusCode::CONFLICT, r.to_string()),
             e @ (ProposeError::Unavailable(_) | ProposeError::NotLeader(_)) => ApiError(StatusCode::SERVICE_UNAVAILABLE, e.to_string()),
             ProposeError::Io(e) => {
@@ -96,6 +96,8 @@ pub fn router(m: Arc<Manager>) -> Router {
         .route("/v1/storage", get(storage).post(add_storage))
         .route("/v1/storage/{name}", axum::routing::delete(remove_storage))
         .route("/v1/storage/{name}/keys", axum::routing::put(set_storage_keys))
+        .route("/v1/ceph/setup", get(ceph_setup).post(start_ceph_setup).delete(clear_ceph_setup))
+        .route("/v1/ceph/setup/retry", post(retry_ceph_setup))
         .route("/v1/settings", get(settings).put(set_settings))
         .route("/v1/settings/proxmox/fingerprint", post(proxmox_fingerprint))
         .route("/v1/settings/proxmox/test", post(proxmox_test))
@@ -560,6 +562,87 @@ async fn set_storage_keys(State(m): State<Arc<Manager>>, h: HeaderMap, Path(name
     let ceph = b.over(old.as_ref());
     m.store.propose(Entry::StorageKeysSet { name: name.clone(), ceph, at: now_ms() }).await?;
     m.events.push("storage", None, format!("storage {name}: its Ceph keys set"));
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Ceph made from the UI (G12.6): the setup being made, or the last, each step with its node's name; null for none.
+async fn ceph_setup(State(m): State<Arc<Manager>>, h: HeaderMap) -> R<Json<Value>> {
+    authed(&m, &h)?;
+    Ok(Json(m.store.read(|s| {
+        let Some(c) = &s.ceph_setup else { return Value::Null };
+        let name = |id: &str| s.nodes.get(id).map_or_else(|| id.to_string(), |n| n.display_name());
+        let mut v = serde_json::to_value(c).unwrap_or(Value::Null);
+        // cephadm's public key is no secret, but nothing a person reading needs.
+        if let Some(o) = v.as_object_mut() {
+            o.remove("public_key");
+        }
+        for (i, st) in c.steps.iter().enumerate() {
+            v["steps"][i]["about_name"] = name(&st.about).into();
+            v["steps"][i]["node_name"] = name(&st.node_id).into();
+        }
+        for (i, hst) in c.hosts.iter().enumerate() {
+            v["hosts"][i]["name"] = name(&hst.node_id).into();
+        }
+        v
+    })))
+}
+
+#[derive(Deserialize)]
+struct CephSetupBody {
+    storage: String,
+    fs: String,
+    #[serde(default)]
+    image: String,
+    hosts: Vec<CephHostBody>,
+}
+
+#[derive(Deserialize)]
+struct CephHostBody {
+    node_id: String,
+    disks: Vec<String>,
+}
+
+/// Starts Ceph on the nodes and disks given (the first node bootstraps). Each node must be heard, at rest, with
+/// Docker, and each disk free as the node itself says (`disks`): nothing on a disk in use is touched.
+async fn start_ceph_setup(State(m): State<Arc<Manager>>, h: HeaderMap, Json(b): Json<CephSetupBody>) -> R<(StatusCode, Json<Value>)> {
+    authed(&m, &h)?;
+    for host in &b.hosts {
+        let ready = m.store.read(|s| s.nodes.get(&host.node_id).map(|n| (n.display_name(), n.fencing.state == crate::state::FenceState::None && n.report.as_ref().is_some_and(|r| r.docker))));
+        let Some((name, at_rest)) = ready else { return Err(ApiError(StatusCode::BAD_REQUEST, format!("no node {}", host.node_id))) };
+        if !at_rest || m.sessions.liveness(&host.node_id).health != crate::sessions::Health::Healthy {
+            return Err(ApiError(StatusCode::CONFLICT, format!("{name} is not heard and at rest with Docker: Ceph is set up on healthy nodes only")));
+        }
+        let disks = m.docker(&host.node_id, "disks", "", Default::default()).await?;
+        for d in &host.disks {
+            let found = disks.as_array().and_then(|l| l.iter().find(|x| x["path"] == d.as_str()).cloned());
+            match found {
+                None => return Err(ApiError(StatusCode::BAD_REQUEST, format!("{name} has no disk {d}"))),
+                Some(x) if x["free"] != true => return Err(ApiError(StatusCode::CONFLICT, format!("{name}'s {d} is not free: {}", x["why"].as_str().unwrap_or("in use")))),
+                _ => {}
+            }
+        }
+    }
+    let image = if b.image.trim().is_empty() { crate::state::DEFAULT_CEPH_IMAGE.to_string() } else { b.image.trim().to_string() };
+    let hosts = b.hosts.into_iter().map(|h| crate::ceph::CephHost { node_id: h.node_id, disks: h.disks, hostname: String::new(), address: String::new() }).collect();
+    let setup = crate::ceph::CephSetup::new(b.storage.trim(), b.fs.trim(), &image, hosts, "an administrator", now_ms());
+    let steps = setup.steps.len();
+    m.store.propose(Entry::CephSetupStarted { setup }).await?;
+    m.events.push("ceph", None, format!("Ceph setup started ({steps} steps)"));
+    Ok((StatusCode::ACCEPTED, Json(json!({ "steps": steps }))))
+}
+
+async fn retry_ceph_setup(State(m): State<Arc<Manager>>, h: HeaderMap) -> R<StatusCode> {
+    authed(&m, &h)?;
+    m.store.propose(Entry::CephSetupRetried { at: now_ms() }).await?;
+    m.events.push("ceph", None, "Ceph setup retried from where it failed".to_string());
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Forgets the setup; what it made (Ceph on the nodes, the storage) stays.
+async fn clear_ceph_setup(State(m): State<Arc<Manager>>, h: HeaderMap) -> R<StatusCode> {
+    authed(&m, &h)?;
+    m.store.propose(Entry::CephSetupCleared { at: now_ms() }).await?;
+    m.events.push("ceph", None, "Ceph setup cleared".to_string());
     Ok(StatusCode::NO_CONTENT)
 }
 

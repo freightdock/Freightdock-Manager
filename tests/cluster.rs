@@ -970,3 +970,58 @@ async fn a_cephfs_s_keys_are_kept_never_shown_and_go_with_its_mounts_and_its_cep
     assert!(list.contains(r#""fence_secret_set":false"#), "no fencing client, no fencing key: {list}");
     a.server.abort();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ceph_is_set_up_step_by_step_and_its_keys_become_a_storage_kept_nowhere_else() {
+    use freightdock_manager::ceph::{CephHost, CephSetup, SetupState};
+    use freightdock_manager::state::{CommandStatus, Op, StorageDriver};
+    let a = start(None).await;
+    until("a leader", || a.m.store.leader().is_some()).await;
+    let t = JoinToken::parse(&issue(&a.m, false).await).unwrap();
+    a.m.store.propose(Entry::NodeEnrolled { node_id: "n1".into(), hostname: "h".into(), secret_hash: t.secret_hash(), cert_sha256: "c".into(), at: now_ms() }).await.unwrap();
+    let hosts = vec![CephHost { node_id: "n1".into(), disks: vec!["/dev/vdb".into()], hostname: String::new(), address: String::new() }];
+    a.m.store.propose(Entry::CephSetupStarted { setup: CephSetup::new("ceph", "fs1", "quay.io/ceph/ceph:v20", hosts, "test", now_ms()) }).await.unwrap();
+
+    // The worker's side, played here: each step's command answered as a worker would.
+    let mut seen = Vec::new();
+    for _ in 0..6 {
+        let mut c = None;
+        for _ in 0..50 {
+            a.m.setup_round().await;
+            c = a.m.store.read(|s| s.commands.values().find(|c| c.status == CommandStatus::Pending && !seen.contains(&c.id)).cloned());
+            if c.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let c = c.expect("the step's command");
+        seen.push(c.id.clone());
+        let Op::Cephadm { action, args, image, .. } = &c.op else { panic!("{:?}", c.op) };
+        assert_eq!(image, "quay.io/ceph/ceph:v20");
+        let answer = match action.as_str() {
+            "prepare" => r#"{"address":"192.0.2.7","hostname":"node-a"}"#.to_string(),
+            "bootstrap" => {
+                assert_eq!(args, &["192.0.2.7", "single-host"], "what prepare learned, filled in");
+                r#"{"fsid":"f-1","public_key":"ssh-rsa AAAA ceph"}"#.to_string()
+            }
+            "keys" => r#"{"mount_key":"AQBtb3VudA==","fence_key":"AgBmZW5jZQ==","fsid":"f-1"}"#.to_string(),
+            _ => {
+                if args.iter().any(|x| x == "osd") {
+                    assert_eq!(args.last().unwrap(), "node-a:/dev/vdb");
+                }
+                r#"{"stdout":""}"#.to_string()
+            }
+        };
+        let kept = a.m.take_ceph_keys(&c.id, CommandStatus::Succeeded, answer).await.unwrap();
+        assert!(!kept.contains("AQBtb3Vu") && !kept.contains("AgBmZW5j"), "the keys are not kept with the command: {kept}");
+        a.m.store.propose(Entry::CommandStatus { command_id: c.id.clone(), status: CommandStatus::Succeeded, message: String::new(), result_json: kept, at: now_ms() }).await.unwrap();
+    }
+    a.m.setup_round().await;
+    assert_eq!(a.m.store.read(|s| s.ceph_setup.as_ref().map(|c| c.state)), Some(SetupState::Done));
+    let st = a.m.store.read(|s| s.storage.get("ceph").cloned()).expect("the storage made");
+    assert_eq!((st.driver, st.source.as_str(), st.options.as_str()), (StorageDriver::Cephfs, "192.0.2.7:/", "name=freightdock,fs=fs1"));
+    let k = st.ceph.unwrap();
+    assert_eq!((k.secret.0.as_str(), k.fence_client.as_str(), k.fence_secret.unwrap().0.as_str()), ("AQBtb3VudA==", "freightdock-fence", "AgBmZW5jZQ=="));
+    assert!(!serde_json::to_string(&a.m.store.read(|s| s.commands.clone())).unwrap().contains("AQBtb3Vu"), "no command record holds a key");
+    a.server.abort();
+}

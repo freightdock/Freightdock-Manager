@@ -142,6 +142,14 @@ pub enum Entry {
     LeaseReleased { volume: String, node_id: String, at: Ms },
     /// Finished commands dropped from the state (`ClusterState::prunable`); one not finished, or not there, is left.
     CommandsPruned { ids: Vec<String>, at: Ms },
+    /// Ceph to be made from the UI (G12.6): refused while another runs, or if its storage's name is taken.
+    CephSetupStarted { setup: crate::ceph::CephSetup },
+    /// A step of it went on: its command made, done (and what it learned), or failed (and so the setup).
+    CephSetupStep { index: usize, state: crate::ceph::StepState, command_id: Option<String>, message: String, learned: Option<crate::ceph::Learned>, at: Ms },
+    /// A failed setup goes on from where it failed.
+    CephSetupRetried { at: Ms },
+    /// The setup forgotten (what it made stays).
+    CephSetupCleared { at: Ms },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -203,6 +211,12 @@ pub enum Rejected {
     BadSettings,
     /// A backup restored over a cluster that has a state already.
     NotEmpty,
+    /// A Ceph setup that cannot be: see `CephSetup::valid`, its nodes known, its storage's name free.
+    BadCephSetup,
+    /// Another Ceph setup runs.
+    CephSetupBusy,
+    /// No Ceph setup, or none in the state the step needs.
+    CephSetupUnknown,
 }
 
 impl std::fmt::Display for Rejected {
@@ -241,6 +255,9 @@ impl std::fmt::Display for Rejected {
             Rejected::NotEmpty => "a backup is restored into a new cluster only, not over one that has a state",
             Rejected::BadRegistry => "a registry is a host and maybe a port (ghcr.io, registry.example:5000, docker.io), and its login has a user and a password",
             Rejected::RegistryUnknown => "the cluster has no login for that registry",
+            Rejected::BadCephSetup => "a Ceph setup names its storage (1 to 40 of a-z, 0-9 and -, not taken) and filesystem, and each node once, known, with its disks as /dev/ paths",
+            Rejected::CephSetupBusy => "Ceph is being set up already: wait for it, or clear it",
+            Rejected::CephSetupUnknown => "no Ceph setup in that state",
             Rejected::BadChannel => "a channel is named 1 to 64 of a-z, 0-9, - and _, is a webhook, email, ntfy or gotify, and tells only of events the cluster knows",
             Rejected::ChannelUnknown => "the cluster has no notification channel of that name",
             Rejected::BadSettings => "a setting is out of its range or order, or the Proxmox provider's settings do not hold",
@@ -419,6 +436,15 @@ pub enum Op {
         #[serde(default)]
         timeout_s: u32,
     },
+    /// A step of Ceph made from the UI (G12.6, `ceph::CephSetup`), run on the node's host by its worker.
+    Cephadm {
+        action: String,
+        args: Vec<String>,
+        #[serde(default)]
+        image: String,
+        #[serde(default)]
+        timeout_s: u32,
+    },
 }
 
 impl Op {
@@ -426,7 +452,7 @@ impl Op {
     pub fn workload_id(&self) -> Option<&str> {
         match self {
             Op::RunContainer { workload_id, .. } | Op::StopContainer { workload_id, .. } | Op::RemoveContainer { workload_id } => Some(workload_id),
-            Op::Ping | Op::DockerInfo | Op::CephCommand { .. } => None,
+            Op::Ping | Op::DockerInfo | Op::CephCommand { .. } | Op::Cephadm { .. } => None,
         }
     }
 }
@@ -1053,6 +1079,9 @@ pub struct ClusterState {
     /// Notification channels, by name.
     #[serde(default)]
     pub notifications: BTreeMap<String, crate::notify::Channel>,
+    /// Ceph made from the UI (G12.6): the one being made, or the last.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ceph_setup: Option<crate::ceph::CephSetup>,
 }
 
 /// A floating address: on its holder's LAN, answering the published ports as the nodes' own addresses do.
@@ -1680,6 +1709,28 @@ impl ClusterState {
                         }
                         Some(e) => c.last_error = Some(e.clone()),
                     }
+                }
+            }
+            Entry::CephSetupStarted { setup } => {
+                if self.ceph_setup.as_ref().is_some_and(|c| c.state == crate::ceph::SetupState::Running) {
+                    return Err(Rejected::CephSetupBusy);
+                }
+                if !setup.valid() || self.storage.contains_key(&setup.storage) || !setup.hosts.iter().all(|h| self.nodes.contains_key(&h.node_id)) {
+                    return Err(Rejected::BadCephSetup);
+                }
+                self.ceph_setup = Some(setup.clone());
+            }
+            Entry::CephSetupStep { index, state, command_id, message, learned, at } => {
+                let c = self.ceph_setup.as_mut().filter(|c| c.state == crate::ceph::SetupState::Running && *index < c.steps.len()).ok_or(Rejected::CephSetupUnknown)?;
+                c.record(*index, *state, command_id.clone(), message, learned.as_ref(), *at);
+            }
+            Entry::CephSetupRetried { at } => {
+                let c = self.ceph_setup.as_mut().filter(|c| c.state == crate::ceph::SetupState::Failed).ok_or(Rejected::CephSetupUnknown)?;
+                c.retry(*at);
+            }
+            Entry::CephSetupCleared { .. } => {
+                if self.ceph_setup.take().is_none() {
+                    return Err(Rejected::CephSetupUnknown);
                 }
             }
             Entry::StorageKeysSet { name, ceph, .. } => {

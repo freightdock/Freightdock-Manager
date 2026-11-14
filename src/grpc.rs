@@ -61,6 +61,7 @@ pub fn op_to_proto(op: &Op) -> v1::command::Op {
         Op::RemoveContainer { workload_id } => P::RemoveContainer(v1::RemoveContainer { workload_id }),
         // The rest is the storage's, filled in as it is sent (`Manager::wire`).
         Op::CephCommand { args, timeout_s, .. } => P::CephCommand(v1::CephCommand { args, timeout_s, ..Default::default() }),
+        Op::Cephadm { action, args, image, timeout_s } => P::Cephadm(v1::Cephadm { action, args, image, timeout_s }),
     }
 }
 
@@ -229,8 +230,18 @@ impl WorkerSession for SessionSvc {
                             tracing::warn!(node = %node_id, command = %u.command_id, "a report on a command that is not this node's");
                             continue;
                         }
-                        let message: String = u.message.chars().take(4096).collect();
-                        let e = Entry::CommandStatus { command_id: u.command_id.clone(), status, message, result_json: u.result_json, at: now_ms() };
+                        let mut message: String = u.message.chars().take(4096).collect();
+                        let mut status = status;
+                        // The keys of Ceph made from the UI become its storage here and are kept nowhere else.
+                        let result_json = match m.take_ceph_keys(&u.command_id, status, u.result_json).await {
+                            Ok(r) => r,
+                            Err(e) => {
+                                status = CommandStatus::Failed;
+                                message = format!("{e:#}");
+                                String::new()
+                            }
+                        };
+                        let e = Entry::CommandStatus { command_id: u.command_id.clone(), status, message, result_json, at: now_ms() };
                         if let Err(e) = m.store.propose(e).await {
                             tracing::warn!(node = %node_id, command = %u.command_id, "{e}");
                         }
