@@ -164,6 +164,7 @@ impl Manager {
                 self.provider_task(n);
             }
         }
+        self.evict_round().await;
     }
 
     /// Powers the node off through its provider (its guest through Proxmox, its system through its BMC), once at a

@@ -393,7 +393,14 @@ Scoped 2026-11-14 against the plan's phase 11. Much of it came with the earlier 
 5. [x] Redfish fencing (2026-11-14, `redfish.rs`): a node labelled `fence.provider=redfish` is powered off through
        its BMC (`ForceOff`, pinned certificate, one cluster account in the settings) and fenced once the BMC says its
        power is off. Tried only against a fake BMC in the tests: the test cluster has no server with a BMC.
-6. [ ] Replicated storage and Ceph: need disks or a Ceph cluster the test cluster does not have (open question 9).
+6. [~] Replicated storage and Ceph (2026-11-14). A `cephfs` storage (`ceph.rs` on both sides): the worker's kernel
+       mounts it (mount(2), the key in the call only), its keys kept apart and filled into a command as it is sent,
+       and a fenced node's mounts evicted by the leader through a `CephCommand` (the `ceph` CLI in the Ceph image on
+       a healthy worker), so Ceph blocklists them. Tried on three VMs with Ceph 20 (cephadm, one 16 GB OSD each):
+       a writer on vm2 cut off from the managers stopped at 30 s, a stray writer holding the mount stopped at the
+       forced unmount (CephFS aborts the session), the writer ran on vm3 25 s after the managers presumed vm2
+       fenced, and vm2's clients were evicted 33 s after (the first worker asked had to pull the image; the retry
+       on another took 1.6 s). Left: Ceph made from the UI (pick workers and disks; cephadm on the nodes).
 
 ## Open questions for the owner
 
@@ -412,5 +419,5 @@ Scoped 2026-11-14 against the plan's phase 11. Much of it came with the earlier 
    pool address, as built ("i think thats fine").
 8. ~~Storage for G11~~ Given 2026-11-13: an NFS share on the owner's LAN for the test cluster (its address is not
    written here).
-9. Replicated storage or Ceph (G12.6): worth building on the test cluster? It needs extra disks on the Proxmox host
-   or a Ceph cluster; until then, shared storage is NFS or a shared directory.
+9. ~~Replicated storage or Ceph (G12.6)~~ Answered 2026-11-14: yes, on three VMs with a 16 GB disk each, and Ceph
+   set up from the UI too (select the workers and disks).

@@ -919,3 +919,54 @@ async fn the_metrics_are_prometheus_text_for_a_read_token() {
     assert_eq!(https_with(&a.m, &addr, "GET", "/v1/metrics", None, "").await.0, 401, "never without a token");
     a.server.abort();
 }
+
+#[tokio::test]
+async fn a_cephfs_s_keys_are_kept_never_shown_and_go_with_its_mounts_and_its_ceph_commands_only() {
+    use freightdock_manager::state::{CommandRecord, CommandStatus, Op, StorageDriver, StorageMount};
+    use freightdock_proto::v1::{command, manager_message::Body};
+    let a = start(None).await;
+    until("a leader", || a.m.store.leader().is_some()).await;
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap().to_string();
+    tokio::spawn(freightdock_manager::serve_admin_tls(a.m.clone(), l));
+    let admin = Some(a.m.admin_token.as_str());
+
+    let body = r#"{"name":"ceph","driver":"cephfs","source":"192.0.2.1,192.0.2.2:/","options":"name=fd,fs=fs1","secret":"AQBtb3VudA==","fence_client":"fd-fence","fence_secret":"AgBmZW5jZQ=="}"#;
+    let (s, b) = https_with(&a.m, &addr, "POST", "/v1/storage", admin, body).await;
+    assert_eq!(s, 201, "{b}");
+    let (s, b) = https_with(&a.m, &addr, "POST", "/v1/storage", admin, r#"{"name":"bare","driver":"cephfs","source":"192.0.2.1:/","options":"name=fd"}"#).await;
+    assert_eq!(s, 400, "a CephFS needs its mount key: {b}");
+    let (_, list) = https_with(&a.m, &addr, "GET", "/v1/storage", admin, "").await;
+    assert!(list.contains(r#""secret_set":true"#) && list.contains(r#""fence_client":"fd-fence""#) && list.contains("quay.io/ceph/ceph"), "{list}");
+    assert!(!list.contains("AQBtb3VudA") && !list.contains("AgBmZW5jZQ"), "never shown: {list}");
+    let (s, b) = https_with(&a.m, &addr, "PUT", "/v1/storage/ceph/keys", admin, r#"{"secret":"AQBuZXc="}"#).await;
+    assert_eq!(s, 204, "{b}");
+
+    let record = |op: Op| CommandRecord { id: "c".into(), node_id: "n".into(), op, config_version: 0, created_at: 0, deadline: 0, status: CommandStatus::Pending, message: String::new(), result_json: String::new(), updated_at: 0 };
+    let mount = StorageMount { volume: "data".into(), storage: "ceph".into(), driver: StorageDriver::Cephfs, source: "192.0.2.1,192.0.2.2:/".into(), options: "name=fd,fs=fs1".into(), dir: "app/data".into() };
+    let run = record(Op::RunContainer { workload_id: "app.db.1".into(), image: "postgres".into(), name: String::new(), command: vec![], env: Default::default(), labels: Default::default(), generation: 0, ports: vec![], volumes: vec!["data:/d".into()], limits: Default::default(), net: Default::default(), storage: vec![mount] });
+    match a.m.wire(&run).body {
+        Some(Body::Command(c)) => match c.op {
+            Some(command::Op::RunContainer(r)) => assert_eq!((r.storage[0].driver.as_str(), r.storage[0].secret.as_str()), ("cephfs", "AQBuZXc="), "the new mount key, the fencing one kept"),
+            o => panic!("{o:?}"),
+        },
+        o => panic!("{o:?}"),
+    }
+    let evict = record(Op::CephCommand { storage: "ceph".into(), args: vec!["status".into()], timeout_s: 0 });
+    match a.m.wire(&evict).body {
+        Some(Body::Command(c)) => match c.op {
+            Some(command::Op::CephCommand(x)) => {
+                assert_eq!((x.mons.as_str(), x.client.as_str(), x.secret.as_str(), x.image.as_str()), ("192.0.2.1,192.0.2.2", "fd-fence", "AgBmZW5jZQ==", "quay.io/ceph/ceph:v20"));
+                assert_eq!(x.args, ["status"]);
+            }
+            o => panic!("{o:?}"),
+        },
+        o => panic!("{o:?}"),
+    }
+    assert!(!serde_json::to_string(&evict).unwrap().contains("AgBm"), "never in the command kept");
+    let (s, b) = https_with(&a.m, &addr, "PUT", "/v1/storage/ceph/keys", admin, r#"{"fence_client":""}"#).await;
+    assert_eq!(s, 204, "{b}");
+    let (_, list) = https_with(&a.m, &addr, "GET", "/v1/storage", admin, "").await;
+    assert!(list.contains(r#""fence_secret_set":false"#), "no fencing client, no fencing key: {list}");
+    a.server.abort();
+}

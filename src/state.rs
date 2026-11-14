@@ -116,6 +116,8 @@ pub enum Entry {
     StorageAdded { storage: Storage },
     /// Refused while a stack keeps a volume on it.
     StorageRemoved { name: String, at: Ms },
+    /// A CephFS's keys set anew (G12.6): a mount from now on takes the new mount key.
+    StorageKeysSet { name: String, ceph: CephKeys, at: Ms },
     /// A private registry's login, set or replaced whole (`registry.rs`).
     RegistrySet { registry: crate::registry::Registry },
     RegistryRemoved { host: String, at: Ms },
@@ -233,7 +235,7 @@ impl std::fmt::Display for Rejected {
             Rejected::StorageExists => "the cluster has storage of that name already",
             Rejected::StorageUnknown => "no such storage (or volume on it)",
             Rejected::StorageInUse => "a stack keeps a volume on that storage: remove the stack first",
-            Rejected::BadStorage => "storage is named 1 to 40 of a-z, 0-9 and -; nfs is host:/export with options of letters, digits and = , . _ : - /; path is an absolute directory other than /",
+            Rejected::BadStorage => "storage is named 1 to 40 of a-z, 0-9 and -; nfs is host:/export with options of letters, digits and = , . _ : - /; cephfs is the monitors' addresses:/path with name=<client> in its options (and fs=<filesystem> to evict), its keys apart; path is an absolute directory other than /",
             Rejected::VolumeShared => "a volume for one writer (access: one) is used by one workload only: one service with one replica, or access: many",
             Rejected::LeaseHeld => "another node holds that volume and may still be writing to it",
             Rejected::NotEmpty => "a backup is restored into a new cluster only, not over one that has a state",
@@ -409,6 +411,14 @@ pub enum Op {
     RemoveContainer {
         workload_id: String,
     },
+    /// `ceph <args>` run once on the node, against the Ceph of a CephFS storage as its fencing client (G12.6). The
+    /// monitors, the image and the key come from the storage as the command is sent, never kept with it.
+    CephCommand {
+        storage: String,
+        args: Vec<String>,
+        #[serde(default)]
+        timeout_s: u32,
+    },
 }
 
 impl Op {
@@ -416,7 +426,7 @@ impl Op {
     pub fn workload_id(&self) -> Option<&str> {
         match self {
             Op::RunContainer { workload_id, .. } | Op::StopContainer { workload_id, .. } | Op::RemoveContainer { workload_id } => Some(workload_id),
-            Op::Ping | Op::DockerInfo => None,
+            Op::Ping | Op::DockerInfo | Op::CephCommand { .. } => None,
         }
     }
 }
@@ -673,10 +683,66 @@ pub struct Storage {
     pub driver: StorageDriver,
     /// nfs: `host:/export`; path: an absolute directory that is the same shared storage on every node.
     pub source: String,
-    /// nfs: mount options, as `mount -o` takes them; none for path.
+    /// nfs: mount options, as `mount -o` takes them; cephfs: the kernel client's (`name=` the client, `fs=` the
+    /// filesystem); none for path.
     #[serde(default)]
     pub options: String,
     pub added_at: Ms,
+    /// cephfs: the keys (G12.6), set once and never shown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ceph: Option<CephKeys>,
+}
+
+/// The Ceph image a `ceph` command runs in when the storage names none: the release Freightdock was tried with.
+pub const DEFAULT_CEPH_IMAGE: &str = "quay.io/ceph/ceph:v20";
+
+/// A CephFS's keys (G12.6). The mount key goes to the kernel with each mount; the fencing client, when there is one,
+/// evicts a fenced node's mount (`ceph tell mds.<fs>:0 client evict`), which Ceph then blocklists, so it writes no
+/// more and the files it held are free at once. Its caps: `mon 'allow r' mds 'allow * fsname=<fs>'`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CephKeys {
+    /// The key of the client the options name (`name=`). The kernel takes only the older key type (`AQ...`).
+    pub secret: crate::settings::Secret,
+    /// The client that evicts, without `client.`; empty: no eviction (the node's own fencing only).
+    #[serde(default)]
+    pub fence_client: String,
+    #[serde(default)]
+    pub fence_secret: Option<crate::settings::Secret>,
+    /// The Ceph image the evicting command runs in; empty: `DEFAULT_CEPH_IMAGE`.
+    #[serde(default)]
+    pub image: String,
+}
+
+/// A Ceph key as it is written: base64.
+fn ceph_key(k: &str) -> bool {
+    !k.is_empty() && k.chars().all(|c| c.is_ascii_alphanumeric() || "+/=".contains(c))
+}
+
+/// A CephFS source as the kernel takes it: the monitors' addresses (IPs, maybe ports: it resolves no names), `:`, and
+/// an absolute path, `/` for the whole filesystem.
+pub fn ceph_source(s: &str, abs: impl Fn(&str) -> bool) -> bool {
+    let Some(i) = s.find(":/") else { return false };
+    let (mons, path) = (&s[..i], &s[i + 1..]);
+    !mons.is_empty() && mons.split(',').all(ceph_mon) && (path == "/" || abs(path))
+}
+
+fn ceph_mon(m: &str) -> bool {
+    m.parse::<std::net::IpAddr>().is_ok() || m.parse::<std::net::SocketAddr>().is_ok() || m.strip_prefix('[').and_then(|r| r.strip_suffix(']')).is_some_and(|v6| v6.parse::<std::net::Ipv6Addr>().is_ok())
+}
+
+impl CephKeys {
+    pub fn valid(&self) -> bool {
+        let plain = |s: &str| s.chars().all(|c| c.is_ascii_alphanumeric() || "._-".contains(c));
+        let image = |s: &str| s.chars().all(|c| c.is_ascii_alphanumeric() || "._-/:@".contains(c));
+        ceph_key(&self.secret.0)
+            && plain(&self.fence_client)
+            && !self.fence_client.starts_with("client.")
+            && match &self.fence_secret {
+                Some(k) => !self.fence_client.is_empty() && ceph_key(&k.0),
+                None => self.fence_client.is_empty(),
+            }
+            && image(&self.image)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -686,6 +752,8 @@ pub enum StorageDriver {
     Nfs,
     /// A directory made shared outside Freightdock (a mount the host has, a bind mount into a container).
     Path,
+    /// A CephFS the worker's kernel mounts (G12.6).
+    Cephfs,
 }
 
 /// What a storage driver can do (plan 8.3), for the scheduler and the person reading.
@@ -697,11 +765,23 @@ pub struct Capabilities {
     pub write_revocation: bool,
     /// The managers keep one writer at a time on a volume for one writer.
     pub leases: bool,
+    /// The managers can cut a fenced node's client off at the storage itself (CephFS eviction), whatever the node does.
+    pub client_eviction: bool,
 }
 
 impl StorageDriver {
     pub fn capabilities(self) -> Capabilities {
-        Capabilities { multi_host_mount: true, multi_host_write: true, write_revocation: self == StorageDriver::Nfs, leases: true }
+        let mounted = matches!(self, StorageDriver::Nfs | StorageDriver::Cephfs);
+        Capabilities { multi_host_mount: true, multi_host_write: true, write_revocation: mounted, leases: true, client_eviction: self == StorageDriver::Cephfs }
+    }
+
+    /// Its name on the wire.
+    pub fn word(self) -> &'static str {
+        match self {
+            StorageDriver::Nfs => "nfs",
+            StorageDriver::Path => "path",
+            StorageDriver::Cephfs => "cephfs",
+        }
     }
 }
 
@@ -713,9 +793,41 @@ impl Storage {
         let abs = |p: &str| p.starts_with('/') && p != "/" && !p.split('/').any(|c| c == "..") && plain(p, "/._-");
         valid_stack_name(&self.name)
             && match self.driver {
-                StorageDriver::Nfs => self.source.split_once(":/").is_some_and(|(host, path)| !host.is_empty() && plain(host, ".-[]") && abs(&format!("/{path}"))) && plain(&self.options, "=,._:-/"),
-                StorageDriver::Path => abs(&self.source) && self.options.is_empty(),
+                StorageDriver::Nfs => self.source.split_once(":/").is_some_and(|(host, path)| !host.is_empty() && plain(host, ".-[]") && abs(&format!("/{path}"))) && plain(&self.options, "=,._:-/") && self.ceph.is_none(),
+                StorageDriver::Path => abs(&self.source) && self.options.is_empty() && self.ceph.is_none(),
+                StorageDriver::Cephfs => {
+                    let keyless = !self.options.split(',').any(|o| matches!(o.split('=').next(), Some("secret" | "secretfile" | "key" | "keyfile")));
+                    ceph_source(&self.source, abs)
+                        && plain(&self.options, "=,._:-/")
+                        && keyless
+                        && self.ceph_client().is_some_and(|c| !c.is_empty())
+                        && self.ceph.as_ref().is_some_and(|k| k.valid() && (k.fence_client.is_empty() || self.ceph_fs().is_some_and(|f| !f.is_empty())))
+                }
             }
+    }
+
+    fn option(&self, key: &str) -> Option<&str> {
+        self.options.split(',').find_map(|o| o.strip_prefix(key)?.strip_prefix('='))
+    }
+
+    /// cephfs: the client it mounts as (`name=`).
+    pub fn ceph_client(&self) -> Option<&str> {
+        self.option("name")
+    }
+
+    /// cephfs: the filesystem (`fs=`, or the older `mds_namespace=`).
+    pub fn ceph_fs(&self) -> Option<&str> {
+        self.option("fs").or_else(|| self.option("mds_namespace"))
+    }
+
+    /// cephfs: the image its `ceph` commands run in.
+    pub fn ceph_image(&self) -> &str {
+        self.ceph.as_ref().map(|k| k.image.as_str()).filter(|i| !i.is_empty()).unwrap_or(DEFAULT_CEPH_IMAGE)
+    }
+
+    /// cephfs: the monitors, as `mon_host` takes them.
+    pub fn ceph_mons(&self) -> &str {
+        self.source.find(":/").map_or("", |i| &self.source[..i])
     }
 }
 
@@ -1570,6 +1682,15 @@ impl ClusterState {
                     }
                 }
             }
+            Entry::StorageKeysSet { name, ceph, .. } => {
+                let st = self.storage.get(name).ok_or(Rejected::StorageUnknown)?;
+                let mut next = st.clone();
+                next.ceph = Some(ceph.clone());
+                if !next.valid() {
+                    return Err(Rejected::BadStorage);
+                }
+                self.storage.insert(name.clone(), next);
+            }
             Entry::StorageRemoved { name, .. } => {
                 if !self.storage.contains_key(name) {
                     return Err(Rejected::StorageUnknown);
@@ -2292,7 +2413,67 @@ pub(crate) mod tests {
     }
 
     fn nas() -> Storage {
-        Storage { name: "nas".into(), driver: StorageDriver::Nfs, source: "192.0.2.50:/export/fd".into(), options: String::new(), added_at: 1 }
+        Storage { name: "nas".into(), driver: StorageDriver::Nfs, source: "192.0.2.50:/export/fd".into(), options: String::new(), added_at: 1, ceph: None }
+    }
+
+    fn cephfs() -> Storage {
+        let keys = CephKeys { secret: crate::settings::Secret("AQBtb3VudC1rZXktb2YtdGVzdA==".into()), fence_client: "fd-fence".into(), fence_secret: Some(crate::settings::Secret("AgBmZW5jZS1rZXktb2YtdGVzdA==".into())), image: String::new() };
+        Storage { name: "ceph".into(), driver: StorageDriver::Cephfs, source: "192.0.2.1,192.0.2.2:6789,[2001:db8::3]:/".into(), options: "name=fd,fs=fs1".into(), added_at: 1, ceph: Some(keys) }
+    }
+
+    #[test]
+    fn a_cephfs_is_its_monitors_addresses_a_client_and_its_key_kept_apart_from_the_options() {
+        let mut s = with_nodes(&["n1"]);
+        let c = cephfs();
+        assert_eq!((c.ceph_client(), c.ceph_fs()), (Some("fd"), Some("fs1")));
+        assert_eq!(c.ceph_image(), DEFAULT_CEPH_IMAGE);
+        let k = |f: fn(&mut CephKeys)| {
+            let mut c = cephfs();
+            f(c.ceph.as_mut().unwrap());
+            c
+        };
+        for bad in [
+            Storage { source: "mon.example:/".into(), ..cephfs() },
+            Storage { source: "192.0.2.1:/../etc".into(), ..cephfs() },
+            Storage { options: "fs=fs1".into(), ..cephfs() },
+            Storage { options: "name=fd,fs=fs1,secret=AQB".into(), ..cephfs() },
+            Storage { options: "name=fd,secretfile=/k".into(), ..cephfs() },
+            Storage { ceph: None, ..cephfs() },
+            Storage { ceph: cephfs().ceph, ..nas() },
+            k(|k| k.secret = crate::settings::Secret(String::new())),
+            k(|k| k.secret = crate::settings::Secret("a b".into())),
+            k(|k| k.fence_client = "client.admin".into()),
+            k(|k| k.fence_secret = None),
+            k(|k| k.image = "x y".into()),
+        ] {
+            assert_eq!(s.check(&Entry::StorageAdded { storage: bad.clone() }), Err(Rejected::BadStorage), "{bad:?}");
+        }
+        let no_fence = k(|k| {
+            k.fence_client = String::new();
+            k.fence_secret = None;
+        });
+        assert!(no_fence.valid(), "fencing through Ceph is the cluster's choice");
+        assert_eq!(s.check(&Entry::StorageAdded { storage: Storage { options: "name=fd".into(), ..cephfs() } }), Err(Rejected::BadStorage), "evicting needs the filesystem's name");
+        next(&mut s, &Entry::StorageAdded { storage: cephfs() }).unwrap();
+        assert!(StorageDriver::Cephfs.capabilities().client_eviction && !StorageDriver::Nfs.capabilities().client_eviction);
+        let fresh = k(|k| k.secret = crate::settings::Secret("AQBuZXcta2V5".into())).ceph;
+        next(&mut s, &Entry::StorageKeysSet { name: "ceph".into(), ceph: fresh.clone().unwrap(), at: 2 }).unwrap();
+        assert_eq!(s.storage["ceph"].ceph, fresh);
+        assert_eq!(s.check(&Entry::StorageKeysSet { name: "nope".into(), ceph: fresh.clone().unwrap(), at: 2 }), Err(Rejected::StorageUnknown));
+        next(&mut s, &Entry::StorageAdded { storage: nas() }).unwrap();
+        assert_eq!(s.check(&Entry::StorageKeysSet { name: "nas".into(), ceph: fresh.unwrap(), at: 2 }), Err(Rejected::BadStorage), "an NFS export has no Ceph keys");
+    }
+
+    #[test]
+    fn a_volume_on_a_cephfs_goes_to_the_worker_without_its_key() {
+        let mut s = with_nodes(&["n1"]);
+        next(&mut s, &Entry::StorageAdded { storage: cephfs() }).unwrap();
+        let db = ServiceSpec { volumes: vec!["data:/var/lib/data".into()], ..spec("postgres", 1) };
+        next(&mut s, &on_storage("app", &[("db", db)], &[("app.db.1", "n1")], &[("data", "ceph", Access::One)])).unwrap();
+        let m = s.storage_mounts(&s.workloads["app.db.1"]);
+        assert_eq!(m.len(), 1);
+        assert_eq!((m[0].driver, m[0].source.as_str(), m[0].options.as_str()), (StorageDriver::Cephfs, "192.0.2.1,192.0.2.2:6789,[2001:db8::3]:/", "name=fd,fs=fs1"));
+        assert!(!serde_json::to_string(&m).unwrap().contains("AQBtb3Vud"), "the key is filled in as the command is sent, never kept with it");
     }
 
     fn on_storage(name: &str, services: &[(&str, ServiceSpec)], placements: &[(&str, &str)], volumes: &[(&str, &str, Access)]) -> Entry {

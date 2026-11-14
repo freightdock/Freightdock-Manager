@@ -95,6 +95,7 @@ pub fn router(m: Arc<Manager>) -> Router {
         .route("/v1/floating/{address}", axum::routing::delete(remove_floating))
         .route("/v1/storage", get(storage).post(add_storage))
         .route("/v1/storage/{name}", axum::routing::delete(remove_storage))
+        .route("/v1/storage/{name}/keys", axum::routing::put(set_storage_keys))
         .route("/v1/settings", get(settings).put(set_settings))
         .route("/v1/settings/proxmox/fingerprint", post(proxmox_fingerprint))
         .route("/v1/settings/proxmox/test", post(proxmox_test))
@@ -489,7 +490,12 @@ async fn storage(State(m): State<Arc<Manager>>, h: HeaderMap) -> R<Json<Value>> 
                         .flat_map(|stack| stack.volumes.iter().filter(|(_, v)| v.storage == st.name).map(move |(name, v)| (stack, name, v)))
                         .map(|(stack, name, v)| json!({ "stack": stack.name, "volume": name, "access": v.access, "holder": s.leases.get(&format!("{}/{name}", stack.name)).map(|l| &l.node_id) }))
                         .collect();
-                    json!({ "name": st.name, "driver": st.driver, "source": st.source, "options": st.options, "added_at": st.added_at, "capabilities": st.driver.capabilities(), "volumes": volumes, "health": storage_health(s, &reports, &st.name) })
+                    let mut v = json!({ "name": st.name, "driver": st.driver, "source": st.source, "options": st.options, "added_at": st.added_at, "capabilities": st.driver.capabilities(), "volumes": volumes, "health": storage_health(s, &reports, &st.name) });
+                    if let Some(k) = &st.ceph {
+                        // The keys are never shown: only whether they are set.
+                        v["ceph"] = json!({ "client": st.ceph_client(), "fs": st.ceph_fs(), "mons": st.ceph_mons(), "secret_set": !k.secret.0.is_empty(), "fence_client": k.fence_client, "fence_secret_set": k.fence_secret.is_some(), "image": k.image, "image_used": st.ceph_image() });
+                    }
+                    v
                 })
                 .collect(),
         )
@@ -503,15 +509,58 @@ struct StorageBody {
     source: String,
     #[serde(default)]
     options: String,
+    /// cephfs: the mount client's key, and the evicting client and its key (G12.6).
+    #[serde(flatten)]
+    keys: CephKeysBody,
+}
+
+#[derive(Deserialize, Default)]
+struct CephKeysBody {
+    secret: Option<String>,
+    fence_client: Option<String>,
+    fence_secret: Option<String>,
+    image: Option<String>,
+}
+
+impl CephKeysBody {
+    /// The keys as they are to be kept, over `old` (a key not given stays as it was; an empty fence client takes the
+    /// eviction away).
+    fn over(self, old: Option<&crate::state::CephKeys>) -> crate::state::CephKeys {
+        use crate::settings::Secret;
+        let t = |s: String| s.trim().to_string();
+        let fence_client = self.fence_client.map(t).unwrap_or_else(|| old.map(|k| k.fence_client.clone()).unwrap_or_default());
+        let fence_secret = match self.fence_secret.map(t) {
+            _ if fence_client.is_empty() => None,
+            Some(k) if !k.is_empty() => Some(Secret(k)),
+            _ => old.and_then(|k| k.fence_secret.clone()),
+        };
+        crate::state::CephKeys {
+            secret: self.secret.map(t).filter(|k| !k.is_empty()).map(Secret).or_else(|| old.map(|k| k.secret.clone())).unwrap_or(Secret(String::new())),
+            fence_client,
+            fence_secret,
+            image: self.image.map(t).unwrap_or_else(|| old.map(|k| k.image.clone()).unwrap_or_default()),
+        }
+    }
 }
 
 async fn add_storage(State(m): State<Arc<Manager>>, h: HeaderMap, Json(b): Json<StorageBody>) -> R<StatusCode> {
     authed(&m, &h)?;
-    let storage = crate::state::Storage { name: b.name.trim().to_string(), driver: b.driver, source: b.source.trim().to_string(), options: b.options.trim().to_string(), added_at: now_ms() };
+    let ceph = (b.driver == crate::state::StorageDriver::Cephfs).then(|| b.keys.over(None));
+    let storage = crate::state::Storage { name: b.name.trim().to_string(), driver: b.driver, source: b.source.trim().to_string(), options: b.options.trim().to_string(), added_at: now_ms(), ceph };
     let name = storage.name.clone();
     m.store.propose(Entry::StorageAdded { storage }).await?;
     m.events.push("storage", None, format!("storage {name} added"));
     Ok(StatusCode::CREATED)
+}
+
+/// A CephFS's keys set anew (G12.6); a key left out stays as it was.
+async fn set_storage_keys(State(m): State<Arc<Manager>>, h: HeaderMap, Path(name): Path<String>, Json(b): Json<CephKeysBody>) -> R<StatusCode> {
+    authed(&m, &h)?;
+    let old = m.store.read(|s| s.storage.get(&name).map(|st| st.ceph.clone())).ok_or_else(|| ApiError(StatusCode::NOT_FOUND, Rejected::StorageUnknown.to_string()))?;
+    let ceph = b.over(old.as_ref());
+    m.store.propose(Entry::StorageKeysSet { name: name.clone(), ceph, at: now_ms() }).await?;
+    m.events.push("storage", None, format!("storage {name}: its Ceph keys set"));
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn remove_storage(State(m): State<Arc<Manager>>, h: HeaderMap, Path(name): Path<String>) -> R<StatusCode> {

@@ -34,6 +34,9 @@ freightdock-manager floating ls|add|rm [address]   the address pool; add takes a
 freightdock-manager storage ls                  the cluster's shared storage, the volumes on it and who holds each
 freightdock-manager storage add <name> nfs <host:/export> [options]   an NFS export the workers mount themselves
 freightdock-manager storage add <name> path <dir>   a directory that is the same shared storage on every node
+freightdock-manager storage add <name> cephfs <mons:/path> <name=client,fs=fs> <key-file> [fence-client fence-key-file]
+                                                a CephFS the workers' kernels mount; the fencing client evicts a fenced node
+freightdock-manager storage keys <name> <key-file> [fence-client fence-key-file]   a CephFS's keys set anew
 freightdock-manager storage rm <name>           take it away (no stack may keep a volume on it)
 freightdock-manager settings                    the cluster's settings, each with where its value comes from
 freightdock-manager settings set <k=v> ...      set some for the whole cluster (v default: back to each manager's own)
@@ -509,6 +512,23 @@ async fn main() -> Result<()> {
                     let options = args.get(5).cloned().unwrap_or_default();
                     call(&config, Method::POST, "/v1/storage", Some(serde_json::json!({ "name": name, "driver": driver, "source": source, "options": options }))).await?;
                 }
+                (Some("add"), Some(name), Some("cephfs"), Some(source)) => {
+                    let (Some(options), Some(key)) = (args.get(5), args.get(6)) else { bail!("{USAGE}") };
+                    let mut b = serde_json::json!({ "name": name, "driver": "cephfs", "source": source, "options": options, "secret": read_key(key)? });
+                    if let (Some(client), Some(file)) = (args.get(7), args.get(8)) {
+                        b["fence_client"] = client.as_str().into();
+                        b["fence_secret"] = read_key(file)?.into();
+                    }
+                    call(&config, Method::POST, "/v1/storage", Some(b)).await?;
+                }
+                (Some("keys"), Some(name), Some(key), _) => {
+                    let mut b = serde_json::json!({ "secret": read_key(key)? });
+                    if let (Some(client), Some(file)) = (args.get(4), args.get(5)) {
+                        b["fence_client"] = client.as_str().into();
+                        b["fence_secret"] = read_key(file)?.into();
+                    }
+                    call(&config, Method::PUT, &format!("/v1/storage/{name}/keys"), Some(b)).await?;
+                }
                 (Some("rm"), Some(name), ..) => {
                     call(&config, Method::DELETE, &format!("/v1/storage/{name}"), None).await?;
                 }
@@ -759,6 +779,16 @@ fn encode(s: &str) -> String {
 
 /// A backup's passphrase: FREIGHTDOCK_BACKUP_PASSPHRASE, else the first line of stdin. Never an argument (it would
 /// be in the shell's history and the process list).
+/// A Ceph key from a file: the bare key, or a keyring's `key = ...` line. From a file, so it is on no command line.
+fn read_key(path: &str) -> Result<String> {
+    let text = std::fs::read_to_string(path).with_context(|| format!("reading the key in {path}"))?;
+    let key = text.lines().find_map(|l| l.trim().strip_prefix("key").map(|r| r.trim_start().trim_start_matches('=').trim().to_string())).unwrap_or_else(|| text.trim().to_string());
+    if key.is_empty() {
+        bail!("{path} holds no key");
+    }
+    Ok(key)
+}
+
 fn passphrase() -> Result<String> {
     let p = match std::env::var("FREIGHTDOCK_BACKUP_PASSPHRASE") {
         Ok(p) => p,

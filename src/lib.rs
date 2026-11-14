@@ -3,6 +3,7 @@
 pub mod admin;
 pub mod backup;
 pub mod ca;
+pub mod ceph;
 pub mod compose;
 pub mod docker;
 pub mod events;
@@ -157,6 +158,8 @@ pub struct Manager {
     cut_off_since: std::sync::Mutex<Option<std::time::Instant>>,
     /// Nodes a fencing provider is working on here.
     fence_tasks: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// The leader's CephFS evictions in hand (G12.6, `ceph::evict_round`).
+    evictions: std::sync::Mutex<ceph::Evictions>,
     /// This manager's data folder: its scheduled backups are in `backups/` there.
     pub data_dir: PathBuf,
     /// Docker requests sent to the workers here, waiting for their replies (`docker.rs`).
@@ -282,7 +285,7 @@ impl Manager {
         let manager_id = kept(&config.data_dir.join("manager.id"), || uuid::Uuid::new_v4().to_string())?;
         let admin_token = kept(&config.data_dir.join("admin.token"), || hex::encode(rand::random::<[u8; 32]>()))?;
         let commands = store.commands();
-        let m = Arc::new(Manager { store, events: Default::default(), sessions: Sessions::new(config.thresholds), ca, manager_id, advertise: config.advertise.clone(), admin_token, peer_tls, peer_channels: Default::default(), local_worker_token: config.local_worker_token.clone(), paced: Default::default(), own: settings::Settings::of(&config.thresholds, &config.fencing), local: config.local(), timers_sent: Default::default(), started: std::time::Instant::now(), cut_off_since: Default::default(), fence_tasks: Default::default(), data_dir: config.data_dir.clone(), docker_waits: Default::default(), notifier: Default::default() });
+        let m = Arc::new(Manager { store, events: Default::default(), sessions: Sessions::new(config.thresholds), ca, manager_id, advertise: config.advertise.clone(), admin_token, peer_tls, peer_channels: Default::default(), local_worker_token: config.local_worker_token.clone(), paced: Default::default(), own: settings::Settings::of(&config.thresholds, &config.fencing), local: config.local(), timers_sent: Default::default(), started: std::time::Instant::now(), cut_off_since: Default::default(), fence_tasks: Default::default(), evictions: Default::default(), data_dir: config.data_dir.clone(), docker_waits: Default::default(), notifier: Default::default() });
         tokio::spawn(deliver_applied(Arc::downgrade(&m), commands));
         Ok(m)
     }
@@ -428,11 +431,32 @@ impl Manager {
             ui::fill(&mut c.op, &ui::Fill { token: ui::token(&self.ca.key_pem()), ca_pem: self.ca.cert_pem.clone(), managers: self.managers(), addresses });
         }
         let mut m = grpc::command_to_proto(&c);
-        // A private registry's login for the image, filled in here only: never kept with the command.
-        if let Some(freightdock_proto::v1::manager_message::Body::Command(cmd)) = &mut m.body
-            && let Some(freightdock_proto::v1::command::Op::RunContainer(r)) = &mut cmd.op
-        {
-            r.auth = self.store.read(|s| registry::auth_for(&s.registries, &r.image));
+        // A private registry's login for the image and a CephFS's keys, filled in here only: never kept with the
+        // command.
+        if let Some(freightdock_proto::v1::manager_message::Body::Command(cmd)) = &mut m.body {
+            use freightdock_proto::v1::command::Op as P;
+            match &mut cmd.op {
+                Some(P::RunContainer(r)) => self.store.read(|s| {
+                    r.auth = registry::auth_for(&s.registries, &r.image);
+                    for v in &mut r.storage {
+                        if let Some(k) = s.storage.get(&v.storage).and_then(|st| st.ceph.as_ref()) {
+                            v.secret = k.secret.0.clone();
+                        }
+                    }
+                }),
+                Some(P::CephCommand(x)) => self.store.read(|s| {
+                    if let state::Op::CephCommand { storage, .. } = &c.op
+                        && let Some(st) = s.storage.get(storage)
+                        && let Some(k) = &st.ceph
+                    {
+                        x.image = st.ceph_image().to_string();
+                        x.mons = st.ceph_mons().to_string();
+                        x.client = k.fence_client.clone();
+                        x.secret = k.fence_secret.as_ref().map(|k| k.0.clone()).unwrap_or_default();
+                    }
+                }),
+                _ => {}
+            }
         }
         m
     }

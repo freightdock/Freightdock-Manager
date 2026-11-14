@@ -425,6 +425,45 @@ freightdock-manager storage add nas path /srv/freightdock
 
 The LXC's root writes as uid 100000 on the export, so the export has to let it (its owner, or open permissions).
 
+#### CephFS
+
+A `cephfs` storage is a CephFS the workers' kernels mount themselves (no Ceph packages on the node). Its source is
+the monitors' addresses (IPs, the kernel resolves no names) and a path, its options name the client and the
+filesystem, and its keys are read from files so they are on no command line; they are kept in the replicated state,
+never shown, and go to a worker only with the command that needs them (the mount key into the mount call itself):
+
+```sh
+freightdock-manager storage add ceph cephfs 192.0.2.1,192.0.2.2,192.0.2.3:/ name=freightdock,fs=fs1 \
+    freightdock.key fd-fence fd-fence.key
+freightdock-manager storage keys ceph freightdock.key [fd-fence fd-fence.key]     # new keys later
+```
+
+The second client is for fencing: once a node is fenced (proved, or presumed after its own timers ran out) the
+leader has a healthy worker evict that node's mounts (`ceph tell mds.<fs>:0 client evict` of the node's hostname and
+the storage's client, run in a throwaway container of the Ceph image, `quay.io/ceph/ceph:v20` unless the storage
+names another). Ceph blocklists what it evicts: a node whose fencing failed, or that was cut off from the managers
+but not from Ceph, writes nothing more, and the files it held are free at once instead of after the MDS's session
+timeout. Nothing is evicted while a node is only unreachable, so a short blip breaks no mount, and a later mount is a
+new session, so nothing has to be undone when the node comes back. Without a fencing client the node's own fencing
+is all: the worker's forced unmount, which on CephFS aborts the session and fails every write still under way.
+
+The keys, made on the Ceph cluster:
+
+```sh
+ceph fs authorize fs1 client.freightdock / rw                               # the mount key
+ceph auth get-or-create client.fd-fence mon 'allow r' mds 'allow * fsname=fs1'   # the fencing key
+```
+
+Ceph 20 (tentacle) makes keys of a newer type (they start `Ag`) that the Linux kernel's client does not take yet
+(7.0 says "secret is not valid base64"). The mount key has to be of the older type, which Ceph makes only once its
+monitors allow it (it then warns `AUTH_INSECURE_*`); the fencing key, used by the Ceph image, may stay new:
+
+```sh
+ceph mon set auth_allowed_ciphers aes256k,aes
+ceph config set mon mon_auth_allow_insecure_key true
+ceph auth rotate client.freightdock --key_type aes
+```
+
 ## Build
 
 ```sh
