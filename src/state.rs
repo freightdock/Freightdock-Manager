@@ -71,6 +71,10 @@ pub enum Entry {
         /// and to edit.
         #[serde(default)]
         options: StackOptions,
+        /// Made or changed stopped: placed, its workloads not run until it is started (an import of a stack that
+        /// still runs elsewhere). An entry from before runs, as every deploy did.
+        #[serde(default)]
+        stopped: bool,
     },
     /// Workloads of a stack put on other nodes, their specs as they were: the leader's, when one is on a node that no
     /// longer qualifies (its labels changed). Refused unless each is the stack's and each node enrolled.
@@ -1394,7 +1398,7 @@ impl ClusterState {
                 }
                 self.commands.insert(command.id.clone(), command.clone());
             }
-            Entry::StackDeployed { name, compose, services, placements, at, nodes, exposures: given, volumes, options } => {
+            Entry::StackDeployed { name, compose, services, placements, at, nodes, exposures: given, volumes, options, stopped } => {
                 if !valid_stack_name(name) || !services.keys().all(|s| valid_service_name(s)) || services.values().any(|s| !s.name.is_empty() && !valid_container_name(&s.name)) {
                     return Err(Rejected::BadName);
                 }
@@ -1476,7 +1480,7 @@ impl ClusterState {
                     Some(list) => list.clone(),
                     None => self.stacks.get(name).map(|s| s.exposures.iter().filter(|e| services.contains_key(&e.service)).cloned().collect()).unwrap_or_default(),
                 };
-                self.stacks.insert(name.clone(), Stack { name: name.clone(), compose: compose.clone(), services: services.clone(), stopped: false, created_at, updated_at: *at, net, exposures, nodes: nodes.clone(), volumes: volumes.clone(), options: options.clone() });
+                self.stacks.insert(name.clone(), Stack { name: name.clone(), compose: compose.clone(), services: services.clone(), stopped: *stopped, created_at, updated_at: *at, net, exposures, nodes: nodes.clone(), volumes: volumes.clone(), options: options.clone() });
             }
             Entry::StackPlaced { name, placements, at } => {
                 if placements.keys().any(|id| self.workloads.get(id).is_none_or(|w| w.stack != *name)) {
@@ -1970,6 +1974,7 @@ pub(crate) mod tests {
             exposures: None,
             volumes: Default::default(),
             options: Default::default(),
+            stopped: false,
         }
     }
 
@@ -2011,6 +2016,19 @@ pub(crate) mod tests {
         assert_eq!(s.workloads["web.a.1"].node_id.as_deref(), Some("n1"), "a placed workload stays");
         assert_eq!(s.workloads["web.a.1"].generation, s.applied, "its spec changed");
         assert_eq!(s.workloads["web.b.1"].generation, g, "b did not change");
+    }
+
+    #[test]
+    fn a_stack_deployed_stopped_is_there_and_runs_nothing_until_it_is_started() {
+        let mut s = with_nodes(&["n1"]);
+        let Entry::StackDeployed { name, compose, services, placements, at, nodes, exposures, volumes, options, .. } = deploy("web", &[("a", spec("nginx", 1))], &[("web.a.1", "n1")]) else { unreachable!() };
+        next(&mut s, &Entry::StackDeployed { name, compose, services, placements, at, nodes, exposures, volumes, options, stopped: true }).unwrap();
+        assert!(s.stacks["web"].stopped && !s.should_run(&s.workloads["web.a.1"]), "placed, and not run");
+        next(&mut s, &Entry::StackStopped { name: "web".into(), stopped: false, at: 60 }).unwrap();
+        assert!(s.should_run(&s.workloads["web.a.1"]));
+        let old = serde_json::json!({ "type": "stack_deployed", "name": "x", "compose": "", "services": {}, "placements": {}, "at": 1 });
+        let Entry::StackDeployed { stopped, .. } = serde_json::from_value::<Entry>(old).unwrap() else { panic!() };
+        assert!(!stopped, "an entry from before runs, as it did");
     }
 
     #[test]
@@ -2153,7 +2171,7 @@ pub(crate) mod tests {
         next(&mut s, &Entry::FloatingAdded { address: "192.0.2.10".into(), at: 1 }).unwrap();
         let x = |port: u16| Exposure { service: "web".into(), container_port: 80, protocol: "tcp".into(), address: "192.0.2.10".into(), port };
         let with = |nodes: &[&str], exposures: Option<Vec<Exposure>>| match deploy("a", &[("web", spec("nginx", 1))], &[("a.web.1", "n2")]) {
-            Entry::StackDeployed { name, compose, services, placements, at, .. } => Entry::StackDeployed { name, compose, services, placements, at, nodes: nodes.iter().map(|n| n.to_string()).collect(), exposures, volumes: Default::default(), options: Default::default() },
+            Entry::StackDeployed { name, compose, services, placements, at, .. } => Entry::StackDeployed { name, compose, services, placements, at, nodes: nodes.iter().map(|n| n.to_string()).collect(), exposures, volumes: Default::default(), options: Default::default(), stopped: false },
             _ => unreachable!(),
         };
         next(&mut s, &with(&["n2"], Some(vec![x(80)]))).unwrap();
@@ -2165,7 +2183,7 @@ pub(crate) mod tests {
         assert_eq!(s.stacks["a"].exposures, vec![x(80)], "and a refusal changes nothing");
         next(&mut s, &deploy("b", &[("web", spec("nginx", 1))], &[("b.web.1", "n1")])).unwrap();
         let b = match with(&[], Some(vec![Exposure { ..x(80) }])) {
-            Entry::StackDeployed { services, at, nodes, exposures, .. } => Entry::StackDeployed { name: "b".into(), compose: String::new(), services, placements: Default::default(), at, nodes, exposures, volumes: Default::default(), options: Default::default() },
+            Entry::StackDeployed { services, at, nodes, exposures, .. } => Entry::StackDeployed { name: "b".into(), compose: String::new(), services, placements: Default::default(), at, nodes, exposures, volumes: Default::default(), options: Default::default(), stopped: false },
             _ => unreachable!(),
         };
         assert_eq!(next(&mut s, &b), Err(Rejected::ExposureTaken), "80 on .10 is a's");
@@ -2281,7 +2299,7 @@ pub(crate) mod tests {
         match deploy(name, services, placements) {
             Entry::StackDeployed { name, compose, services, placements, at, nodes, exposures, .. } => {
                 let volumes = volumes.iter().map(|(v, st, a)| (v.to_string(), StackVolume { storage: st.to_string(), access: *a })).collect();
-                Entry::StackDeployed { name, compose, services, placements, at, nodes, exposures, volumes, options: Default::default() }
+                Entry::StackDeployed { name, compose, services, placements, at, nodes, exposures, volumes, options: Default::default(), stopped: false }
             }
             _ => unreachable!(),
         }
@@ -2308,7 +2326,7 @@ pub(crate) mod tests {
     fn a_workload_s_attempts_are_counted_per_spec_in_the_state_until_it_settles() {
         let mut s = with_nodes(&["a"]);
         let services = crate::compose::parse("services:\n  job:\n    image: x\n    restart: on-failure:2\n").unwrap().services;
-        next(&mut s, &Entry::StackDeployed { name: "st".into(), compose: String::new(), services, placements: [("st.job.1".to_string(), "a".to_string())].into(), at: 1, nodes: vec![], exposures: None, volumes: Default::default(), options: Default::default() }).unwrap();
+        next(&mut s, &Entry::StackDeployed { name: "st".into(), compose: String::new(), services, placements: [("st.job.1".to_string(), "a".to_string())].into(), at: 1, nodes: vec![], exposures: None, volumes: Default::default(), options: Default::default(), stopped: false }).unwrap();
         let g = s.workloads["st.job.1"].generation;
         next(&mut s, &Entry::WorkloadAttempted { workload_id: "st.job.1".into(), generation: g, at: 10 }).unwrap();
         next(&mut s, &Entry::WorkloadAttempted { workload_id: "st.job.1".into(), generation: g, at: 20 }).unwrap();
@@ -2324,7 +2342,7 @@ pub(crate) mod tests {
     fn a_move_remembers_the_node_left_until_its_copy_is_gone_there() {
         let mut s = with_nodes(&["a", "b"]);
         let services = crate::compose::parse("services:\n  web:\n    image: nginx\n").unwrap().services;
-        next(&mut s, &Entry::StackDeployed { name: "st".into(), compose: String::new(), services, placements: [("st.web.1".to_string(), "a".to_string())].into(), at: 1, nodes: vec![], exposures: None, volumes: Default::default(), options: Default::default() }).unwrap();
+        next(&mut s, &Entry::StackDeployed { name: "st".into(), compose: String::new(), services, placements: [("st.web.1".to_string(), "a".to_string())].into(), at: 1, nodes: vec![], exposures: None, volumes: Default::default(), options: Default::default(), stopped: false }).unwrap();
         assert_eq!(s.workloads["st.web.1"].leaving, None, "a first placement leaves nothing");
         next(&mut s, &Entry::StackPlaced { name: "st".into(), placements: [("st.web.1".to_string(), "b".to_string())].into(), at: 2 }).unwrap();
         assert_eq!(s.workloads["st.web.1"].leaving.as_deref(), Some("a"));
@@ -2346,7 +2364,7 @@ pub(crate) mod tests {
 
         let mut s = with_nodes(&["a", "b"]);
         let services = crate::compose::parse("services:\n  web:\n    image: nginx\n    deploy: {update_config: {order: start-first}}\n").unwrap().services;
-        next(&mut s, &Entry::StackDeployed { name: "st".into(), compose: String::new(), services, placements: [("st.web.1".to_string(), "a".to_string())].into(), at: 1, nodes: vec![], exposures: None, volumes: Default::default(), options: Default::default() }).unwrap();
+        next(&mut s, &Entry::StackDeployed { name: "st".into(), compose: String::new(), services, placements: [("st.web.1".to_string(), "a".to_string())].into(), at: 1, nodes: vec![], exposures: None, volumes: Default::default(), options: Default::default(), stopped: false }).unwrap();
         next(&mut s, &Entry::StackPlaced { name: "st".into(), placements: [("st.web.1".to_string(), "b".to_string())].into(), at: 2 }).unwrap();
         assert_eq!(s.workloads["st.web.1"].leaving, None, "start-first: the new copy may start beside the old");
     }

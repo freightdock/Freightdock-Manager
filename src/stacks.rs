@@ -480,7 +480,7 @@ mod tests {
 
     fn deploy(s: &mut ClusterState, stack: &str, services: &BTreeMap<String, ServiceSpec>, placements: BTreeMap<String, String>) {
         let i = s.applied + 1;
-        s.apply_at(i, &Entry::StackDeployed { name: stack.into(), compose: String::new(), services: services.clone(), placements, at: 1, nodes: vec![], exposures: None, volumes: Default::default(), options: Default::default() }).unwrap();
+        s.apply_at(i, &Entry::StackDeployed { name: stack.into(), compose: String::new(), services: services.clone(), placements, at: 1, nodes: vec![], exposures: None, volumes: Default::default(), options: Default::default(), stopped: false }).unwrap();
     }
 
     fn svc(list: &[(&str, ServiceSpec)]) -> BTreeMap<String, ServiceSpec> {
@@ -690,7 +690,7 @@ mod tests {
         let services = svc(&[("db", ServiceSpec { volumes: vec!["pg:/var/lib/pg".into(), "cache:/cache".into()], ..spec("postgres", 1) })]);
         let i = s.applied + 1;
         let volumes = [("pg".to_string(), StackVolume { storage: "nas".into(), access: Access::One })].into();
-        s.apply_at(i, &Entry::StackDeployed { name: "app".into(), compose: String::new(), services, placements: [("app.db.1".to_string(), "a".to_string())].into(), at: 1, nodes: vec![], exposures: None, volumes, options: Default::default() }).unwrap();
+        s.apply_at(i, &Entry::StackDeployed { name: "app".into(), compose: String::new(), services, placements: [("app.db.1".to_string(), "a".to_string())].into(), at: 1, nodes: vec![], exposures: None, volumes, options: Default::default(), stopped: false }).unwrap();
         let ops = reconcile(&s, "a", &[], &BTreeSet::new());
         let Some((_, Op::RunContainer { storage, volumes, .. })) = ops.first() else { panic!("{ops:?}") };
         assert_eq!(storage.len(), 1, "only pg is on storage; cache is local");

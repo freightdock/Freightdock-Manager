@@ -1018,7 +1018,7 @@ async fn ui_deploy(State(m): State<Arc<Manager>>, h: HeaderMap, Json(b): Json<Ui
     let placements = m.store.read(|s| crate::stacks::place(s, crate::ui::STACK, &services, &m.eligible(s), &[])).map_err(|e| ApiError(StatusCode::CONFLICT, e))?;
     let existed = m.store.read(|s| s.stacks.contains_key(crate::ui::STACK));
     let options = crate::state::StackOptions { description: "The Freightdock UI, run by the managers".into(), ..Default::default() };
-    m.store.propose(Entry::StackDeployed { name: crate::ui::STACK.into(), compose, services, placements, at: now_ms(), nodes: vec![], exposures: Some(vec![crate::ui::exposure(&address)]), volumes: Default::default(), options }).await?;
+    m.store.propose(Entry::StackDeployed { name: crate::ui::STACK.into(), compose, services, placements, at: now_ms(), nodes: vec![], exposures: Some(vec![crate::ui::exposure(&address)]), volumes: Default::default(), options, stopped: false }).await?;
     m.events.push("ui", None, format!("the UI {} ({image}) at https://{address}", if existed { "updated" } else { "deployed" }));
     let (code, Json(v)) = (if existed { StatusCode::OK } else { StatusCode::CREATED }, ui_status(State(m), h).await?);
     Ok((code, Json(v)))
@@ -1061,6 +1061,9 @@ struct DeployBody {
     /// Container names by service.
     #[serde(default)]
     names: Option<std::collections::BTreeMap<String, String>>,
+    /// Made or changed stopped (an import of a stack that still runs elsewhere); a deploy otherwise runs it.
+    #[serde(default)]
+    stopped: Option<bool>,
 }
 
 /// A field that is there, null included: `Some(Value::Null)`, where a plain `Option` reads null as left out.
@@ -1185,7 +1188,7 @@ async fn deploy_stack(State(m): State<Arc<Manager>>, h: HeaderMap, Json(b): Json
     let (name, r) = ready(&m, &b)?;
     let placements = r.placements.map_err(|e| ApiError(StatusCode::CONFLICT, e))?;
     let existed = m.store.read(|s| s.stacks.contains_key(&name));
-    m.store.propose(Entry::StackDeployed { name: name.clone(), compose: b.compose, services: r.parsed.services, placements, at: now_ms(), nodes: r.nodes, exposures: b.exposures, volumes: r.parsed.volumes, options: r.options }).await?;
+    m.store.propose(Entry::StackDeployed { name: name.clone(), compose: b.compose, services: r.parsed.services, placements, at: now_ms(), nodes: r.nodes, exposures: b.exposures, volumes: r.parsed.volumes, options: r.options, stopped: b.stopped.unwrap_or(false) }).await?;
     m.events.push("stack_deployed", None, format!("stack {name} {}", if existed { "updated" } else { "deployed" }));
     let v = m.store.read(|s| s.stacks.get(&name).map(|st| stack_json(&m, s, st, false))).unwrap_or(Value::Null);
     Ok((if existed { StatusCode::OK } else { StatusCode::CREATED }, Json(json!({ "stack": v, "warnings": r.parsed.warnings }))))

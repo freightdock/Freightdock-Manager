@@ -290,7 +290,8 @@ stateless|pinned|shared:<storage>|file` (every workload moves with local volumes
 named volumes on that storage, one writer; or as the file says) and `--name <service>=<name>` (a container name of
 its own, over `container_name`: one workload's in the cluster, `-<n>` added per replica when it has more, and a name
 for it inside the stack). The API takes the same as `description`, `env`, `selector`, `mode`
-(`{"kind": "shared", "storage": "nas"}`, null for the file) and `names`.
+(`{"kind": "shared", "storage": "nas"}`, null for the file) and `names`, and `"stopped": true` makes or changes it
+stopped: placed, and run only once it is started (an import of a stack that still runs where it came from).
 
 Finished commands are dropped from the state an hour after they finished, or past the newest 1000, each workload's
 latest kept.
