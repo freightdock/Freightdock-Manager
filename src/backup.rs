@@ -213,7 +213,7 @@ mod tests {
     fn a_backup_s_name_says_when() {
         assert_eq!(file_name(1_794_600_000_000), "freightdock-20261113-200000.fdbk");
         assert_eq!(taken_at("freightdock-20261113-200000.fdbk"), Some(1_794_600_000_000));
-        for bad in ["freightdock-20261313-200000.fdbk", "../admin.token", "freightdock-2026111-200000.fdbk", "freightdock-20261113-200000.fdbk.tmp"] {
+        for bad in ["freightdock-20261313-200000.fdbk", "freightdock-2026111-200000.fdbk", "freightdock-20261113-200000.fdbk.tmp", "../admin.token"] {
             assert_eq!(taken_at(bad), None, "{bad}");
         }
     }

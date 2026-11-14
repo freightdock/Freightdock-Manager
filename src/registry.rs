@@ -124,7 +124,7 @@ mod tests {
 
     #[test]
     fn a_registry_s_name_is_a_host_and_maybe_a_port() {
-        for ok in ["ghcr.io", "registry.example:5000", "docker.io", "localhost", "10.0.0.5:5000"] {
+        for ok in ["ghcr.io", "registry.example:5000", "docker.io", "localhost", "192.0.2.5:5000"] {
             assert!(valid_host(ok), "{ok}");
         }
         for bad in ["", "GHCR.io", "https://ghcr.io", "ghcr.io/x", "a b", "h:0", "h:99999", "-x.io", "h:"] {
