@@ -120,6 +120,13 @@ impl ManagerPeer for PeerSvc {
         Ok(Response::new(HeardReply { nodes: self.0.sessions.connected() }))
     }
 
+    type ShellStream = tokio_stream::wrappers::ReceiverStream<Result<freightdock_proto::v1::ShellUp, Status>>;
+
+    async fn shell(&self, req: Request<tonic::Streaming<freightdock_proto::v1::PeerShellDown>>) -> Result<Response<Self::ShellStream>, Status> {
+        caller(&req)?;
+        Ok(Response::new(self.0.shell_for_peer(req.into_inner()).await?))
+    }
+
     async fn docker(&self, req: Request<PeerDockerRequest>) -> Result<Response<DockerReply>, Status> {
         caller(&req)?;
         let r = req.into_inner();

@@ -102,6 +102,8 @@ fn report_of(h: &v1::Hello) -> NodeReport {
         memory_total_bytes: res.memory_total_bytes,
         wg_public_key: h.network.as_ref().map(|n| n.public_key.clone()).unwrap_or_default(),
         docker_requests: caps.docker_requests,
+        shells: caps.shells,
+        host_shell: caps.host_shell,
     }
 }
 
@@ -138,6 +140,17 @@ pub struct SessionSvc(pub Arc<Manager>);
 #[tonic::async_trait]
 impl WorkerSession for SessionSvc {
     type OpenStream = ReceiverStream<Result<v1::ManagerMessage, Status>>;
+    type ShellStream = ReceiverStream<Result<v1::ShellDown, Status>>;
+
+    /// A worker dialling back for a shell it was asked to open; only the node the certificate names, for its own.
+    async fn shell(&self, req: Request<Streaming<v1::ShellUp>>) -> Result<Response<Self::ShellStream>, Status> {
+        let m = &self.0;
+        let peer = peer_of(&req).ok_or_else(|| Status::internal("no peer"))?;
+        let cert = peer.cert.as_ref().ok_or_else(|| Status::unauthenticated("a client certificate is needed"))?;
+        let fp = sha256_hex(cert);
+        let node_id = m.store.read(|s| s.node_by_cert(&fp).map(|n| n.id.clone())).ok_or_else(|| Status::permission_denied("this certificate is not an enrolled node's"))?;
+        Ok(Response::new(m.shell_dialled(&node_id, Box::pin(req.into_inner())).await?))
+    }
 
     /// A new certificate for the node whose certificate this call came with (G2.7).
     async fn renew(&self, req: Request<v1::RenewRequest>) -> Result<Response<v1::RenewResponse>, Status> {

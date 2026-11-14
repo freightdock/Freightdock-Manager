@@ -788,6 +788,133 @@ async fn a_node_s_docker_is_asked_through_the_manager_that_holds_its_stream() {
 }
 
 #[tokio::test]
+async fn a_shell_is_opened_through_the_manager_that_holds_the_node_s_stream_and_nothing_typed_is_kept() {
+    use freightdock_manager::state::NodeReport;
+    use freightdock_proto::v1::{ShellDown, ShellEnd, ShellUp, manager_message::Body, shell_down, shell_up};
+    use futures_util::StreamExt;
+    let a = start(None).await;
+    let b = start(Some((&a.addr, issue(&a.m, true).await))).await;
+    until("b a voter", || a.m.store.voters().len() == 2).await;
+    let t = JoinToken::parse(&issue(&a.m, false).await).unwrap();
+    a.m.store.propose(Entry::NodeEnrolled { node_id: "n1".into(), hostname: "h".into(), secret_hash: t.secret_hash(), cert_sha256: "c".into(), at: now_ms() }).await.unwrap();
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap().to_string();
+    tokio::spawn(freightdock_manager::serve_admin_tls(a.m.clone(), l));
+    let admin = Some(a.m.admin_token.as_str());
+
+    let (s, body) = https(&a.m, &addr, "GET", "/v1/nodes/n1/shell", admin).await;
+    assert!(s == 409 && body.contains("older"), "a worker without shells is told apart: {s} {body}");
+    let report = NodeReport { docker: true, shells: true, host_shell: false, ..Default::default() };
+    a.m.store.propose(Entry::NodeReported { node_id: "n1".into(), report, at: now_ms() }).await.unwrap();
+    let (s, body) = https(&a.m, &addr, "GET", "/v1/nodes/n1/shell", admin).await;
+    assert!(s == 403 && body.contains("FREIGHTDOCK_WORKER_HOST_SHELL"), "the node's owner turned the host's off: {s} {body}");
+    let (s, body) = https(&a.m, &addr, "GET", "/v1/nodes/n1/shell?container=web", admin).await;
+    assert!(s == 400 && body.contains("WebSocket"), "a container's is allowed, as a WebSocket: {s} {body}");
+    let (s, _) = https(&a.m, &addr, "GET", "/v1/nodes/n1/shell?container=web&check=1", admin).await;
+    assert_eq!(s, 204, "asked only whether it may be opened");
+    let (s, _) = https(&a.m, &addr, "GET", "/v1/nodes/n1/shell?container=-it", admin).await;
+    assert_eq!(s, 400);
+    let (s, _) = https(&a.m, &addr, "GET", "/v1/nodes/nope/shell?container=web", admin).await;
+    assert_eq!(s, 404);
+    let (s, body) = https_with(&a.m, &addr, "POST", "/v1/api-tokens", admin, r#"{"name":"look","role":"read"}"#).await;
+    assert_eq!(s, 201, "{body}");
+    let read = serde_json::from_str::<serde_json::Value>(&body).unwrap()["token"].as_str().unwrap().to_string();
+    let (s, _) = https(&a.m, &addr, "GET", "/v1/nodes/n1/shell?container=web", Some(&read)).await;
+    assert_eq!(s, 403, "a read token opens no shell");
+
+    // The worker is connected to b; asked, it dials back with the session's id and echoes what is typed.
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+    b.m.sessions.open("n1", tx, "test".into(), None);
+    let bm = b.m.clone();
+    tokio::spawn(async move {
+        while let Some(Ok(msg)) = rx.recv().await {
+            if let Some(Body::ShellOpen(o)) = msg.body {
+                let (up, up_rx) = tokio::sync::mpsc::channel::<ShellUp>(8);
+                up.send(ShellUp { body: Some(shell_up::Body::SessionId(o.session_id.clone())) }).await.unwrap();
+                let stream = tokio_stream::wrappers::ReceiverStream::new(up_rx).map(Ok);
+                let mut down = bm.shell_dialled("n1", Box::pin(stream)).await.unwrap();
+                up.send(ShellUp { body: Some(shell_up::Body::Output(format!("{} {}x{}\n", o.container, o.cols, o.rows).into_bytes())) }).await.unwrap();
+                tokio::spawn(async move {
+                    while let Some(Ok(ShellDown { body: Some(b) })) = down.next().await {
+                        let said = match b {
+                            shell_down::Body::Input(i) if i == b"exit\n" => break,
+                            shell_down::Body::Input(i) => [b"echo:".to_vec(), i].concat(),
+                            shell_down::Body::Resize(s) => format!("size:{}x{}", s.cols, s.rows).into_bytes(),
+                        };
+                        up.send(ShellUp { body: Some(shell_up::Body::Output(said)) }).await.unwrap();
+                    }
+                    let _ = up.send(ShellUp { body: Some(shell_up::Body::End(ShellEnd { exit_code: 3, error: String::new() })) }).await;
+                });
+            }
+        }
+    });
+    a.m.gather_heard().await;
+    let mut pipe = a.m.shell("n1", "web", 120, 40).await.unwrap();
+    let out = |u: Option<ShellUp>| match u.and_then(|u| u.body) {
+        Some(shell_up::Body::Output(b)) => String::from_utf8(b).unwrap(),
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(out(pipe.up.recv().await), "web 120x40\n", "opened through b, as asked");
+    pipe.down.send(ShellDown { body: Some(shell_down::Body::Input(b"ls\n".to_vec())) }).await.unwrap();
+    assert_eq!(out(pipe.up.recv().await), "echo:ls\n");
+    pipe.down.send(ShellDown { body: Some(shell_down::Body::Resize(freightdock_proto::v1::ShellSize { cols: 90, rows: 30 })) }).await.unwrap();
+    assert_eq!(out(pipe.up.recv().await), "size:90x30");
+    pipe.down.send(ShellDown { body: Some(shell_down::Body::Input(b"exit\n".to_vec())) }).await.unwrap();
+    match pipe.up.recv().await.and_then(|u| u.body) {
+        Some(shell_up::Body::End(e)) => assert_eq!(e.exit_code, 3),
+        other => panic!("{other:?}"),
+    }
+    assert!(a.m.events.last(20).iter().any(|e| e.kind == "shell" && e.message.contains("container web")), "opened is an event");
+    assert!(!a.m.events.last(50).iter().chain(b.m.events.last(50).iter()).any(|e| e.message.contains("ls")), "nothing typed is kept");
+
+    // As a WebSocket over the admin API's TLS, as the UI opens it: the output comes as binary frames, the typed goes
+    // up as masked ones.
+    {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(a.m.ca.cert_der.clone()).unwrap();
+        let cfg = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider())).with_safe_default_protocol_versions().unwrap().with_root_certificates(roots).with_no_client_auth();
+        let tcp = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        let name = rustls::pki_types::ServerName::try_from(freightdock_proto::MANAGER_SERVER_NAME).unwrap();
+        let mut tls = tokio_rustls::TlsConnector::from(Arc::new(cfg)).connect(name, tcp).await.unwrap();
+        let req = format!("GET /v1/nodes/n1/shell?container=web&cols=100&rows=20 HTTP/1.1\r\nHost: m\r\nAuthorization: Bearer {}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n", a.m.admin_token);
+        tls.write_all(req.as_bytes()).await.unwrap();
+        let mut got = Vec::new();
+        let mut buf = [0u8; 4096];
+        // Reads until `n` bytes of frames follow the head, or gives up.
+        async fn more(tls: &mut (impl AsyncReadExt + Unpin), got: &mut Vec<u8>, buf: &mut [u8], until: impl Fn(&[u8]) -> bool) {
+            while !until(got) {
+                match tokio::time::timeout(Duration::from_secs(5), tls.read(buf)).await {
+                    Ok(Ok(n)) if n > 0 => got.extend_from_slice(&buf[..n]),
+                    _ => return,
+                }
+            }
+        }
+        let has = |needle: &'static [u8]| move |g: &[u8]| g.windows(needle.len()).any(|w| w == needle);
+        more(&mut tls, &mut got, &mut buf, has(b"web 100x20")).await;
+        let text = String::from_utf8_lossy(&got).into_owned();
+        assert!(text.starts_with("HTTP/1.1 101"), "{text}");
+        assert!(text.contains("web 100x20"), "the shell's output came over the WebSocket: {text:?}");
+        let payload = b"pwd\n";
+        let mask = [1u8, 2, 3, 4];
+        let mut frame = vec![0x82, 0x80 | payload.len() as u8];
+        frame.extend_from_slice(&mask);
+        frame.extend(payload.iter().enumerate().map(|(i, b)| b ^ mask[i % 4]));
+        tls.write_all(&frame).await.unwrap();
+        more(&mut tls, &mut got, &mut buf, has(b"echo:pwd")).await;
+        assert!(String::from_utf8_lossy(&got).contains("echo:pwd"), "what is typed reached the shell");
+    }
+
+    // The cluster can turn shells off.
+    let (s, _) = https_with(&a.m, &addr, "PUT", "/v1/settings", admin, r#"{"shells":false}"#).await;
+    assert_eq!(s, 200);
+    let (s, body) = https(&a.m, &addr, "GET", "/v1/nodes/n1/shell?container=web", admin).await;
+    assert!(s == 403 && body.contains("turned off for this cluster"), "{s} {body}");
+    a.server.abort();
+    b.server.abort();
+}
+
+#[tokio::test]
 async fn a_private_registry_s_login_is_kept_never_shown_and_goes_with_its_images_only() {
     use freightdock_manager::state::{CommandRecord, CommandStatus, Op};
     use freightdock_proto::v1::{command, manager_message::Body};

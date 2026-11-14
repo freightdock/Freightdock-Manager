@@ -287,6 +287,11 @@ pub struct NodeReport {
     /// The worker answers DockerRequest (the per-node Docker pages); an older one does not.
     #[serde(default)]
     pub docker_requests: bool,
+    /// The worker opens shells (the UI's terminal) in containers, and on the host unless its owner turned that off.
+    #[serde(default)]
+    pub shells: bool,
+    #[serde(default)]
+    pub host_shell: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

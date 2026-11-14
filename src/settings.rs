@@ -31,6 +31,9 @@ pub struct Settings {
     pub auto_authorize: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recovery_delay_s: Option<u32>,
+    /// Whether an administrator may open a shell on a node or in a container from the UI (on by default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shells: Option<bool>,
     /// The Proxmox provider: its address, token (never shown) and pinned certificate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proxmox: Option<ProxmoxConfig>,
@@ -74,7 +77,7 @@ const NUMBERS: [(&str, u32, u32); 9] = [
 /// Daily, the last week of them.
 pub const BACKUP_EVERY_H: u32 = 24;
 pub const BACKUP_KEEP: u32 = 7;
-const SWITCHES: [&str; 2] = ["fence", "auto_authorize"];
+const SWITCHES: [&str; 3] = ["fence", "auto_authorize", "shells"];
 
 impl Settings {
     /// Every value, as a manager without any setting has it.
@@ -94,6 +97,7 @@ impl Settings {
             fence_reboot_s: Some(f.reboot_s),
             auto_authorize: Some(f.auto_authorize),
             recovery_delay_s: Some(f.recovery_delay_s),
+            shells: Some(true),
             proxmox: f.proxmox.clone(),
             redfish: f.redfish.clone(),
             backup_every_h: Some(BACKUP_EVERY_H),
@@ -114,6 +118,7 @@ impl Settings {
             fence_reboot_s: self.fence_reboot_s.or(base.fence_reboot_s),
             auto_authorize: self.auto_authorize.or(base.auto_authorize),
             recovery_delay_s: self.recovery_delay_s.or(base.recovery_delay_s),
+            shells: self.shells.or(base.shells),
             proxmox: self.proxmox.clone().or_else(|| base.proxmox.clone()),
             redfish: self.redfish.clone().or_else(|| base.redfish.clone()),
             backup_every_h: self.backup_every_h.or(base.backup_every_h),
@@ -176,6 +181,7 @@ impl Settings {
         match key {
             "fence" => self.fence,
             "auto_authorize" => self.auto_authorize,
+            "shells" => self.shells,
             _ => None,
         }
     }
@@ -184,6 +190,7 @@ impl Settings {
         Some(match key {
             "fence" => &mut self.fence,
             "auto_authorize" => &mut self.auto_authorize,
+            "shells" => &mut self.shells,
             _ => return None,
         })
     }
@@ -350,6 +357,16 @@ mod tests {
         assert!(s.patched(&json!({ "fence_stop_s": "x" })).is_err());
         assert!(s.patched(&json!({ "fence_stop_s": -1 })).is_err());
         assert!(s.patched(&json!({ "fence": 1 })).is_err());
+    }
+
+    #[test]
+    fn shells_are_on_unless_the_cluster_turns_them_off() {
+        let d = Settings::defaults();
+        assert_eq!(Settings::default().over(&d).shells, Some(true));
+        let off = Settings::default().patched(&json!({ "shells": false })).unwrap();
+        assert_eq!(off.over(&d).shells, Some(false));
+        assert_eq!(view(&off, &d)["shells"]["value"], false);
+        assert!(Settings::default().patched(&json!({ "shells": "no" })).is_err());
     }
 
     #[test]

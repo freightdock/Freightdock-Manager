@@ -17,6 +17,7 @@ pub mod recovery;
 pub mod registry;
 pub mod sessions;
 pub mod settings;
+pub mod shell;
 pub mod stacks;
 pub mod state;
 pub mod store;
@@ -164,6 +165,7 @@ pub struct Manager {
     pub data_dir: PathBuf,
     /// Docker requests sent to the workers here, waiting for their replies (`docker.rs`).
     docker_waits: docker::Waits,
+    shell_waits: shell::Waits,
     /// The leader's watch over the cluster and the quiet window of what was told (`notify.rs`).
     pub notifier: notify::Notifier,
 }
@@ -285,7 +287,7 @@ impl Manager {
         let manager_id = kept(&config.data_dir.join("manager.id"), || uuid::Uuid::new_v4().to_string())?;
         let admin_token = kept(&config.data_dir.join("admin.token"), || hex::encode(rand::random::<[u8; 32]>()))?;
         let commands = store.commands();
-        let m = Arc::new(Manager { store, events: Default::default(), sessions: Sessions::new(config.thresholds), ca, manager_id, advertise: config.advertise.clone(), admin_token, peer_tls, peer_channels: Default::default(), local_worker_token: config.local_worker_token.clone(), paced: Default::default(), own: settings::Settings::of(&config.thresholds, &config.fencing), local: config.local(), timers_sent: Default::default(), started: std::time::Instant::now(), cut_off_since: Default::default(), fence_tasks: Default::default(), evictions: Default::default(), data_dir: config.data_dir.clone(), docker_waits: Default::default(), notifier: Default::default() });
+        let m = Arc::new(Manager { store, events: Default::default(), sessions: Sessions::new(config.thresholds), ca, manager_id, advertise: config.advertise.clone(), admin_token, peer_tls, peer_channels: Default::default(), local_worker_token: config.local_worker_token.clone(), paced: Default::default(), own: settings::Settings::of(&config.thresholds, &config.fencing), local: config.local(), timers_sent: Default::default(), started: std::time::Instant::now(), cut_off_since: Default::default(), fence_tasks: Default::default(), evictions: Default::default(), data_dir: config.data_dir.clone(), docker_waits: Default::default(), shell_waits: Default::default(), notifier: Default::default() });
         tokio::spawn(deliver_applied(Arc::downgrade(&m), commands));
         Ok(m)
     }
@@ -686,7 +688,8 @@ pub async fn serve_admin_tls(m: Arc<Manager>, listener: tokio::net::TcpListener)
                 _ => return tracing::debug!("API TLS handshake with {addr} failed or took too long"),
             };
             let svc = hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| app.clone().oneshot(req.map(axum::body::Body::new)));
-            let conn = hyper::server::conn::http1::Builder::new().timer(hyper_util::rt::TokioTimer::new()).header_read_timeout(Duration::from_secs(10)).serve_connection(hyper_util::rt::TokioIo::new(tls), svc);
+            let conn = hyper::server::conn::http1::Builder::new().timer(hyper_util::rt::TokioTimer::new()).header_read_timeout(Duration::from_secs(10)).serve_connection(hyper_util::rt::TokioIo::new(tls), svc).with_upgrades();
+            // with_upgrades: a shell is a WebSocket on this connection, taken over once the 101 has gone.
             if let Err(e) = conn.await {
                 tracing::debug!("API connection from {addr}: {e}");
             }

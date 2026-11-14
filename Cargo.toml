@@ -9,7 +9,7 @@ rust-version = "1.90"
 
 [dependencies]
 anyhow = "1"
-axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "query"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "query", "ws"] }
 freightdock-proto = { path = "../Freightdock-Contracts" }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 hex = "0.4"

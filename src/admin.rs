@@ -120,6 +120,7 @@ pub fn router(m: Arc<Manager>) -> Router {
         .route("/v1/nodes/{id}/labels", axum::routing::put(set_labels))
         .route("/v1/nodes/{id}/authorize", post(authorize))
         .route("/v1/nodes/{id}/docker", get(docker_read).post(docker_change))
+        .route("/v1/nodes/{id}/shell", get(shell))
         .route("/v1/join-tokens", post(join_token))
         .route("/v1/manager-tokens", post(manager_token))
         .route("/v1/commands", get(commands))
@@ -199,6 +200,108 @@ impl From<crate::docker::DockerError> for ApiError {
             Peer(_) => StatusCode::BAD_GATEWAY,
         };
         ApiError(status, e.to_string())
+    }
+}
+
+impl From<crate::shell::ShellError> for ApiError {
+    fn from(e: crate::shell::ShellError) -> Self {
+        use crate::shell::ShellError::*;
+        let status = match &e {
+            UnknownNode => StatusCode::NOT_FOUND,
+            BadContainer(_) => StatusCode::BAD_REQUEST,
+            Off | HostOff => StatusCode::FORBIDDEN,
+            Older => StatusCode::CONFLICT,
+            NotConnected => StatusCode::SERVICE_UNAVAILABLE,
+            NoAnswer => StatusCode::GATEWAY_TIMEOUT,
+            Peer(_) => StatusCode::BAD_GATEWAY,
+        };
+        ApiError(status, e.to_string())
+    }
+}
+
+#[derive(Deserialize)]
+struct ShellAsk {
+    #[serde(default)]
+    container: String,
+    #[serde(default)]
+    cols: u32,
+    #[serde(default)]
+    rows: u32,
+    /// Only whether it may be opened: 204, or why not.
+    #[serde(default)]
+    check: Option<String>,
+}
+
+/// A shell on the node (`container` empty) or in one of its containers, as a WebSocket: what the shell writes comes
+/// as binary messages, and its end as a text one, `{"end":{"exit_code","error"}}`; what is typed goes as binary,
+/// a new size as text, `{"resize":{"cols","rows"}}`. The admin token only (a shell changes anything), and only while
+/// the cluster's settings allow shells.
+async fn shell(State(m): State<Arc<Manager>>, h: HeaderMap, Path(id): Path<String>, Query(q): Query<ShellAsk>, ws: Result<axum::extract::ws::WebSocketUpgrade, axum::extract::ws::rejection::WebSocketUpgradeRejection>) -> R<axum::response::Response> {
+    if authed(&m, &h)? != ApiRole::Admin {
+        return Err(ApiError(StatusCode::FORBIDDEN, "a shell needs a token that may change things".into()));
+    }
+    m.shell_allowed(&id, &q.container)?;
+    if q.check.is_some() {
+        return Ok(StatusCode::NO_CONTENT.into_response());
+    }
+    let ws = ws.map_err(|_| ApiError(StatusCode::BAD_REQUEST, "a shell is a WebSocket".into()))?;
+    let pipe = m.shell(&id, &q.container, q.cols, q.rows).await?;
+    Ok(ws.on_upgrade(move |socket| shell_socket(socket, pipe)))
+}
+
+/// What the browser sends as text: a new size.
+#[derive(Deserialize)]
+struct ShellText {
+    resize: Option<ShellResize>,
+}
+
+#[derive(Deserialize)]
+struct ShellResize {
+    cols: u32,
+    rows: u32,
+}
+
+/// Pumps a shell to and from its WebSocket until either ends.
+pub async fn shell_socket(mut socket: axum::extract::ws::WebSocket, mut pipe: crate::shell::Pipe) {
+    use axum::extract::ws::Message;
+    use freightdock_proto::v1::{ShellDown, shell_down, shell_up};
+    loop {
+        tokio::select! {
+            up = pipe.up.recv() => match up.and_then(|u| u.body) {
+                Some(shell_up::Body::Output(b)) => {
+                    if socket.send(Message::Binary(b.into())).await.is_err() {
+                        return;
+                    }
+                }
+                Some(shell_up::Body::End(e)) => {
+                    let _ = socket.send(Message::Text(json!({ "end": { "exit_code": e.exit_code, "error": e.error } }).to_string().into())).await;
+                    let _ = socket.send(Message::Close(None)).await;
+                    return;
+                }
+                Some(shell_up::Body::SessionId(_)) => {}
+                None => {
+                    let _ = socket.send(Message::Text(json!({ "end": { "exit_code": -1, "error": "the shell went away" } }).to_string().into())).await;
+                    let _ = socket.send(Message::Close(None)).await;
+                    return;
+                }
+            },
+            msg = socket.recv() => match msg {
+                Some(Ok(Message::Binary(b))) => {
+                    if pipe.down.send(ShellDown { body: Some(shell_down::Body::Input(b.to_vec())) }).await.is_err() {
+                        return;
+                    }
+                }
+                Some(Ok(Message::Text(t))) => {
+                    if let Ok(ShellText { resize: Some(sz) }) = serde_json::from_str::<ShellText>(&t) {
+                        let size = freightdock_proto::v1::ShellSize { cols: sz.cols, rows: sz.rows };
+                        let _ = pipe.down.send(ShellDown { body: Some(shell_down::Body::Resize(size)) }).await;
+                    }
+                }
+                Some(Ok(_)) => {}
+                // The browser went: dropping the pipe's down end hangs the shell up.
+                _ => return,
+            },
+        }
     }
 }
 

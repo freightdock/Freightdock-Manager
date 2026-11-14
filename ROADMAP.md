@@ -404,6 +404,13 @@ Scoped 2026-11-14 against the plan's phase 11. Much of it came with the earlier 
        each node offers): tried on the three VMs with their 16 GB disks, 16 steps done the first time, the storage
        made from the keys step and a writer running on it. The UI does it from its Integrations page: torn down and set
        up again from there by ticking the three disks, the same 16 steps done, the writer running on it again.
+7. [x] Shells (2026-11-14, `shell.rs` on both sides): an administrator's shell on a node (a login shell as root on a
+       terminal of the worker's own) or in a container (`docker exec` with a terminal), as a WebSocket from the admin
+       API (`/v1/nodes/{id}/shell`), on a gRPC stream of its own the worker dials back (WorkerSession.Shell) so its
+       output never holds up the heartbeats, through ManagerPeer.Shell when the node is another manager's. The
+       cluster's `shells` setting turns them off; `FREIGHTDOCK_WORKER_HOST_SHELL=off` turns the host's off on a node.
+       Tried from the UI on the test cluster: root on vm1, idle 20 s and on, and sh in a busybox container on vm3 with
+       its exit code back.
 
 ## Open questions for the owner
 
