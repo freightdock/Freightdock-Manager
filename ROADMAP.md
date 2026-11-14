@@ -82,7 +82,7 @@ While nothing is published the crates point at each other by path (`../Freightdo
     runs as containers. Today's `install-node.sh` works over ssh from another machine; it becomes that command.
 14. **No standalone Freightdock** (owner's decision, 2026-11-12): the single-host product (Freightdock managing Docker
     hosts directly: local socket, tunnel agent, environments) goes; a one-node cluster does that job. Freightdock keeps
-    its sign-in, including SSO (OIDC) and LDAP. The Portainer import is set aside until everything else is done.
+    its sign-in, including SSO (OIDC) and LDAP. The Portainer import is set aside until everything else is done. (Back, 2026-11-14: Compose stacks into cluster stacks.)
 15. **External integrations last** (owner's decision, 2026-11-12): the Proxmox fencing provider stays in the code but
     is not tried or extended until then; the same for other outside systems.
 16. **The UI's database is replicated by the managers** (owner's choice, 2026-11-12): Freightdock keeps its SQLite
@@ -218,7 +218,9 @@ same host. Each later goal adds its pages there (stacks with G4, and so on).
        templates, webhooks, registries, image updates, notifications, history, backups, MCP or Portainer import; two
        roles (Administrator, user). Its own image: the binary alone, no socket. Set aside to come back through the
        managers: a node's Docker pages via its worker, registries, notifications, backups of the managers' state, the
-       MCP server, the Portainer import (last).
+       MCP server, the Portainer import (last). The MCP server and the Portainer import are back (2026-11-14): MCP's tools call
+       the cluster routes; a Portainer Compose stack comes in as a cluster stack, made stopped unless asked
+       (`POST /v1/stacks` takes `"stopped": true`).
 4. [x] A cluster section: nodes, health, stacks, events, fencing, recoveries (the Cluster and Cluster stacks pages).
 5. [x] The managers run the UI as a system workload (G4's workloads): placed on a node, recovered when that node
        goes, on the single-node cluster too; reachable through any manager. How (2026-11-12):
