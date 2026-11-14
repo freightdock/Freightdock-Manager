@@ -42,21 +42,40 @@ FREIGHTDOCK_MANAGER_DATA=./data cargo run -q -- command <node> '{"op":"remove_co
 
 ## Install
 
-Build once on a machine with Docker (Contracts, Manager and Worker checked out side by side); the binaries are
-static and run on any x86_64 Linux with systemd:
+On each node, as root, with Docker and systemd there; one line per role:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/freightdock/Freightdock-Manager/main/install.sh | sudo sh -s -- first
+curl -fsSL https://raw.githubusercontent.com/freightdock/Freightdock-Manager/main/install.sh | sudo sh -s -- worker 192.0.2.11 FDCT1-...
+curl -fsSL https://raw.githubusercontent.com/freightdock/Freightdock-Manager/main/install.sh | sudo sh -s -- join   192.0.2.11 FDMT1-...
+curl -fsSL https://raw.githubusercontent.com/freightdock/Freightdock-Manager/main/install.sh | sudo sh -s -- upgrade
+```
+
+`first` makes a whole cluster on its node (a manager and a worker) and prints the `worker` and `join` lines for the
+others, their tokens filled in; each token is good once, for a day, and `freightdock-manager join-token` (a worker's)
+or `manager-token` (a manager's) makes another. `join` adds a manager with a worker beside it, `worker` a worker only,
+`upgrade` puts the newest binaries in place and restarts them, settings kept. `--ui <address>` with `first` runs the
+Freightdock UI at `https://<address>`, a free address of the LAN (below); `--labels k=v,...` gives the worker its
+labels; `--advertise <address>` the address the others reach the node at, when the default route's is not it.
+
+The script takes the binaries for the node's architecture (amd64 or arm64, static, any glibc) from this repository's
+latest release, or `edge` (the newest build of main) while there is none or with `FREIGHTDOCK_VERSION=edge`, and
+checks them against the release's `SHA256SUMS`. It writes `/etc/freightdock/manager.env` and `worker.env`, which are
+the whole configuration (below), and installs wireguard-tools, nftables, arping and conntrack for the overlay where
+it can (apt, dnf or apk). The release workflow (`.github/workflows/release.yml`) builds those files.
+
+From source instead, over ssh from a machine with Docker (Contracts, Network, Manager and Worker checked out side by
+side):
 
 ```sh
 Freightdock-Manager/deploy/build-static.sh                               # -> dist/freightdock-manager, dist/freightdock-worker
 Freightdock-Manager/deploy/install-node.sh first  192.0.2.11              # manager + worker: a whole cluster on one node
 Freightdock-Manager/deploy/install-node.sh join   192.0.2.12 192.0.2.11    # another manager + worker, joining it
-Freightdock-Manager/deploy/install-node.sh join   192.0.2.13 192.0.2.11    # a third (managers go 1, 3, 5)
 Freightdock-Manager/deploy/install-node.sh worker 192.0.2.21 192.0.2.11    # a worker only
 ```
 
-The script works over `ssh root@<host>`; `LABELS=key=value,...` sets the worker's labels, and `UI_IMAGE=<image>`
-with `first` runs the Freightdock UI on the new cluster (below). It writes
-`/etc/freightdock/manager.env` and `worker.env`, which are the whole configuration (below). By hand: a worker join
-token from `freightdock-manager join-token`, a manager one from `freightdock-manager manager-token`, each good once.
+It works over `ssh root@<host>`, fetching the tokens itself; `LABELS=key=value,...` sets the worker's labels, and
+`UI_IMAGE=<image> UI_ADDRESS=<address>` with `first` runs the UI.
 
 With two managers, losing either stops every change (a majority of two is two), so grow from one manager to three.
 Port 7450/tcp must be open between managers and from workers to managers; nothing needs to be open on a worker.

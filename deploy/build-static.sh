@@ -1,12 +1,13 @@
 #!/bin/sh
 # Builds static (musl) binaries of the manager and the worker in a throwaway rust:alpine container, so they run on any
-# x86_64 Linux whatever its glibc. Needs Docker, and Contracts, Manager and Worker checked out side by side.
+# Linux of this machine's architecture (amd64 or arm64) whatever its glibc. Needs Docker, and Contracts, Network,
+# Manager and Worker checked out side by side. The release workflow builds with it too.
 #
 #   Freightdock-Manager/deploy/build-static.sh        ->  dist/freightdock-manager, dist/freightdock-worker (beside the checkouts)
 set -eu
 here=$(cd "$(dirname "$0")/../.." && pwd)
-for d in Freightdock-Contracts Freightdock-Manager Freightdock-Worker; do
-  [ -d "$here/$d" ] || { echo "missing $here/$d: check out Freightdock-Contracts, -Manager and -Worker side by side" >&2; exit 1; }
+for d in Freightdock-Contracts Freightdock-Network Freightdock-Manager Freightdock-Worker; do
+  [ -d "$here/$d" ] || { echo "missing $here/$d: check out Freightdock-Contracts, -Network, -Manager and -Worker side by side" >&2; exit 1; }
 done
 mkdir -p "$here/dist"
 docker volume create freightdock-cargo-cache >/dev/null

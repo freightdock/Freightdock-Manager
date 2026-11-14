@@ -221,6 +221,8 @@ same host. Each later goal adds its pages there (stacks with G4, and so on).
        MCP server, the Portainer import (last). The MCP server and the Portainer import are back (2026-11-14): MCP's tools call
        the cluster routes; a Portainer Compose stack comes in as a cluster stack, made stopped unless asked
        (`POST /v1/stacks` takes `"stopped": true`).
+       Install is one line per role on the node itself (2026-11-14): `install.sh first|worker|join|upgrade`, from
+       the release workflow's static amd64/arm64 builds (`edge` from main, `vX.Y.Z` from tags), checked by SHA256SUMS.
 4. [x] A cluster section: nodes, health, stacks, events, fencing, recoveries (the Cluster and Cluster stacks pages).
 5. [x] The managers run the UI as a system workload (G4's workloads): placed on a node, recovered when that node
        goes, on the single-node cluster too; reachable through any manager. How (2026-11-12):

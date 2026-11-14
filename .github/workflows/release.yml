@@ -1,0 +1,105 @@
+# The cluster's binaries, for install.sh: the manager and the worker built static (musl) for amd64 and arm64, each on
+# a runner of its own architecture, with their systemd units, install.sh itself and SHA256SUMS.
+#
+#   push to main      the `edge` pre-release, made again at that commit (the newest build of main)
+#   tag vX.Y.Z        a release of that name, the one install.sh takes by default (GitHub's latest)
+#
+# The worker is built from the same owner's Freightdock-Worker (with Network and Contracts beside it), at its main
+# branch, or at the same tag when that repository has it.
+name: release
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*.*.*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      matrix:
+        include:
+          - { arch: amd64, runner: ubuntu-24.04 }
+          - { arch: arm64, runner: ubuntu-24.04-arm }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: Freightdock-Manager
+      - name: The other repositories, at this tag when they have it
+        env:
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -eu
+          ref=main
+          case "$GITHUB_REF" in refs/tags/*) ref=${GITHUB_REF#refs/tags/} ;; esac
+          for r in Contracts Network Worker; do
+            url="https://github.com/$OWNER/Freightdock-$r.git"
+            if [ "$ref" != main ] && git ls-remote --exit-code --tags "$url" "$ref" >/dev/null; then at=$ref; else at=main; fi
+            git clone -q --depth 1 --branch "$at" "$url" "Freightdock-$r"
+            echo "Freightdock-$r at $at ($(git -C "Freightdock-$r" rev-parse --short HEAD))"
+          done
+      - name: Build
+        run: sh Freightdock-Manager/deploy/build-static.sh
+      - name: Name them for their architecture
+        run: |
+          set -eu
+          mkdir out
+          for b in manager worker; do cp "dist/freightdock-$b" "out/freightdock-$b-linux-${{ matrix.arch }}"; done
+          file out/*
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: bin-${{ matrix.arch }}
+          path: |
+            out/*
+            Freightdock-Worker/deploy/freightdock-worker.service
+          if-no-files-found: error
+
+  publish:
+    name: Publish
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: art
+      - name: The release's files
+        run: |
+          set -eu
+          mkdir rel
+          cp art/*/out/* rel/
+          cp art/bin-amd64/Freightdock-Worker/deploy/freightdock-worker.service rel/
+          cp deploy/freightdock-manager.service install.sh rel/
+          cd rel && sha256sum -- * > SHA256SUMS && cat SHA256SUMS
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          line='curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/install.sh | sudo sh -s -- first'
+          case "$GITHUB_REF" in
+            refs/tags/v*)
+              tag=${GITHUB_REF#refs/tags/}
+              gh release create "$tag" rel/* --title "$tag" --verify-tag \
+                --notes "Install a node: \`$line\` (the README's Install says more)."
+              ;;
+            refs/heads/main)
+              gh release delete edge --cleanup-tag --yes 2>/dev/null || true
+              gh release create edge rel/* --prerelease --target "$GITHUB_SHA" --title "edge" \
+                --notes "The newest build of main ($(git rev-parse --short HEAD)), made again at every push. \`FREIGHTDOCK_VERSION=edge\` installs it; with no release yet, install.sh takes it anyway."
+              ;;
+            *) echo "nothing to publish for $GITHUB_REF" ;;
+          esac
