@@ -393,7 +393,7 @@ Scoped 2026-11-14 against the plan's phase 11. Much of it came with the earlier 
 5. [x] Redfish fencing (2026-11-14, `redfish.rs`): a node labelled `fence.provider=redfish` is powered off through
        its BMC (`ForceOff`, pinned certificate, one cluster account in the settings) and fenced once the BMC says its
        power is off. Tried only against a fake BMC in the tests: the test cluster has no server with a BMC.
-6. [~] Replicated storage and Ceph (2026-11-14). A `cephfs` storage (`ceph.rs` on both sides): the worker's kernel
+6. [x] Replicated storage and Ceph (2026-11-14). A `cephfs` storage (`ceph.rs` on both sides): the worker's kernel
        mounts it (mount(2), the key in the call only), its keys kept apart and filled into a command as it is sent,
        and a fenced node's mounts evicted by the leader through a `CephCommand` (the `ceph` CLI in the Ceph image on
        a healthy worker), so Ceph blocklists them. Tried on three VMs with Ceph 20 (cephadm, one 16 GB OSD each):
@@ -402,7 +402,8 @@ Scoped 2026-11-14 against the plan's phase 11. Much of it came with the earlier 
        fenced, and vm2's clients were evicted 33 s after (the first worker asked had to pull the image; the retry
        on another took 1.6 s). Ceph made by the managers (`CephSetup`, `Cephadm` steps on the workers, the disks
        each node offers): tried on the three VMs with their 16 GB disks, 16 steps done the first time, the storage
-       made from the keys step and a writer running on it. Left: the UI for it.
+       made from the keys step and a writer running on it. The UI does it from its Integrations page: torn down and set
+       up again from there by ticking the three disks, the same 16 steps done, the writer running on it again.
 
 ## Open questions for the owner
 

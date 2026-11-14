@@ -594,6 +594,9 @@ struct CephSetupBody {
     #[serde(default)]
     image: String,
     hosts: Vec<CephHostBody>,
+    /// Who started it, as the UI names its user; else "an administrator".
+    #[serde(default)]
+    by: String,
 }
 
 #[derive(Deserialize)]
@@ -624,11 +627,17 @@ async fn start_ceph_setup(State(m): State<Arc<Manager>>, h: HeaderMap, Json(b): 
     }
     let image = if b.image.trim().is_empty() { crate::state::DEFAULT_CEPH_IMAGE.to_string() } else { b.image.trim().to_string() };
     let hosts = b.hosts.into_iter().map(|h| crate::ceph::CephHost { node_id: h.node_id, disks: h.disks, hostname: String::new(), address: String::new() }).collect();
-    let setup = crate::ceph::CephSetup::new(b.storage.trim(), b.fs.trim(), &image, hosts, "an administrator", now_ms());
+    let setup = crate::ceph::CephSetup::new(b.storage.trim(), b.fs.trim(), &image, hosts, started_by(&b.by), now_ms());
     let steps = setup.steps.len();
     m.store.propose(Entry::CephSetupStarted { setup }).await?;
     m.events.push("ceph", None, format!("Ceph setup started ({steps} steps)"));
     Ok((StatusCode::ACCEPTED, Json(json!({ "steps": steps }))))
+}
+
+/// Who a setup is said to be started by: the name the UI gives (plain, short), else "an administrator".
+fn started_by(by: &str) -> &str {
+    let by = by.trim();
+    if by.is_empty() || by.len() > 64 || by.chars().any(char::is_control) { "an administrator" } else { by }
 }
 
 async fn retry_ceph_setup(State(m): State<Arc<Manager>>, h: HeaderMap) -> R<StatusCode> {
@@ -1387,6 +1396,14 @@ fn node_by(s: &crate::state::ClusterState, n: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_setup_is_started_by_the_ui_s_user_or_an_administrator() {
+        assert_eq!(super::started_by(" admin "), "admin");
+        assert_eq!(super::started_by(""), "an administrator");
+        assert_eq!(super::started_by("a\nb"), "an administrator");
+        assert_eq!(super::started_by(&"x".repeat(65)), "an administrator");
+    }
+
     #[test]
     fn a_storage_s_health_is_each_node_s_that_made_it_ready_by_name() {
         use freightdock_proto::v1::{StorageHealth, StorageReport};

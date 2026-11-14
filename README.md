@@ -463,7 +463,7 @@ trusts cephadm's key on the others and adds them, places 1, 3 or 5 monitors and 
 two nodes, gives the OSDs a third of each node's memory, makes an OSD of each disk, the filesystem, and the clients'
 keys, which become a `cephfs` storage of the name given and are kept nowhere else (not in the command's record). The
 steps are in the replicated state, so a new leader goes on; a failed step says why, and `ceph retry` goes on from
-it once the cause is fixed. The UI does the same from the Cluster page.
+it once the cause is fixed. The UI does the same from its Integrations page (Set up Ceph, under the shares).
 
 ```sh
 freightdock-manager disks <node>
