@@ -386,8 +386,9 @@ Scoped 2026-11-14 against the plan's phase 11. Much of it came with the earlier 
 3. [x] Storage-aware placement and its health (G11.8).
 4. [x] Monitoring (2026-11-14): `GET /v1/metrics`, Prometheus' text format from any manager for the whole cluster
        (`metrics.rs`), with a read token over the TLS API.
-5. [ ] More fencing providers: Redfish (a server's BMC) is the next useful one; it can only be tried against a fake
-       BMC here.
+5. [x] Redfish fencing (2026-11-14, `redfish.rs`): a node labelled `fence.provider=redfish` is powered off through
+       its BMC (`ForceOff`, pinned certificate, one cluster account in the settings) and fenced once the BMC says its
+       power is off. Tried only against a fake BMC in the tests: the test cluster has no server with a BMC.
 6. [ ] Replicated storage and Ceph: need disks or a Ceph cluster the test cluster does not have (open question 9).
 
 ## Open questions for the owner

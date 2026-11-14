@@ -20,6 +20,7 @@ lettre = { version = "0.11", default-features = false, features = ["builder", "s
 libc = "0.2"
 rand = "0.9"
 ring = "0.17"
+base64 = "0.22"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots", "rustls-tls-native-roots"] }
 socket2 = "0.6"
 rcgen = { version = "0.14", features = ["pem", "x509-parser"] }

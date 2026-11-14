@@ -8,6 +8,7 @@ use serde_json::{Map, Value, json};
 
 use crate::fencing::FenceConfig;
 use crate::proxmox::ProxmoxConfig;
+use crate::redfish::RedfishConfig;
 use crate::sessions::Thresholds;
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -33,6 +34,9 @@ pub struct Settings {
     /// The Proxmox provider: its address, token (never shown) and pinned certificate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proxmox: Option<ProxmoxConfig>,
+    /// The Redfish provider's account on the nodes' BMCs (its password never shown).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redfish: Option<RedfishConfig>,
     /// Hours between the backups each manager writes of the cluster's state; 0 is none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backup_every_h: Option<u32>,
@@ -45,7 +49,7 @@ pub struct Settings {
 }
 
 /// A value that is stored and used but never shown: `Debug` hides it, the API's view says only whether it is set.
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Secret(pub String);
 
@@ -91,6 +95,7 @@ impl Settings {
             auto_authorize: Some(f.auto_authorize),
             recovery_delay_s: Some(f.recovery_delay_s),
             proxmox: f.proxmox.clone(),
+            redfish: f.redfish.clone(),
             backup_every_h: Some(BACKUP_EVERY_H),
             backup_keep: Some(BACKUP_KEEP),
             backup_passphrase: None,
@@ -110,6 +115,7 @@ impl Settings {
             auto_authorize: self.auto_authorize.or(base.auto_authorize),
             recovery_delay_s: self.recovery_delay_s.or(base.recovery_delay_s),
             proxmox: self.proxmox.clone().or_else(|| base.proxmox.clone()),
+            redfish: self.redfish.clone().or_else(|| base.redfish.clone()),
             backup_every_h: self.backup_every_h.or(base.backup_every_h),
             backup_keep: self.backup_keep.or(base.backup_keep),
             backup_passphrase: self.backup_passphrase.clone().or_else(|| base.backup_passphrase.clone()),
@@ -131,6 +137,7 @@ impl Settings {
             auto_authorize: self.auto_authorize.unwrap_or(d.auto_authorize),
             enabled: self.fence.unwrap_or(d.enabled),
             proxmox: self.proxmox.clone(),
+            redfish: self.redfish.clone(),
             recovery_delay_s: self.recovery_delay_s.unwrap_or(d.recovery_delay_s),
         }
     }
@@ -204,6 +211,9 @@ impl Settings {
         if let Some(p) = &self.proxmox {
             ProxmoxConfig::checked(&p.url(), &p.token, &p.fingerprint).map_err(|e| format!("{e:#}"))?;
         }
+        if let Some(r) = &self.redfish {
+            RedfishConfig::checked(&r.username, &r.password.0).map_err(|e| format!("{e:#}"))?;
+        }
         Ok(())
     }
 
@@ -246,6 +256,20 @@ impl Settings {
                     }
                     _ => return Err("proxmox is {url, fingerprint, token} or null".into()),
                 };
+            } else if key == "redfish" {
+                s.redfish = match v {
+                    Value::Null => None,
+                    Value::Object(r) => {
+                        let user = r.get("username").and_then(Value::as_str).unwrap_or("");
+                        let password = match (r.get("password").and_then(Value::as_str).filter(|p| !p.is_empty()), &self.redfish) {
+                            (Some(p), _) => p.to_string(),
+                            (None, Some(old)) => old.password.0.clone(),
+                            (None, None) => return Err("the Redfish provider needs a password".into()),
+                        };
+                        Some(RedfishConfig::checked(user, &password).map_err(|e| format!("{e:#}"))?)
+                    }
+                    _ => return Err("redfish is {username, password} or null".into()),
+                };
             } else {
                 return Err(format!("{key} is not a setting"));
             }
@@ -277,6 +301,8 @@ pub fn view(cluster: &Settings, manager: &Settings) -> Value {
     }
     let p = cluster.proxmox.as_ref().map(|p| (p, "cluster")).or_else(|| manager.proxmox.as_ref().map(|p| (p, "manager")));
     out.insert("backup_passphrase_set".into(), json!(cluster.backup_passphrase.is_some()));
+    let r = cluster.redfish.as_ref().map(|r| (r, "cluster")).or_else(|| manager.redfish.as_ref().map(|r| (r, "manager")));
+    out.insert("redfish".into(), r.map_or(Value::Null, |(r, src)| json!({ "username": r.username, "password_set": true, "source": src })));
     out.insert("proxmox".into(), p.map_or(Value::Null, |(p, src)| json!({ "url": p.url(), "token_id": p.token_id(), "fingerprint": colons(&p.fingerprint), "source": src })));
     Value::Object(out)
 }
@@ -324,6 +350,21 @@ mod tests {
         assert!(s.patched(&json!({ "fence_stop_s": "x" })).is_err());
         assert!(s.patched(&json!({ "fence_stop_s": -1 })).is_err());
         assert!(s.patched(&json!({ "fence": 1 })).is_err());
+    }
+
+    #[test]
+    fn the_redfish_password_is_kept_when_left_out_and_never_shown() {
+        let s = Settings::default().patched(&json!({ "redfish": { "username": "fence", "password": "s3cret" } })).unwrap();
+        let again = s.patched(&json!({ "redfish": { "username": "fence2" } })).unwrap();
+        let r = again.redfish.as_ref().unwrap();
+        assert_eq!((r.username.as_str(), r.password.0.as_str()), ("fence2", "s3cret"));
+        assert!(Settings::default().patched(&json!({ "redfish": { "username": "fence" } })).unwrap_err().contains("password"));
+        assert!(Settings::default().patched(&json!({ "redfish": { "username": "", "password": "x" } })).is_err());
+        assert_eq!(again.fencing().redfish, again.redfish, "the leader fences with it");
+        let v = view(&again, &Settings::default());
+        assert_eq!(v["redfish"], json!({ "username": "fence2", "password_set": true, "source": "cluster" }));
+        assert!(!v.to_string().contains("s3cret"));
+        assert_eq!(again.patched(&json!({ "redfish": null })).unwrap().redfish, None);
     }
 
     #[test]

@@ -96,7 +96,7 @@ it, filled in by the manager that sends it, never written to the cluster's state
 
 ### The cluster's settings
 
-The timings, fencing and the Proxmox provider are also the cluster's settings, kept in the replicated state and changed
+The timings, fencing and its providers are also the cluster's settings, kept in the replicated state and changed
 from the UI's Integrations page, `freightdock-manager settings set k=v ...` (`default` to let one go) or
 `PUT /v1/settings`. A value the cluster sets wins on every manager; one it does not set is the manager's own variable,
 else the default. `GET /v1/settings` says where each comes from and shows what only a manager's environment sets
@@ -104,7 +104,8 @@ else the default. `GET /v1/settings` says where each comes from and shows what o
 a manager are sent a Welcome again when the heartbeat or the fencing timers change, so they take them on the same
 stream. `POST /v1/settings/proxmox/fingerprint {url}` reads the certificate the API shows (nothing is sent), and
 `POST /v1/settings/proxmox/test` (the settings given, or the ones in use) answers Proxmox's version and each
-worker's guest as Proxmox sees it.
+worker's guest as Proxmox sees it. `POST /v1/settings/redfish/fingerprint {host}` and `POST
+/v1/settings/redfish/test` (`{username, password}` or the account in use) do the same for the nodes' BMCs.
 
 | Setting | Variable | Default |
 |---|---|---|
@@ -113,6 +114,7 @@ worker's guest as Proxmox sees it.
 | `fence_stop_s`, `fence_storage_s`, `fence_reboot_s` | `FREIGHTDOCK_FENCE_STOP_S`, `_STORAGE_S`, `_REBOOT_S` | 30, 15, 15 |
 | `recovery_delay_s` | `FREIGHTDOCK_RECOVERY_DELAY_S` | 0 |
 | `proxmox` (`{url, fingerprint, token}`) | `FREIGHTDOCK_FENCE_PROXMOX_URL`, `_TOKEN_FILE`, `_FINGERPRINT` | none |
+| `redfish` (`{username, password}`) | | none |
 | `backup_every_h` (0: none), `backup_keep` | | 24, 7 |
 | `backup_passphrase` (set, never shown) | | none: no scheduled backups |
 
@@ -319,6 +321,20 @@ for id in 201 202; do                                             # the workers'
   pveum acl modify /vms/$id --tokens 'freightdock-fence@pve!fence' --roles FreightdockFence
 done
 openssl x509 -in /etc/pve/local/pve-ssl.pem -noout -fingerprint -sha256
+```
+
+A bare-metal node is powered off through its BMC (iDRAC, iLO, XClarity or any other Redfish service) when it is
+labelled `fence.provider=redfish`, `redfish.host=<host[:port]>` (443 when not given) and `redfish.fingerprint=<the
+BMC certificate's SHA-256>`, plus `redfish.system=<id>` when the BMC manages more than one system. The leader sends
+`ForceOff` to the system's `ComputerSystem.Reset` action and calls the node fenced once the BMC says its
+`PowerState` is `Off`; an accepted reset is no proof. The cluster holds one account for its BMCs (the `redfish`
+setting; its password is never shown), which needs the right to reset the system (iDRAC: the Operator role).
+
+```sh
+freightdock-manager settings redfish fingerprint 192.0.2.31        # the certificate the BMC shows, to pin
+freightdock-manager label <node> fence.provider=redfish redfish.host=192.0.2.31 redfish.fingerprint=AB:CD:...   # all its labels
+freightdock-manager settings redfish fence                         # the account; its password on stdin
+freightdock-manager settings redfish test                          # each BMC's system and power state
 ```
 
 | Variable | Default | |

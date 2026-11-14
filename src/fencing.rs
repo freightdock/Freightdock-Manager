@@ -41,13 +41,15 @@ pub struct FenceConfig {
     pub enabled: bool,
     /// The Proxmox provider's settings, for nodes labelled `fence.provider=proxmox`.
     pub proxmox: Option<crate::proxmox::ProxmoxConfig>,
+    /// The Redfish provider's account, for nodes labelled `fence.provider=redfish`.
+    pub redfish: Option<crate::redfish::RedfishConfig>,
     /// How long a node stays fenced before its stateless workloads are started elsewhere (G7).
     pub recovery_delay_s: u32,
 }
 
 impl Default for FenceConfig {
     fn default() -> Self {
-        FenceConfig { stop_s: 30, storage_s: 15, reboot_s: 15, auto_authorize: true, enabled: true, proxmox: None, recovery_delay_s: 0 }
+        FenceConfig { stop_s: 30, storage_s: 15, reboot_s: 15, auto_authorize: true, enabled: true, proxmox: None, redfish: None, recovery_delay_s: 0 }
     }
 }
 
@@ -81,6 +83,7 @@ impl FenceConfig {
             auto_authorize: onoff("FREIGHTDOCK_FENCE_AUTO_AUTHORIZE", d.auto_authorize)?,
             enabled: onoff("FREIGHTDOCK_FENCE", d.enabled)?,
             proxmox: crate::proxmox::ProxmoxConfig::from(&get)?,
+            redfish: None,
             recovery_delay_s: match get("FREIGHTDOCK_RECOVERY_DELAY_S") {
                 Some(v) => v.trim().parse::<u32>().map_err(|_| anyhow::anyhow!("FREIGHTDOCK_RECOVERY_DELAY_S is a number of seconds"))?,
                 None => d.recovery_delay_s,
@@ -157,29 +160,35 @@ impl Manager {
             let health = self.sessions.liveness(&n.id).health;
             if let Some((state, message)) = leader_step(&n.fencing, &provider, health, n.report.is_some(), now_ms(), &cfg) {
                 self.set_fencing(&n.id, state, &provider, message).await;
-            } else if n.fencing.state == FenceState::InProgress && n.fencing.provider == "proxmox" {
-                self.proxmox_task(n);
+            } else if n.fencing.state == FenceState::InProgress && matches!(n.fencing.provider.as_str(), "proxmox" | "redfish") {
+                self.provider_task(n);
             }
         }
     }
 
-    /// Powers the node's guest off through Proxmox, once at a time per node (a new leader takes over one that was
-    /// in progress: stopping a stopped guest is harmless), and records what Proxmox says.
-    fn proxmox_task(self: &std::sync::Arc<Self>, n: crate::state::Node) {
+    /// Powers the node off through its provider (its guest through Proxmox, its system through its BMC), once at a
+    /// time per node (a new leader takes over one that was in progress: powering off what is off is harmless), and
+    /// records what the provider says.
+    fn provider_task(self: &std::sync::Arc<Self>, n: crate::state::Node) {
         if !self.fence_tasks.lock().expect("fence tasks lock").insert(n.id.clone()) {
             return;
         }
         let m = self.clone();
         tokio::spawn(async move {
+            let provider = n.fencing.provider.clone();
             let r = async {
+                if provider == "redfish" {
+                    let cfg = m.fence().redfish.ok_or_else(|| anyhow::anyhow!("the cluster has no Redfish account set (Integrations)"))?;
+                    return crate::redfish::Redfish::new(cfg, crate::redfish::bmc_of(&n)?)?.fence(Duration::from_secs(60)).await;
+                }
                 let cfg = m.fence().proxmox.ok_or_else(|| anyhow::anyhow!("the cluster has no Proxmox provider set (Integrations, or FREIGHTDOCK_FENCE_PROXMOX_URL)"))?;
                 let g = crate::proxmox::guest_of(&n)?;
                 crate::proxmox::Proxmox::new(cfg)?.fence(&g, Duration::from_secs(60)).await
             }
             .await;
             match r {
-                Ok(msg) => m.set_fencing(&n.id, FenceState::Fenced, "proxmox", msg).await,
-                Err(e) => m.set_fencing(&n.id, FenceState::Failed, "proxmox", format!("{e:#}")).await,
+                Ok(msg) => m.set_fencing(&n.id, FenceState::Fenced, &provider, msg).await,
+                Err(e) => m.set_fencing(&n.id, FenceState::Failed, &provider, format!("{e:#}")).await,
             }
             m.fence_tasks.lock().expect("fence tasks lock").remove(&n.id);
         });

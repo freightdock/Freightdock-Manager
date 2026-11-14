@@ -98,6 +98,8 @@ pub fn router(m: Arc<Manager>) -> Router {
         .route("/v1/settings", get(settings).put(set_settings))
         .route("/v1/settings/proxmox/fingerprint", post(proxmox_fingerprint))
         .route("/v1/settings/proxmox/test", post(proxmox_test))
+        .route("/v1/settings/redfish/fingerprint", post(redfish_fingerprint))
+        .route("/v1/settings/redfish/test", post(redfish_test))
         .route("/v1/backup", post(take_backup))
         .route("/v1/registries", get(registries))
         .route("/v1/registries/{host}", axum::routing::put(set_registry).delete(remove_registry))
@@ -737,6 +739,53 @@ async fn proxmox_test(State(m): State<Arc<Manager>>, h: HeaderMap, body: Option<
         guests.push(r);
     }
     Ok(Json(json!({ "version": version, "guests": guests })))
+}
+
+#[derive(Deserialize)]
+struct HostBody {
+    host: String,
+}
+
+/// The certificate the BMC at `host` (`host[:port]`) shows, to pin in the node's `redfish.fingerprint` label.
+async fn redfish_fingerprint(State(m): State<Arc<Manager>>, h: HeaderMap, Json(b): Json<HostBody>) -> R<Json<Value>> {
+    authed(&m, &h)?;
+    let host = crate::redfish::host_port(&b.host).map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    let fp = crate::proxmox::fingerprint_at(&host).await.map_err(|e| ApiError(StatusCode::BAD_GATEWAY, format!("{e:#}")))?;
+    Ok(Json(json!({ "host": host, "fingerprint": crate::settings::colons(&fp) })))
+}
+
+/// Tries the Redfish provider: the account given (`{username, password}`, the password kept when left out) or the
+/// one in use, against the BMC of each node labelled `fence.provider=redfish`. Answers each system's power state;
+/// changes nothing.
+async fn redfish_test(State(m): State<Arc<Manager>>, h: HeaderMap, body: Option<Json<Value>>) -> R<Json<Value>> {
+    authed(&m, &h)?;
+    let given = body.map(|b| b.0).filter(|b| b.get("username").is_some());
+    let cfg = match given {
+        Some(r) => m.settings().patched(&json!({ "redfish": r })).map_err(|e| ApiError(StatusCode::BAD_REQUEST, e))?.redfish,
+        None => m.fence().redfish,
+    }
+    .ok_or_else(|| ApiError(StatusCode::BAD_REQUEST, "no Redfish account is set".into()))?;
+    let nodes: Vec<crate::state::Node> = m.store.read(|s| s.nodes.values().filter(|n| crate::proxmox::provider_of(n) == "redfish").cloned().collect());
+    let mut systems = vec![];
+    for n in nodes {
+        let mut r = match crate::redfish::bmc_of(&n) {
+            Ok(b) => {
+                let bmc = b.to_string();
+                match crate::redfish::Redfish::new(cfg.clone(), b) {
+                    Ok(rf) => match rf.status().await {
+                        Ok((sys, power)) => json!({ "bmc": bmc, "system": sys, "power": power }),
+                        Err(e) => json!({ "bmc": bmc, "error": format!("{e:#}") }),
+                    },
+                    Err(e) => json!({ "bmc": bmc, "error": format!("{e:#}") }),
+                }
+            }
+            Err(e) => json!({ "error": format!("{e:#}") }),
+        };
+        r["node"] = json!(n.id);
+        r["name"] = json!(n.display_name());
+        systems.push(r);
+    }
+    Ok(Json(json!({ "systems": systems })))
 }
 
 /// A token for another manager to join with (`FREIGHTDOCK_MANAGER_JOIN_TOKEN`). Good once, an hour by default.

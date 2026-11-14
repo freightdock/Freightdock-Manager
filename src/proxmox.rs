@@ -112,11 +112,42 @@ pub fn guest_of(n: &Node) -> Result<Guest> {
     Ok(Guest { node, kind, vmid })
 }
 
-/// Accepts the one certificate whose SHA-256 is pinned, whatever its name and issuer: Proxmox's own.
+/// Accepts the one certificate whose SHA-256 is pinned, whatever its name and issuer: the server's own (Proxmox's, a
+/// BMC's), which no CA signed.
 #[derive(Debug)]
 struct PinnedLeaf {
     pin: String,
+    what: &'static str,
     provider: Arc<rustls::crypto::CryptoProvider>,
+}
+
+/// A TLS client that trusts the one certificate `pin` (its SHA-256, lowercase hex); `what` names the server in errors.
+pub(crate) fn pinned_tls(pin: &str, what: &'static str) -> Result<Arc<rustls::ClientConfig>> {
+    let p = Arc::new(rustls::crypto::ring::default_provider());
+    let tls = rustls::ClientConfig::builder_with_provider(p.clone())
+        .with_safe_default_protocol_versions()?
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(PinnedLeaf { pin: pin.to_string(), what, provider: p }))
+        .with_no_client_auth();
+    Ok(Arc::new(tls))
+}
+
+/// One HTTPS request to `host` (`host:port`) over `tls`, answered within 15 s: the status and the body.
+pub(crate) async fn https(tls: &Arc<rustls::ClientConfig>, host: &str, method: hyper::Method, path: &str, headers: &[(&str, String)], body: Option<Vec<u8>>) -> Result<(hyper::StatusCode, Bytes)> {
+    let tcp = tokio::time::timeout(Duration::from_secs(5), tokio::net::TcpStream::connect(host)).await.map_err(|_| anyhow!("{host} did not answer"))??;
+    let name = host.rsplit_once(':').map_or(host, |h| h.0).trim_start_matches('[').trim_end_matches(']').to_string();
+    let name = rustls::pki_types::ServerName::try_from(name).unwrap_or_else(|_| rustls::pki_types::ServerName::try_from("server").expect("a name"));
+    let tls = tokio_rustls::TlsConnector::from(tls.clone()).connect(name, tcp).await.with_context(|| format!("TLS to {host}"))?;
+    let (mut send, conn) = hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(tls)).await?;
+    tokio::spawn(conn);
+    let mut req = hyper::Request::builder().method(method).uri(path).header("host", host);
+    for (k, v) in headers {
+        req = req.header(*k, v);
+    }
+    let req = req.body(Full::new(Bytes::from(body.unwrap_or_default())))?;
+    let res = tokio::time::timeout(Duration::from_secs(15), send.send_request(req)).await.map_err(|_| anyhow!("{host} did not answer within 15s"))??;
+    let status = res.status();
+    Ok((status, res.into_body().collect().await?.to_bytes()))
 }
 
 impl rustls::client::danger::ServerCertVerifier for PinnedLeaf {
@@ -124,7 +155,7 @@ impl rustls::client::danger::ServerCertVerifier for PinnedLeaf {
         if freightdock_proto::sha256_hex(end) == self.pin {
             Ok(rustls::client::danger::ServerCertVerified::assertion())
         } else {
-            Err(rustls::Error::General("the Proxmox API's certificate is not the pinned one".into()))
+            Err(rustls::Error::General(format!("the {}'s certificate is not the pinned one", self.what)))
         }
     }
 
@@ -170,7 +201,11 @@ impl rustls::client::danger::ServerCertVerifier for Seen {
 /// The SHA-256 of the certificate the API at `url` shows, read in the handshake, which is then broken off: nothing
 /// is sent. For an administrator to compare with the one Proxmox shows, and pin.
 pub async fn fingerprint_of(url: &str) -> Result<String> {
-    let host = host_of(url)?;
+    fingerprint_at(&host_of(url)?).await
+}
+
+/// The SHA-256 of the certificate the server at `host` (`host:port`) shows; nothing is sent.
+pub async fn fingerprint_at(host: &str) -> Result<String> {
     let p = Arc::new(rustls::crypto::ring::default_provider());
     let seen = Arc::new(Seen { leaf: Default::default(), provider: p.clone() });
     let tls = rustls::ClientConfig::builder_with_provider(p).with_safe_default_protocol_versions()?.dangerous().with_custom_certificate_verifier(seen.clone()).with_no_client_auth();
@@ -188,33 +223,13 @@ pub struct Proxmox {
 
 impl Proxmox {
     pub fn new(cfg: ProxmoxConfig) -> Result<Self> {
-        let p = Arc::new(rustls::crypto::ring::default_provider());
-        let tls = rustls::ClientConfig::builder_with_provider(p.clone())
-            .with_safe_default_protocol_versions()?
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(PinnedLeaf { pin: cfg.fingerprint.clone(), provider: p }))
-            .with_no_client_auth();
-        Ok(Proxmox { cfg, tls: Arc::new(tls) })
+        let tls = pinned_tls(&cfg.fingerprint, "Proxmox API")?;
+        Ok(Proxmox { cfg, tls })
     }
 
     /// One call to the API: its `data`.
     async fn call(&self, method: hyper::Method, path: &str) -> Result<Value> {
-        let host = self.cfg.host.clone();
-        let tcp = tokio::time::timeout(Duration::from_secs(5), tokio::net::TcpStream::connect(&host)).await.map_err(|_| anyhow!("{host} did not answer"))??;
-        let name = host.rsplit_once(':').map_or(host.as_str(), |h| h.0).trim_start_matches('[').trim_end_matches(']').to_string();
-        let name = rustls::pki_types::ServerName::try_from(name).unwrap_or_else(|_| rustls::pki_types::ServerName::try_from("proxmox").expect("a name"));
-        let tls = tokio_rustls::TlsConnector::from(self.tls.clone()).connect(name, tcp).await.context("TLS to the Proxmox API")?;
-        let (mut send, conn) = hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(tls)).await?;
-        tokio::spawn(conn);
-        let req = hyper::Request::builder()
-            .method(method)
-            .uri(path)
-            .header("host", &host)
-            .header("authorization", format!("PVEAPIToken={}", self.cfg.token))
-            .body(Full::new(Bytes::new()))?;
-        let res = tokio::time::timeout(Duration::from_secs(15), send.send_request(req)).await.map_err(|_| anyhow!("the Proxmox API did not answer within 15s"))??;
-        let status = res.status();
-        let body = res.into_body().collect().await?.to_bytes();
+        let (status, body) = https(&self.tls, &self.cfg.host, method, path, &[("authorization", format!("PVEAPIToken={}", self.cfg.token))], None).await.context("the Proxmox API")?;
         let v: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
         if !status.is_success() {
             bail!("Proxmox answered {status}: {}", v.get("message").and_then(Value::as_str).unwrap_or_else(|| std::str::from_utf8(&body).unwrap_or("")).trim());

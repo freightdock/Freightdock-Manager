@@ -10,6 +10,7 @@ pub mod fencing;
 pub mod grpc;
 pub mod peer;
 pub mod proxmox;
+pub mod redfish;
 pub mod raft;
 pub mod recovery;
 pub mod registry;

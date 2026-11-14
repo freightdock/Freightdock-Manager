@@ -39,6 +39,10 @@ freightdock-manager settings                    the cluster's settings, each wit
 freightdock-manager settings set <k=v> ...      set some for the whole cluster (v default: back to each manager's own)
 freightdock-manager settings proxmox <https://host:port> <fingerprint> [token-file]   the Proxmox fencing provider
 freightdock-manager settings proxmox off        take it away
+freightdock-manager settings redfish <user>     the Redfish fencing provider's BMC account (password on stdin or FREIGHTDOCK_REDFISH_PASSWORD)
+freightdock-manager settings redfish off        take it away
+freightdock-manager settings redfish test       each redfish node's BMC and power state
+freightdock-manager settings redfish fingerprint <host[:port]>   the certificate a BMC shows
 freightdock-manager settings backup-passphrase [off]   the passphrase the scheduled backups are sealed with
                                        (read from FREIGHTDOCK_BACKUP_PASSPHRASE or the first line of stdin)
 freightdock-manager backup <file>           a backup of the cluster (its state and CA), sealed with the passphrase
@@ -286,6 +290,41 @@ async fn main() -> Result<()> {
                     };
                     call(&config, Method::PUT, "/v1/settings", Some(serde_json::json!({ "proxmox": p }))).await?;
                 }
+                Some("redfish") => match args.get(2).map(String::as_str) {
+                    Some("off") => {
+                        call(&config, Method::PUT, "/v1/settings", Some(serde_json::json!({ "redfish": null }))).await?;
+                    }
+                    Some("test") => {
+                        let v = call(&config, Method::POST, "/v1/settings/redfish/test", None).await?;
+                        for s in v["systems"].as_array().into_iter().flatten() {
+                            let what = match s["error"].as_str() {
+                                Some(e) => format!("error: {e}"),
+                                None => format!("{} power {}", s["system"].as_str().unwrap_or(""), s["power"].as_str().unwrap_or("")),
+                            };
+                            println!("{:<16} {:<28} {what}", s["name"].as_str().unwrap_or(""), s["bmc"].as_str().unwrap_or(""));
+                        }
+                        return Ok(());
+                    }
+                    Some("fingerprint") => {
+                        let host = args.get(3).with_context(|| USAGE.to_string())?;
+                        let v = call(&config, Method::POST, "/v1/settings/redfish/fingerprint", Some(serde_json::json!({ "host": host }))).await?;
+                        println!("{}", v["fingerprint"].as_str().unwrap_or(""));
+                        return Ok(());
+                    }
+                    Some(user) => {
+                        let password = match std::env::var("FREIGHTDOCK_REDFISH_PASSWORD") {
+                            Ok(p) => p,
+                            Err(_) => {
+                                eprintln!("the BMC account's password (one line on stdin):");
+                                let mut line = String::new();
+                                std::io::stdin().read_line(&mut line)?;
+                                line.trim_end_matches(['\r', '\n']).to_string()
+                            }
+                        };
+                        call(&config, Method::PUT, "/v1/settings", Some(serde_json::json!({ "redfish": { "username": user, "password": password } }))).await?;
+                    }
+                    None => bail!("{USAGE}"),
+                },
                 Some("backup-passphrase") => {
                     let p = match args.get(2).map(String::as_str) {
                         Some("off") => Value::Null,
@@ -298,10 +337,15 @@ async fn main() -> Result<()> {
             }
             let v = call(&config, Method::GET, "/v1/settings", None).await?;
             println!("{:<20} {:<10} {:<9} DEFAULT", "SETTING", "VALUE", "FROM");
-            for (k, x) in v["settings"].as_object().into_iter().flatten().filter(|(k, x)| *k != "proxmox" && x.is_object()) {
+            for (k, x) in v["settings"].as_object().into_iter().flatten().filter(|(k, x)| *k != "proxmox" && *k != "redfish" && x.is_object()) {
                 println!("{:<20} {:<10} {:<9} {}", k, x["value"].to_string(), x["source"].as_str().unwrap_or(""), x["default"]);
             }
             println!("backup_passphrase    {}", if v["settings"]["backup_passphrase_set"] == true { "set" } else { "not set (no scheduled backups)" });
+            let r = &v["settings"]["redfish"];
+            match r.is_null() {
+                true => println!("redfish              not set"),
+                false => println!("redfish              user {} ({}), password set", r["username"].as_str().unwrap_or(""), r["source"].as_str().unwrap_or("")),
+            }
             let p = &v["settings"]["proxmox"];
             match p.is_null() {
                 true => println!("proxmox              not set"),
