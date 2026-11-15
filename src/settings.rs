@@ -34,6 +34,9 @@ pub struct Settings {
     /// Whether an administrator may open a shell on a node or in a container from the UI (on by default).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shells: Option<bool>,
+    /// Whether the leader has nodes pull ahead the images of the workloads they would take over (on by default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prepull: Option<bool>,
     /// The Proxmox provider: its address, token (never shown) and pinned certificate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proxmox: Option<ProxmoxConfig>,
@@ -77,7 +80,7 @@ const NUMBERS: [(&str, u32, u32); 9] = [
 /// Daily, the last week of them.
 pub const BACKUP_EVERY_H: u32 = 24;
 pub const BACKUP_KEEP: u32 = 7;
-const SWITCHES: [&str; 3] = ["fence", "auto_authorize", "shells"];
+const SWITCHES: [&str; 4] = ["fence", "auto_authorize", "shells", "prepull"];
 
 impl Settings {
     /// Every value, as a manager without any setting has it.
@@ -98,6 +101,7 @@ impl Settings {
             auto_authorize: Some(f.auto_authorize),
             recovery_delay_s: Some(f.recovery_delay_s),
             shells: Some(true),
+            prepull: Some(true),
             proxmox: f.proxmox.clone(),
             redfish: f.redfish.clone(),
             backup_every_h: Some(BACKUP_EVERY_H),
@@ -119,6 +123,7 @@ impl Settings {
             auto_authorize: self.auto_authorize.or(base.auto_authorize),
             recovery_delay_s: self.recovery_delay_s.or(base.recovery_delay_s),
             shells: self.shells.or(base.shells),
+            prepull: self.prepull.or(base.prepull),
             proxmox: self.proxmox.clone().or_else(|| base.proxmox.clone()),
             redfish: self.redfish.clone().or_else(|| base.redfish.clone()),
             backup_every_h: self.backup_every_h.or(base.backup_every_h),
@@ -182,6 +187,7 @@ impl Settings {
             "fence" => self.fence,
             "auto_authorize" => self.auto_authorize,
             "shells" => self.shells,
+            "prepull" => self.prepull,
             _ => None,
         }
     }
@@ -191,6 +197,7 @@ impl Settings {
             "fence" => &mut self.fence,
             "auto_authorize" => &mut self.auto_authorize,
             "shells" => &mut self.shells,
+            "prepull" => &mut self.prepull,
             _ => return None,
         })
     }
@@ -357,6 +364,15 @@ mod tests {
         assert!(s.patched(&json!({ "fence_stop_s": "x" })).is_err());
         assert!(s.patched(&json!({ "fence_stop_s": -1 })).is_err());
         assert!(s.patched(&json!({ "fence": 1 })).is_err());
+    }
+
+    #[test]
+    fn pulling_ahead_is_on_unless_the_cluster_turns_it_off() {
+        let d = Settings::defaults();
+        assert_eq!(Settings::default().over(&d).prepull, Some(true));
+        let off = Settings::default().patched(&json!({ "prepull": false })).unwrap();
+        assert_eq!(off.over(&d).prepull, Some(false));
+        assert_eq!(view(&off, &d)["prepull"]["value"], false);
     }
 
     #[test]

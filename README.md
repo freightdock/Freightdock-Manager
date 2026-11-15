@@ -134,6 +134,7 @@ worker's guest as Proxmox sees it. `POST /v1/settings/redfish/fingerprint {host}
 | `fence`, `auto_authorize` | `FREIGHTDOCK_FENCE`, `FREIGHTDOCK_FENCE_AUTO_AUTHORIZE` | on, on |
 | `fence_stop_s`, `fence_storage_s`, `fence_reboot_s` | `FREIGHTDOCK_FENCE_STOP_S`, `_STORAGE_S`, `_REBOOT_S` | 30, 15, 15 |
 | `recovery_delay_s` | `FREIGHTDOCK_RECOVERY_DELAY_S` | 0 |
+| `shells`; `prepull` (nodes pull ahead the images of what they would take over if another node failed) | | on; on |
 | `proxmox` (`{url, fingerprint, token}`) | `FREIGHTDOCK_FENCE_PROXMOX_URL`, `_TOKEN_FILE`, `_FINGERPRINT` | none |
 | `redfish` (`{username, password}`) | | none |
 | `backup_every_h` (0: none), `backup_keep` | | 24, 7 |

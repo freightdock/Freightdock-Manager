@@ -10,6 +10,7 @@ pub mod events;
 pub mod fencing;
 pub mod grpc;
 pub mod peer;
+pub mod prepull;
 pub mod proxmox;
 pub mod redfish;
 pub mod raft;
@@ -171,6 +172,10 @@ pub struct Manager {
     pub peer_versions: std::sync::Mutex<std::collections::HashMap<String, (String, std::time::Instant)>>,
     /// The leader's watch over the cluster and the quiet window of what was told (`notify.rs`).
     pub notifier: notify::Notifier,
+    /// A pre-pull round is running (`prepull.rs`).
+    prepulling: std::sync::atomic::AtomicBool,
+    /// Pulls ahead that failed and were said, by (node, image), so the next failure is not said again.
+    prepull_failed: std::sync::Mutex<std::collections::HashSet<(String, String)>>,
 }
 
 /// How long a manager may be cut off from the majority before it sends its workers away.
@@ -290,7 +295,7 @@ impl Manager {
         let manager_id = kept(&config.data_dir.join("manager.id"), || uuid::Uuid::new_v4().to_string())?;
         let admin_token = kept(&config.data_dir.join("admin.token"), || hex::encode(rand::random::<[u8; 32]>()))?;
         let commands = store.commands();
-        let m = Arc::new(Manager { store, events: Default::default(), sessions: Sessions::new(config.thresholds), ca, manager_id, advertise: config.advertise.clone(), admin_token, peer_tls, peer_channels: Default::default(), local_worker_token: config.local_worker_token.clone(), paced: Default::default(), own: settings::Settings::of(&config.thresholds, &config.fencing), local: config.local(), timers_sent: Default::default(), started: std::time::Instant::now(), cut_off_since: Default::default(), fence_tasks: Default::default(), evictions: Default::default(), data_dir: config.data_dir.clone(), docker_waits: Default::default(), shell_waits: Default::default(), peer_versions: Default::default(), notifier: Default::default() });
+        let m = Arc::new(Manager { store, events: Default::default(), sessions: Sessions::new(config.thresholds), ca, manager_id, advertise: config.advertise.clone(), admin_token, peer_tls, peer_channels: Default::default(), local_worker_token: config.local_worker_token.clone(), paced: Default::default(), own: settings::Settings::of(&config.thresholds, &config.fencing), local: config.local(), timers_sent: Default::default(), started: std::time::Instant::now(), cut_off_since: Default::default(), fence_tasks: Default::default(), evictions: Default::default(), data_dir: config.data_dir.clone(), docker_waits: Default::default(), shell_waits: Default::default(), peer_versions: Default::default(), notifier: Default::default(), prepulling: Default::default(), prepull_failed: Default::default() });
         tokio::spawn(deliver_applied(Arc::downgrade(&m), commands));
         Ok(m)
     }
@@ -643,6 +648,9 @@ pub async fn housekeeping(m: Arc<Manager>) {
             m.sync_release().await;
         }
         m.recover_round().await;
+        if ticks.is_multiple_of(prepull::EVERY_S) {
+            m.prepull_round();
+        }
         m.float_round().await;
         m.reconcile().await;
         m.push_network();

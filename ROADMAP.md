@@ -201,6 +201,10 @@ Ranked inside the goal:
 2. [x] Duplicate execution prevention: the returning node's reconcile removes the containers of workloads that
        moved (the state no longer places them there), and runs nothing before it is authorized.
 3. [x] Recovery history in the replicated state (latest 200): `GET /v1/recoveries`, CLI `recoveries`, the UI.
+4. [x] Images pulled ahead (2026-11-15, `prepull.rs`, setting `prepull`, on): every 5 minutes the leader works out
+       where recovery would put each healthy node's workloads if that node failed now, and has those nodes pull the
+       images they lack, so a recovery does not wait on a download. Pinned workloads and ones with local data are
+       never pulled elsewhere; a failed pull is an event once, until it works.
 
 ## G8: UI (Freightdock as the cluster's UI only)
 
