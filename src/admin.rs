@@ -96,6 +96,7 @@ pub fn router(m: Arc<Manager>) -> Router {
         .route("/v1/storage", get(storage).post(add_storage))
         .route("/v1/storage/{name}", axum::routing::delete(remove_storage))
         .route("/v1/storage/{name}/keys", axum::routing::put(set_storage_keys))
+        .route("/v1/storage/{name}/password", axum::routing::put(set_storage_password))
         .route("/v1/ceph/setup", get(ceph_setup).post(start_ceph_setup).delete(clear_ceph_setup))
         .route("/v1/ceph/setup/retry", post(retry_ceph_setup))
         .route("/v1/release", get(release))
@@ -620,6 +621,10 @@ async fn storage(State(m): State<Arc<Manager>>, h: HeaderMap) -> R<Json<Value>> 
                         .map(|(stack, name, v)| json!({ "stack": stack.name, "volume": name, "access": v.access, "holder": s.leases.get(&format!("{}/{name}", stack.name)).map(|l| &l.node_id) }))
                         .collect();
                     let mut v = json!({ "name": st.name, "driver": st.driver, "source": st.source, "options": st.options, "added_at": st.added_at, "capabilities": st.driver.capabilities(), "volumes": volumes, "health": storage_health(s, &reports, &st.name) });
+                    if st.driver == crate::state::StorageDriver::Smb {
+                        // The password is never shown: only whether it is set.
+                        v["smb"] = json!({ "password_set": st.password.is_some() });
+                    }
                     if let Some(k) = &st.ceph {
                         // The keys are never shown: only whether they are set.
                         v["ceph"] = json!({ "client": st.ceph_client(), "fs": st.ceph_fs(), "mons": st.ceph_mons(), "secret_set": !k.secret.0.is_empty(), "fence_client": k.fence_client, "fence_secret_set": k.fence_secret.is_some(), "image": k.image, "image_used": st.ceph_image() });
@@ -641,6 +646,20 @@ struct StorageBody {
     /// cephfs: the mount client's key, and the evicting client and its key (G12.6).
     #[serde(flatten)]
     keys: CephKeysBody,
+    /// smb: the password of the options' `username=`.
+    #[serde(default)]
+    password: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct PasswordBody {
+    #[serde(default)]
+    password: Option<String>,
+}
+
+/// A password as it is kept: none when it is empty (a guest share).
+fn password_of(p: Option<String>) -> Option<crate::settings::Secret> {
+    p.filter(|p| !p.is_empty()).map(crate::settings::Secret)
 }
 
 #[derive(Deserialize, Default)]
@@ -675,11 +694,20 @@ impl CephKeysBody {
 async fn add_storage(State(m): State<Arc<Manager>>, h: HeaderMap, Json(b): Json<StorageBody>) -> R<StatusCode> {
     authed(&m, &h)?;
     let ceph = (b.driver == crate::state::StorageDriver::Cephfs).then(|| b.keys.over(None));
-    let storage = crate::state::Storage { name: b.name.trim().to_string(), driver: b.driver, source: b.source.trim().to_string(), options: b.options.trim().to_string(), added_at: now_ms(), ceph };
+    let password = (b.driver == crate::state::StorageDriver::Smb).then(|| password_of(b.password)).flatten();
+    let storage = crate::state::Storage { name: b.name.trim().to_string(), driver: b.driver, source: b.source.trim().to_string(), options: b.options.trim().to_string(), added_at: now_ms(), ceph, password };
     let name = storage.name.clone();
     m.store.propose(Entry::StorageAdded { storage }).await?;
     m.events.push("storage", None, format!("storage {name} added"));
     Ok(StatusCode::CREATED)
+}
+
+/// An SMB share's password set anew (G11.9); empty for a guest share.
+async fn set_storage_password(State(m): State<Arc<Manager>>, h: HeaderMap, Path(name): Path<String>, Json(b): Json<PasswordBody>) -> R<StatusCode> {
+    authed(&m, &h)?;
+    m.store.propose(Entry::StoragePasswordSet { name: name.clone(), password: password_of(b.password), at: now_ms() }).await?;
+    m.events.push("storage", None, format!("storage {name}: its password set"));
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// A CephFS's keys set anew (G12.6); a key left out stays as it was.

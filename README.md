@@ -412,8 +412,10 @@ The volume is the directory `<stack>/<volume>` on the storage. An `nfs` storage 
 has, or a bind mount into a container that cannot mount NFS itself, such as an unprivileged LXC). A volume for one
 writer (`access: one`, a database's files) is used by one workload, and the managers lease it to one node at a time:
 a workload that moves runs on its new node only once the old one let the volume go (its container there is gone) or
-is fenced. `access: many` is for what the application itself keeps safe to share. A fencing worker unmounts its
-`nfs` storage once its workloads are stopped (`FREIGHTDOCK_FENCE_STORAGE_S` after); a `path` storage is the host's to
+is fenced. `access: many` is for what the application itself keeps safe to share. A fencing worker makes its
+mounted storage (`nfs`, `smb`, `cephfs`) read-only and then unmounts it once its workloads are stopped
+(`FREIGHTDOCK_FENCE_STORAGE_S` after): read-only first, because a lazy unmount only hides the tree from new opens and
+a process still holding a file could otherwise go on writing; a `path` storage is the host's to
 take away, so with one a provider such as Proxmox is what makes a fenced node let go of it. A plain named volume
 stays local to each node, as before.
 
@@ -433,6 +435,23 @@ freightdock-manager storage add nas path /srv/freightdock
 ```
 
 The LXC's root writes as uid 100000 on the export, so the export has to let it (its owner, or open permissions).
+
+#### SMB
+
+An `smb` storage is an SMB share (Samba, Windows, a NAS) the workers' kernels mount themselves, with no cifs-utils
+on the node. Its source is `//host/share`, maybe with a path in it; its options name the user (`username=`, and
+`vers=`, `domain=` and the like as the kernel's client takes them) or say `guest`. The password is read from a file,
+so it is on no command line; it is kept in the replicated state, never shown, and goes to a worker only with the
+command that runs a workload on the share, into the mount call itself. The kernel resolves no names, so the worker
+looks the host up and passes its address (`ip=`) unless the options give one.
+
+```sh
+freightdock-manager storage add files smb //192.0.2.60/freightdock username=freightdock,vers=3.1.1 files.pw
+freightdock-manager storage password files files.pw      # a new password later
+```
+
+An SMB server has no fencing of its own here: as with NFS, a fenced worker takes its own writes away (read-only,
+then unmounted), and a provider such as Proxmox is what proves it.
 
 #### CephFS
 

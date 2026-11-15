@@ -447,7 +447,7 @@ impl Manager {
             ui::fill(&mut c.op, &ui::Fill { token: ui::token(&self.ca.key_pem()), ca_pem: self.ca.cert_pem.clone(), managers: self.managers(), addresses });
         }
         let mut m = grpc::command_to_proto(&c);
-        // A private registry's login for the image and a CephFS's keys, filled in here only: never kept with the
+        // A private registry's login for the image, a CephFS's keys and an SMB share's password, filled in here only: never kept with the
         // command.
         if let Some(freightdock_proto::v1::manager_message::Body::Command(cmd)) = &mut m.body {
             use freightdock_proto::v1::command::Op as P;
@@ -455,8 +455,12 @@ impl Manager {
                 Some(P::RunContainer(r)) => self.store.read(|s| {
                     r.auth = registry::auth_for(&s.registries, &r.image);
                     for v in &mut r.storage {
-                        if let Some(k) = s.storage.get(&v.storage).and_then(|st| st.ceph.as_ref()) {
-                            v.secret = k.secret.0.clone();
+                        if let Some(st) = s.storage.get(&v.storage) {
+                            if let Some(k) = &st.ceph {
+                                v.secret = k.secret.0.clone();
+                            } else if let Some(p) = &st.password {
+                                v.secret = p.0.clone();
+                            }
                         }
                     }
                 }),

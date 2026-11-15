@@ -481,6 +481,7 @@ impl Manager {
                 options: format!("name={MOUNT_CLIENT},fs={}", setup.fs),
                 added_at: now_ms(),
                 ceph: Some(ceph),
+                password: None,
             };
             crate::state::Entry::StorageAdded { storage }
         };
@@ -600,7 +601,7 @@ mod tests {
 
     fn cephfs(fence: bool) -> Storage {
         let keys = CephKeys { secret: Secret("AQBtb3VudA==".into()), fence_client: if fence { "fd-fence".into() } else { String::new() }, fence_secret: fence.then(|| Secret("AgBmZW5jZQ==".into())), image: String::new() };
-        Storage { name: if fence { "ceph".into() } else { "quiet".into() }, driver: StorageDriver::Cephfs, source: "192.0.2.1:/".into(), options: "name=fd,fs=fs1".into(), added_at: 1, ceph: Some(keys) }
+        Storage { name: if fence { "ceph".into() } else { "quiet".into() }, driver: StorageDriver::Cephfs, source: "192.0.2.1:/".into(), options: "name=fd,fs=fs1".into(), added_at: 1, ceph: Some(keys), password: None }
     }
 
     fn fenced(s: &mut ClusterState, node: &str, state: FenceState) {

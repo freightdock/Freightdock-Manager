@@ -1098,6 +1098,43 @@ async fn a_cephfs_s_keys_are_kept_never_shown_and_go_with_its_mounts_and_its_cep
     a.server.abort();
 }
 
+#[tokio::test]
+async fn an_smb_share_s_password_is_kept_never_shown_and_goes_with_its_mounts_only() {
+    use freightdock_manager::state::{CommandRecord, CommandStatus, Op, StorageDriver, StorageMount};
+    use freightdock_proto::v1::{command, manager_message::Body};
+    let a = start(None).await;
+    until("a leader", || a.m.store.leader().is_some()).await;
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap().to_string();
+    tokio::spawn(freightdock_manager::serve_admin_tls(a.m.clone(), l));
+    let admin = Some(a.m.admin_token.as_str());
+
+    let body = r#"{"name":"share","driver":"smb","source":"//192.0.2.60/fd","options":"username=fd,vers=3.0","password":"s3cret pw"}"#;
+    let (s, b) = https_with(&a.m, &addr, "POST", "/v1/storage", admin, body).await;
+    assert_eq!(s, 201, "{b}");
+    let (s, b) = https_with(&a.m, &addr, "POST", "/v1/storage", admin, r#"{"name":"bare","driver":"smb","source":"//192.0.2.60/fd","options":"username=fd"}"#).await;
+    assert_eq!(s, 400, "a username wants its password: {b}");
+    let (s, b) = https_with(&a.m, &addr, "POST", "/v1/storage", admin, r#"{"name":"open","driver":"smb","source":"//192.0.2.60/pub","options":"guest"}"#).await;
+    assert_eq!(s, 201, "a guest share has none: {b}");
+    let (_, list) = https_with(&a.m, &addr, "GET", "/v1/storage", admin, "").await;
+    assert!(list.contains(r#""password_set":true"#) && list.contains(r#""password_set":false"#), "{list}");
+    assert!(!list.contains("s3cret"), "never shown: {list}");
+    let (s, b) = https_with(&a.m, &addr, "PUT", "/v1/storage/share/password", admin, r#"{"password":"n3w pw"}"#).await;
+    assert_eq!(s, 204, "{b}");
+
+    let mount = StorageMount { volume: "data".into(), storage: "share".into(), driver: StorageDriver::Smb, source: "//192.0.2.60/fd".into(), options: "username=fd,vers=3.0".into(), dir: "app/data".into() };
+    let run = CommandRecord { id: "c".into(), node_id: "n".into(), op: Op::RunContainer { workload_id: "app.db.1".into(), image: "postgres".into(), name: String::new(), command: vec![], env: Default::default(), labels: Default::default(), generation: 0, ports: vec![], volumes: vec!["data:/d".into()], limits: Default::default(), net: Default::default(), storage: vec![mount] }, config_version: 0, created_at: 0, deadline: 0, status: CommandStatus::Pending, message: String::new(), result_json: String::new(), updated_at: 0 };
+    match a.m.wire(&run).body {
+        Some(Body::Command(c)) => match c.op {
+            Some(command::Op::RunContainer(r)) => assert_eq!((r.storage[0].driver.as_str(), r.storage[0].secret.as_str()), ("smb", "n3w pw")),
+            o => panic!("{o:?}"),
+        },
+        o => panic!("{o:?}"),
+    }
+    assert!(!serde_json::to_string(&run).unwrap().contains("n3w"), "never in the command kept");
+    a.server.abort();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ceph_is_set_up_step_by_step_and_its_keys_become_a_storage_kept_nowhere_else() {
     use freightdock_manager::ceph::{CephHost, CephSetup, SetupState};

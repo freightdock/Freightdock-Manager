@@ -118,6 +118,8 @@ pub enum Entry {
     StorageRemoved { name: String, at: Ms },
     /// A CephFS's keys set anew (G12.6): a mount from now on takes the new mount key.
     StorageKeysSet { name: String, ceph: CephKeys, at: Ms },
+    /// An SMB share's password set anew (G11.9); none for a guest share.
+    StoragePasswordSet { name: String, password: Option<crate::settings::Secret>, at: Ms },
     /// A private registry's login, set or replaced whole (`registry.rs`).
     RegistrySet { registry: crate::registry::Registry },
     RegistryRemoved { host: String, at: Ms },
@@ -263,7 +265,7 @@ impl std::fmt::Display for Rejected {
             Rejected::StorageExists => "the cluster has storage of that name already",
             Rejected::StorageUnknown => "no such storage (or volume on it)",
             Rejected::StorageInUse => "a stack keeps a volume on that storage: remove the stack first",
-            Rejected::BadStorage => "storage is named 1 to 40 of a-z, 0-9 and -; nfs is host:/export with options of letters, digits and = , . _ : - /; cephfs is the monitors' addresses:/path with name=<client> in its options (and fs=<filesystem> to evict), its keys apart; path is an absolute directory other than /",
+            Rejected::BadStorage => "storage is named 1 to 40 of a-z, 0-9 and -; nfs is host:/export with options of letters, digits and = , . _ : - /; smb is //host/share with username= (its password apart) or guest in its options; cephfs is the monitors' addresses:/path with name=<client> in its options (and fs=<filesystem> to evict), its keys apart; path is an absolute directory other than /",
             Rejected::VolumeShared => "a volume for one writer (access: one) is used by one workload only: one service with one replica, or access: many",
             Rejected::LeaseHeld => "another node holds that volume and may still be writing to it",
             Rejected::NotEmpty => "a backup is restored into a new cluster only, not over one that has a state",
@@ -734,7 +736,8 @@ pub enum Access {
 pub struct Storage {
     pub name: String,
     pub driver: StorageDriver,
-    /// nfs: `host:/export`; path: an absolute directory that is the same shared storage on every node.
+    /// nfs: `host:/export`; smb: `//host/share` and maybe a path in it; path: an absolute directory that is the same
+    /// shared storage on every node.
     pub source: String,
     /// nfs: mount options, as `mount -o` takes them; cephfs: the kernel client's (`name=` the client, `fs=` the
     /// filesystem); none for path.
@@ -744,6 +747,9 @@ pub struct Storage {
     /// cephfs: the keys (G12.6), set once and never shown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ceph: Option<CephKeys>,
+    /// smb: the password of the `username=` in the options (none for `guest`), never shown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password: Option<crate::settings::Secret>,
 }
 
 /// The Ceph image a `ceph` command runs in when the storage names none: the release Freightdock was tried with.
@@ -769,6 +775,16 @@ pub struct CephKeys {
 /// A Ceph key as it is written: base64.
 fn ceph_key(k: &str) -> bool {
     !k.is_empty() && k.chars().all(|c| c.is_ascii_alphanumeric() || "+/=".contains(c))
+}
+
+/// An SMB share as `//host/share`, maybe a path in it: a host name or address, a share (a hidden one ends in `$`), and
+/// plain path parts that climb nowhere.
+pub fn smb_source(s: &str) -> bool {
+    let plain = |s: &str, extra: &str| s.chars().all(|c| c.is_ascii_alphanumeric() || extra.contains(c));
+    let Some((host, path)) = s.strip_prefix("//").and_then(|r| r.split_once('/')) else { return false };
+    let mut parts = path.split('/');
+    let share = parts.next().unwrap_or("");
+    !host.is_empty() && plain(host, ".-[]:") && !share.is_empty() && plain(share, "._-$") && parts.all(|p| !p.is_empty() && p != ".." && p != "." && plain(p, "._-"))
 }
 
 /// A CephFS source as the kernel takes it: the monitors' addresses (IPs, maybe ports: it resolves no names), `:`, and
@@ -807,6 +823,8 @@ pub enum StorageDriver {
     Path,
     /// A CephFS the worker's kernel mounts (G12.6).
     Cephfs,
+    /// An SMB share the worker's kernel mounts (G11.9).
+    Smb,
 }
 
 /// What a storage driver can do (plan 8.3), for the scheduler and the person reading.
@@ -824,7 +842,7 @@ pub struct Capabilities {
 
 impl StorageDriver {
     pub fn capabilities(self) -> Capabilities {
-        let mounted = matches!(self, StorageDriver::Nfs | StorageDriver::Cephfs);
+        let mounted = matches!(self, StorageDriver::Nfs | StorageDriver::Cephfs | StorageDriver::Smb);
         Capabilities { multi_host_mount: true, multi_host_write: true, write_revocation: mounted, leases: true, client_eviction: self == StorageDriver::Cephfs }
     }
 
@@ -834,6 +852,7 @@ impl StorageDriver {
             StorageDriver::Nfs => "nfs",
             StorageDriver::Path => "path",
             StorageDriver::Cephfs => "cephfs",
+            StorageDriver::Smb => "smb",
         }
     }
 }
@@ -844,10 +863,23 @@ impl Storage {
     pub fn valid(&self) -> bool {
         let plain = |s: &str, extra: &str| s.chars().all(|c| c.is_ascii_alphanumeric() || extra.contains(c));
         let abs = |p: &str| p.starts_with('/') && p != "/" && !p.split('/').any(|c| c == "..") && plain(p, "/._-");
+        let secret_free = self.password.is_none() || self.driver == StorageDriver::Smb;
         valid_stack_name(&self.name)
+            && secret_free
             && match self.driver {
                 StorageDriver::Nfs => self.source.split_once(":/").is_some_and(|(host, path)| !host.is_empty() && plain(host, ".-[]") && abs(&format!("/{path}"))) && plain(&self.options, "=,._:-/") && self.ceph.is_none(),
                 StorageDriver::Path => abs(&self.source) && self.options.is_empty() && self.ceph.is_none(),
+                StorageDriver::Smb => {
+                    let k: Vec<&str> = self.options.split(',').map(|x| x.split('=').next().unwrap_or("")).collect();
+                    let keyless = !k.iter().any(|w| matches!(*w, "password" | "pass" | "password2" | "credentials" | "cred"));
+                    let user = self.option("username").or_else(|| self.option("user")).is_some_and(|u| !u.is_empty());
+                    let guest = k.contains(&"guest");
+                    let password_ok = match &self.password {
+                        Some(p) => user && !p.0.is_empty() && !p.0.chars().any(char::is_control),
+                        None => guest,
+                    };
+                    smb_source(&self.source) && plain(&self.options, "=,._:-/") && keyless && (user || guest) && password_ok && self.ceph.is_none()
+                }
                 StorageDriver::Cephfs => {
                     let keyless = !self.options.split(',').any(|o| matches!(o.split('=').next(), Some("secret" | "secretfile" | "key" | "keyfile")));
                     ceph_source(&self.source, abs)
@@ -1816,6 +1848,15 @@ impl ClusterState {
                 }
                 self.storage.insert(name.clone(), next);
             }
+            Entry::StoragePasswordSet { name, password, .. } => {
+                let st = self.storage.get(name).ok_or(Rejected::StorageUnknown)?;
+                let mut next = st.clone();
+                next.password = password.clone();
+                if next.driver != StorageDriver::Smb || !next.valid() {
+                    return Err(Rejected::BadStorage);
+                }
+                self.storage.insert(name.clone(), next);
+            }
             Entry::StorageRemoved { name, .. } => {
                 if !self.storage.contains_key(name) {
                     return Err(Rejected::StorageUnknown);
@@ -2538,12 +2579,59 @@ pub(crate) mod tests {
     }
 
     fn nas() -> Storage {
-        Storage { name: "nas".into(), driver: StorageDriver::Nfs, source: "192.0.2.50:/export/fd".into(), options: String::new(), added_at: 1, ceph: None }
+        Storage { name: "nas".into(), driver: StorageDriver::Nfs, source: "192.0.2.50:/export/fd".into(), options: String::new(), added_at: 1, ceph: None, password: None }
+    }
+
+    fn smb() -> Storage {
+        Storage { name: "share".into(), driver: StorageDriver::Smb, source: "//192.0.2.60/fd".into(), options: "username=fd,vers=3.0".into(), added_at: 1, ceph: None, password: Some(crate::settings::Secret("a pass, word".into())) }
+    }
+
+    #[test]
+    fn an_smb_share_is_host_and_share_with_its_password_kept_apart_from_the_options() {
+        let mut s = with_nodes(&["n1"]);
+        for bad in [
+            Storage { source: "192.0.2.60:/fd".into(), ..smb() },
+            Storage { source: "//192.0.2.60".into(), ..smb() },
+            Storage { source: "//192.0.2.60/fd/../x".into(), ..smb() },
+            Storage { options: "username=fd,password=x".into(), ..smb() },
+            Storage { options: "username=fd,credentials=/etc/x".into(), ..smb() },
+            Storage { options: "vers=3.0".into(), ..smb() },
+            Storage { password: None, ..smb() },
+            Storage { password: Some(crate::settings::Secret("nl\nin it".into())), ..smb() },
+            Storage { ceph: cephfs().ceph, ..smb() },
+            Storage { password: smb().password, ..nas() },
+        ] {
+            assert_eq!(s.check(&Entry::StorageAdded { storage: bad.clone() }), Err(Rejected::BadStorage), "{bad:?}");
+        }
+        let guest = Storage { options: "guest,vers=3.0".into(), password: None, ..smb() };
+        assert!(guest.valid(), "a guest share has no password");
+        assert!(Storage { source: "//nas.example/fd$/apps".into(), ..smb() }.valid(), "a name, a hidden share, a path in it");
+        let caps = StorageDriver::Smb.capabilities();
+        assert!(caps.write_revocation && !caps.client_eviction, "the worker unmounts it; the server is not asked");
+        next(&mut s, &Entry::StorageAdded { storage: smb() }).unwrap();
+        let new = Some(crate::settings::Secret("another".into()));
+        next(&mut s, &Entry::StoragePasswordSet { name: "share".into(), password: new.clone(), at: 2 }).unwrap();
+        assert_eq!(s.storage["share"].password, new);
+        assert_eq!(s.check(&Entry::StoragePasswordSet { name: "share".into(), password: None, at: 3 }), Err(Rejected::BadStorage), "a username wants a password");
+        assert_eq!(s.check(&Entry::StoragePasswordSet { name: "nope".into(), password: new.clone(), at: 3 }), Err(Rejected::StorageUnknown));
+        next(&mut s, &Entry::StorageAdded { storage: nas() }).unwrap();
+        assert_eq!(s.check(&Entry::StoragePasswordSet { name: "nas".into(), password: new, at: 3 }), Err(Rejected::BadStorage), "an NFS export has no password");
+    }
+
+    #[test]
+    fn a_volume_on_an_smb_share_goes_to_the_worker_without_its_password() {
+        let mut s = with_nodes(&["n1"]);
+        next(&mut s, &Entry::StorageAdded { storage: smb() }).unwrap();
+        let db = ServiceSpec { volumes: vec!["data:/var/lib/data".into()], ..spec("postgres", 1) };
+        next(&mut s, &on_storage("app", &[("db", db)], &[("app.db.1", "n1")], &[("data", "share", Access::One)])).unwrap();
+        let m = s.storage_mounts(&s.workloads["app.db.1"]);
+        assert_eq!((m[0].driver, m[0].source.as_str()), (StorageDriver::Smb, "//192.0.2.60/fd"));
+        assert!(!serde_json::to_string(&m).unwrap().contains("a pass"), "filled in as the command is sent");
     }
 
     fn cephfs() -> Storage {
         let keys = CephKeys { secret: crate::settings::Secret("AQBtb3VudC1rZXktb2YtdGVzdA==".into()), fence_client: "fd-fence".into(), fence_secret: Some(crate::settings::Secret("AgBmZW5jZS1rZXktb2YtdGVzdA==".into())), image: String::new() };
-        Storage { name: "ceph".into(), driver: StorageDriver::Cephfs, source: "192.0.2.1,192.0.2.2:6789,[2001:db8::3]:/".into(), options: "name=fd,fs=fs1".into(), added_at: 1, ceph: Some(keys) }
+        Storage { name: "ceph".into(), driver: StorageDriver::Cephfs, source: "192.0.2.1,192.0.2.2:6789,[2001:db8::3]:/".into(), options: "name=fd,fs=fs1".into(), added_at: 1, ceph: Some(keys), password: None }
     }
 
     #[test]

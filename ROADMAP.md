@@ -380,8 +380,11 @@ Built 2026-11-13 (plan 4.6, 5.2, 7.1, 8), the first slice; the README's "Shared 
        in its heartbeat (`StorageReport`); the managers pass it on, `GET /v1/storage` shows it per node, the leader
        tells `storage.unhealthy` and `storage.back`, and a node whose storage fails takes no new workload with volumes
        on it (one there already stays, so a passing hiccup moves nothing).
-9. [ ] Left for later: read-only remounts, SMB, block storage and the cluster filesystems (plan 8.2), replicated
-       storage (G12).
+9. [ ] Left for later: block storage and the cluster filesystems (plan 8.2), replicated storage (G12).
+       Done 2026-11-15: SMB (`smb`, mounted by the kernel with its password in the call only, `storage password`)
+       and read-only remounts (a fencing worker makes each mounted storage read-only before its forced lazy
+       unmount, so a file still open there can write no more). Not yet tried on the test cluster: no SMB server
+       there, and the link to it is too slow to deploy.
 
 ### G12: advanced
 

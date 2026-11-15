@@ -36,7 +36,10 @@ freightdock-manager storage add <name> nfs <host:/export> [options]   an NFS exp
 freightdock-manager storage add <name> path <dir>   a directory that is the same shared storage on every node
 freightdock-manager storage add <name> cephfs <mons:/path> <name=client,fs=fs> <key-file> [fence-client fence-key-file]
                                                 a CephFS the workers' kernels mount; the fencing client evicts a fenced node
+freightdock-manager storage add <name> smb <//host/share> <username=user|guest[,options]> [password-file]
+                                                an SMB share the workers' kernels mount (the password from a file)
 freightdock-manager storage keys <name> <key-file> [fence-client fence-key-file]   a CephFS's keys set anew
+freightdock-manager storage password <name> [password-file]   an SMB share's password set anew (none: guest)
 freightdock-manager storage rm <name>           take it away (no stack may keep a volume on it)
 freightdock-manager disks <node>                a node's disks, and which Ceph may take
 freightdock-manager ceph setup <storage> <fs> <node>=<disk>[,<disk>] ...   Ceph on those nodes and disks (the first
@@ -630,6 +633,15 @@ async fn main() -> Result<()> {
                     }
                     call(&config, Method::POST, "/v1/storage", Some(b)).await?;
                 }
+                (Some("add"), Some(name), Some("smb"), Some(source)) => {
+                    let Some(options) = args.get(5) else { bail!("{USAGE}") };
+                    let password = args.get(6).map(|f| read_password(f.as_str())).transpose()?;
+                    call(&config, Method::POST, "/v1/storage", Some(serde_json::json!({ "name": name, "driver": "smb", "source": source, "options": options, "password": password }))).await?;
+                }
+                (Some("password"), Some(name), file, _) => {
+                    let password = file.map(read_password).transpose()?;
+                    call(&config, Method::PUT, &format!("/v1/storage/{name}/password"), Some(serde_json::json!({ "password": password }))).await?;
+                }
                 (Some("keys"), Some(name), Some(key), _) => {
                     let mut b = serde_json::json!({ "secret": read_key(key)? });
                     if let (Some(client), Some(file)) = (args.get(4), args.get(5)) {
@@ -889,6 +901,16 @@ fn encode(s: &str) -> String {
 /// A backup's passphrase: FREIGHTDOCK_BACKUP_PASSPHRASE, else the first line of stdin. Never an argument (it would
 /// be in the shell's history and the process list).
 /// A Ceph key from a file: the bare key, or a keyring's `key = ...` line. From a file, so it is on no command line.
+/// A password from a file: its first line as it is (spaces kept), never from the command line, where `ps` shows it.
+fn read_password(path: &str) -> Result<String> {
+    let text = std::fs::read_to_string(path).with_context(|| format!("reading the password in {path}"))?;
+    let p = text.lines().next().unwrap_or("").trim_end_matches('\r').to_string();
+    if p.is_empty() {
+        bail!("{path} holds no password");
+    }
+    Ok(p)
+}
+
 fn read_key(path: &str) -> Result<String> {
     let text = std::fs::read_to_string(path).with_context(|| format!("reading the key in {path}"))?;
     let key = text.lines().find_map(|l| l.trim().strip_prefix("key").map(|r| r.trim_start().trim_start_matches('=').trim().to_string())).unwrap_or_else(|| text.trim().to_string());

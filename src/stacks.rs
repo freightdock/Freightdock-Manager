@@ -686,7 +686,7 @@ mod tests {
         use crate::state::{Access, StackVolume, Storage, StorageDriver};
         let mut s = state_with(&["a", "b"]);
         let i = s.applied + 1;
-        s.apply_at(i, &Entry::StorageAdded { storage: Storage { name: "nas".into(), driver: StorageDriver::Nfs, source: "192.0.2.50:/fd".into(), options: "vers=4.2".into(), added_at: 1, ceph: None } }).unwrap();
+        s.apply_at(i, &Entry::StorageAdded { storage: Storage { name: "nas".into(), driver: StorageDriver::Nfs, source: "192.0.2.50:/fd".into(), options: "vers=4.2".into(), added_at: 1, ceph: None, password: None } }).unwrap();
         let services = svc(&[("db", ServiceSpec { volumes: vec!["pg:/var/lib/pg".into(), "cache:/cache".into()], ..spec("postgres", 1) })]);
         let i = s.applied + 1;
         let volumes = [("pg".to_string(), StackVolume { storage: "nas".into(), access: Access::One })].into();
