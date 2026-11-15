@@ -72,6 +72,7 @@ freightdock-manager notify test|rm <name>   send a test through it, or take it a
 freightdock-manager ca                      the cluster CA's certificate (PEM), for a client of the API over TLS
 freightdock-manager ui <image> [address]|off|status   run the Freightdock UI on the cluster, at https://<address>, an
                                        address of the pool (by default the one it has, else the first free one)
+freightdock-manager --version | --help      its version, or this
 
 A manager joins a cluster on its first start with FREIGHTDOCK_MANAGER_JOIN=<a manager's host:port> and
 FREIGHTDOCK_MANAGER_JOIN_TOKEN=<a manager-token>.
@@ -81,6 +82,17 @@ The other commands talk to a running manager's API (FREIGHTDOCK_MANAGER_API_BIND
 #[tokio::main]
 async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    match asks_before_config(args.first().map(String::as_str)) {
+        Some(Before::Version) => {
+            println!("freightdock-manager {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+        Some(Before::Help) => {
+            println!("{USAGE}");
+            return Ok(());
+        }
+        None => {}
+    }
     // `freightdock-manager nodes | head` ends quietly when `head` has read enough, as a command-line tool should; the
     // server keeps Rust's default (ignored), so a peer that hangs up mid-write is an error, not the manager's end.
     #[cfg(unix)]
@@ -899,6 +911,21 @@ fn print_reach(stack: &Value) {
 }
 
 /// Whether a command dies quietly on a closed pipe: every command-line one, never the server (`serve`, or none).
+#[derive(Debug, PartialEq, Eq)]
+enum Before {
+    Version,
+    Help,
+}
+
+/// What is answered without the manager's configuration (and so on a node where it is not set up yet).
+fn asks_before_config(command: Option<&str>) -> Option<Before> {
+    match command? {
+        "--version" | "-V" | "version" => Some(Before::Version),
+        "--help" | "-h" | "help" => Some(Before::Help),
+        _ => None,
+    }
+}
+
 fn quiet_on_closed_pipe(command: Option<&str>) -> bool {
     !matches!(command, None | Some("serve"))
 }
@@ -906,6 +933,18 @@ fn quiet_on_closed_pipe(command: Option<&str>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn its_version_and_usage_are_printed_before_any_configuration_is_read() {
+        assert_eq!(asks_before_config(Some("--version")), Some(Before::Version));
+        assert_eq!(asks_before_config(Some("-V")), Some(Before::Version));
+        assert_eq!(asks_before_config(Some("version")), Some(Before::Version));
+        assert_eq!(asks_before_config(Some("--help")), Some(Before::Help));
+        assert_eq!(asks_before_config(Some("-h")), Some(Before::Help));
+        assert_eq!(asks_before_config(Some("help")), Some(Before::Help));
+        assert_eq!(asks_before_config(None), None, "no command is the server");
+        assert_eq!(asks_before_config(Some("nodes")), None);
+    }
 
     #[test]
     fn only_the_command_line_dies_on_a_closed_pipe_never_the_server() {

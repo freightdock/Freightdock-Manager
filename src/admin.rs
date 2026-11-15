@@ -166,6 +166,15 @@ async fn cluster(State(m): State<Arc<Manager>>, h: HeaderMap) -> R<Json<Value>> 
     })))
 }
 
+/// Whether version `a` (a worker's) is older than `b` (this manager's): x.y.z by number; anything else is unknown.
+pub fn older(a: &str, b: &str) -> bool {
+    let v = |s: &str| -> Option<Vec<u64>> {
+        let p: Vec<u64> = s.split('.').map(|x| x.parse().ok()).collect::<Option<_>>()?;
+        (p.len() == 3).then_some(p)
+    };
+    matches!((v(a), v(b)), (Some(a), Some(b)) if a < b)
+}
+
 fn node_json(m: &Manager, n: &crate::state::Node) -> Value {
     json!({
         "id": n.id,
@@ -173,6 +182,8 @@ fn node_json(m: &Manager, n: &crate::state::Node) -> Value {
         "enrolled_at": n.enrolled_at,
         "reported_at": n.reported_at,
         "report": n.report,
+        // Its worker is older than this manager: upgrade it (`install.sh upgrade` on the node).
+        "worker_outdated": n.report.as_ref().is_some_and(|r| older(&r.agent_version, env!("CARGO_PKG_VERSION"))),
         "labels": n.labels,
         "all_labels": n.all_labels(),
         "fencing": n.fencing,
@@ -1540,6 +1551,17 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn a_worker_older_than_this_manager_is_outdated_and_a_newer_or_unknown_one_is_not() {
+        assert!(older("0.1.0", "1.0.0"));
+        assert!(older("1.0.9", "1.1.0"));
+        assert!(older("1.9.0", "1.10.0"), "by number, not by letter");
+        assert!(!older("1.0.0", "1.0.0"));
+        assert!(!older("1.2.0", "1.0.0"));
+        assert!(!older("", "1.0.0"), "a worker that never said is unknown, not outdated");
+        assert!(!older("dev", "1.0.0"));
+    }
 
     #[test]
     fn the_admin_token_does_everything_an_api_token_its_role_and_a_read_token_only_reads() {
