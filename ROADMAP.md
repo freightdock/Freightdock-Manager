@@ -411,6 +411,11 @@ Scoped 2026-11-14 against the plan's phase 11. Much of it came with the earlier 
        cluster's `shells` setting turns them off; `FREIGHTDOCK_WORKER_HOST_SHELL=off` turns the host's off on a node.
        Tried from the UI on the test cluster: root on vm1, idle 20 s and on, and sh in a busybox container on vm3 with
        its exit code back.
+8. [x] Failure tests (2026-11-15, `qa/chaos.py`): a dead leader, a cut-off follower, a cut-off leader, the manager
+       holding the workers' streams cut off for two minutes, and a worker cut off from every manager, on the test
+       cluster, with a watcher that fails the run if a one-replica workload ever runs on two nodes at once. 37 of 37
+       checks passed. Found on the way: a stranded workload's reason named another workload of its stack (fixed);
+       a moved workload is back only as fast as its image is pulled on its new node (about 100 s for one not there).
 
 ## Open questions for the owner
 

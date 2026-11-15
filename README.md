@@ -19,6 +19,7 @@ src/compose.rs    Compose files read into a stack's services (the part a worker 
 src/stacks.rs     placement of a stack's workloads, and the reconcile of each worker against the state
 src/admin.rs      the HTTP/JSON admin API the CLI and the UI use
 deploy/           static build, install over ssh, systemd unit
+qa/chaos.py       failure tests on a real cluster: partitions, a dead leader, a cut-off worker
 ```
 
 The repositories, side by side: **Freightdock-Contracts** (the gRPC contract), **Freightdock-Manager** (this), **Freightdock-Worker** (the
@@ -488,5 +489,30 @@ ceph auth rotate client.freightdock --key_type aes
 cargo test                 # unit tests, and tests/cluster.rs: real managers in one process
 cargo clippy --all-targets -- -D warnings
 ```
+
+## Failure tests
+
+`tests/cluster.rs` runs real managers in one process; `qa/chaos.py` breaks a real cluster and measures what it does.
+It reaches the nodes over ssh, cuts only the managers' ports (7450 to 7452, an nftables table of its own that undoes
+itself after `heal_s`) or stops a manager, and while it runs lists every worker's containers each second: a workload
+with one replica seen on two nodes at once fails the run, whatever else passed.
+
+```sh
+python3 qa/chaos.py cluster.json                 # every scenario, in order
+python3 qa/chaos.py cluster.json leader-cut      # one
+```
+
+| Scenario | What is done | What must hold |
+|---|---|---|
+| `leader-dies` | the leader's manager is stopped | the other two elect a leader, take writes, every node is heard again; it comes back with every write |
+| `follower-cut` | a follower is cut off from the other managers | a write through it is refused (503), the leader's commits; healed, it catches up and the refused write is nowhere |
+| `holder-cut` | the manager holding the most workers' streams is cut off for two minutes | it sends its workers away, the majority hears them all, nothing is fenced for it |
+| `leader-cut` | the leader is cut off from the other managers | another leader, the old one refuses writes and says it is not quorate; healed, it has the majority's write |
+| `worker-cut` | a worker is cut off from every manager | unreachable, it stops its workloads itself, the managers fence it; what they move runs elsewhere, the rest stays with its reason; healed, it is let back in and the moved workload's old container stays gone |
+
+The config names the hosts and stays out of the repository; the script's header shows it. On the test cluster (three
+managers, six workers, Proxmox fencing) every check passed: a new leader in about 4 s, a cut-off manager's six
+workers heard by the majority in 11 s, a cut-off worker fenced through Proxmox 26 s after the cut and its movable
+workload placed elsewhere a second later.
 
 GPL-3.0-only, as Freightdock.

@@ -56,8 +56,16 @@ pub fn plan(s: &ClusterState, from: Option<&str>, eligible: &[String], sick: &[(
                 }
             }
             Err(why) => {
+                // `place` stops at the first workload it cannot place, and the stack moves whole or not at all: that one
+                // says why, the others that they wait on it.
+                let named = why.strip_prefix("no node can take ").and_then(|r| r.split_once(": "));
                 for id in go.iter().filter(|id| s.workloads[*id].stack == stack) {
-                    out.left.insert(id.clone(), why.clone());
+                    let said = match named {
+                        Some((first, rest)) if first == id => format!("no node can take it: {rest}"),
+                        Some((first, rest)) => format!("it moves with its stack, and no node can take {first}: {rest}"),
+                        None => why.clone(),
+                    };
+                    out.left.insert(id.clone(), said);
                 }
             }
         }
@@ -188,7 +196,17 @@ mod tests {
     fn a_workload_with_nowhere_to_go_stays_with_the_reason() {
         let p = plan(&cluster(), Some("a"), &[], &[]);
         assert!(p.moves.is_empty());
-        assert!(p.left["app.web.1"].contains("no node can take app.web.1"), "{:?}", p.left);
+        assert!(p.left["app.web.1"].contains("no node can take it"), "{:?}", p.left);
+    }
+
+    #[test]
+    fn each_workload_left_says_its_own_reason_not_another_s() {
+        let mut s = cluster();
+        let sp = s.stacks["app"].services["web"].for_workload(3);
+        s.workloads.insert("app.web.3".into(), Workload { id: "app.web.3".into(), stack: "app".into(), service: "web".into(), slot: 3, node_id: Some("a".into()), spec: sp, generation: 1, host: None, leaving: None, attempts: None });
+        let p = plan(&s, Some("a"), &[], &[]);
+        assert!(p.left["app.web.1"].starts_with("no node can take it:"), "{:?}", p.left);
+        assert!(p.left["app.web.3"].starts_with("it moves with its stack, and no node can take app.web.1:"), "{:?}", p.left);
     }
 
     #[test]
