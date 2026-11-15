@@ -416,6 +416,12 @@ Scoped 2026-11-14 against the plan's phase 11. Much of it came with the earlier 
        cluster, with a watcher that fails the run if a one-replica workload ever runs on two nodes at once. 37 of 37
        checks passed. Found on the way: a stranded workload's reason named another workload of its stack (fixed);
        a moved workload is back only as fast as its image is pulled on its new node (about 100 s for one not there).
+9. [x] Upgrades from the managers (2026-11-15, `release.rs`): the cluster's release in the state and its binaries in
+       the managers' folders (uploaded, or a published release fetched and checked against its SHA256SUMS), rolled
+       out a node at a time by the leader, workers first and itself last, each back on the version and healthy before
+       the next; the UI's Upgrades page and `freightdock-manager release` / `upgrade`. Workers fetch the binary from
+       their manager over their session. The worker and manager say `--version`, refuse arguments they do not take,
+       and a worker older than the managers is marked outdated.
 
 ## Open questions for the owner
 

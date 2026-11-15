@@ -62,6 +62,7 @@ pub fn op_to_proto(op: &Op) -> v1::command::Op {
         // The rest is the storage's, filled in as it is sent (`Manager::wire`).
         Op::CephCommand { args, timeout_s, .. } => P::CephCommand(v1::CephCommand { args, timeout_s, ..Default::default() }),
         Op::Cephadm { action, args, image, timeout_s } => P::Cephadm(v1::Cephadm { action, args, image, timeout_s }),
+        Op::Upgrade { version, sha256, size } => P::Upgrade(v1::Upgrade { version, sha256, size }),
     }
 }
 
@@ -104,6 +105,7 @@ fn report_of(h: &v1::Hello) -> NodeReport {
         docker_requests: caps.docker_requests,
         shells: caps.shells,
         host_shell: caps.host_shell,
+        upgrade: caps.upgrade,
     }
 }
 
@@ -141,6 +143,17 @@ pub struct SessionSvc(pub Arc<Manager>);
 impl WorkerSession for SessionSvc {
     type OpenStream = ReceiverStream<Result<v1::ManagerMessage, Status>>;
     type ShellStream = ReceiverStream<Result<v1::ShellDown, Status>>;
+    type FetchStream = ReceiverStream<Result<v1::FetchChunk, Status>>;
+
+    /// A binary of the release, for an enrolled node (what its Upgrade command names).
+    async fn fetch(&self, req: Request<v1::FetchRequest>) -> Result<Response<Self::FetchStream>, Status> {
+        let m = &self.0;
+        let peer = peer_of(&req).ok_or_else(|| Status::internal("no peer"))?;
+        let cert = peer.cert.as_ref().ok_or_else(|| Status::unauthenticated("a client certificate is needed"))?;
+        let fp = sha256_hex(cert);
+        m.store.read(|s| s.node_by_cert(&fp).map(|_| ())).ok_or_else(|| Status::permission_denied("this certificate is not an enrolled node's"))?;
+        Ok(Response::new(m.serve_binary(&req.into_inner().sha256)?))
+    }
 
     /// A worker dialling back for a shell it was asked to open; only the node the certificate names, for its own.
     async fn shell(&self, req: Request<Streaming<v1::ShellUp>>) -> Result<Response<Self::ShellStream>, Status> {

@@ -117,10 +117,25 @@ impl ManagerPeer for PeerSvc {
 
     async fn heard(&self, req: Request<HeardRequest>) -> Result<Response<HeardReply>, Status> {
         caller(&req)?;
-        Ok(Response::new(HeardReply { nodes: self.0.sessions.connected() }))
+        Ok(Response::new(HeardReply { nodes: self.0.sessions.connected(), version: env!("CARGO_PKG_VERSION").into() }))
     }
 
     type ShellStream = tokio_stream::wrappers::ReceiverStream<Result<freightdock_proto::v1::ShellUp, Status>>;
+    type FetchStream = tokio_stream::wrappers::ReceiverStream<Result<freightdock_proto::v1::FetchChunk, Status>>;
+
+    /// A binary of the release, for another manager.
+    async fn fetch(&self, req: Request<freightdock_proto::v1::FetchRequest>) -> Result<Response<Self::FetchStream>, Status> {
+        caller(&req)?;
+        Ok(Response::new(self.0.serve_binary(&req.into_inner().sha256)?))
+    }
+
+    /// The leader asks this manager to upgrade itself.
+    async fn upgrade(&self, req: Request<freightdock_proto::v1::PeerUpgradeRequest>) -> Result<Response<freightdock_proto::v1::PeerUpgradeReply>, Status> {
+        caller(&req)?;
+        let r = req.into_inner();
+        self.0.upgrade_self(&r.version, &r.sha256, r.size).await.map_err(|e| Status::failed_precondition(format!("{e:#}")))?;
+        Ok(Response::new(freightdock_proto::v1::PeerUpgradeReply {}))
+    }
 
     async fn shell(&self, req: Request<tonic::Streaming<freightdock_proto::v1::PeerShellDown>>) -> Result<Response<Self::ShellStream>, Status> {
         caller(&req)?;

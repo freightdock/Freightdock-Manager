@@ -112,6 +112,7 @@ it, filled in by the manager that sends it, never written to the cluster's state
 | `FREIGHTDOCK_HEARTBEAT_MS` | `2000` | How often workers send a heartbeat (a cluster setting too) |
 | `FREIGHTDOCK_SUSPECT_MS` | `5000` | Silent this long: suspect |
 | `FREIGHTDOCK_UNREACHABLE_MS` | `12000` | Silent this long: unreachable (which never means stopped) |
+| `FREIGHTDOCK_RELEASES_URL` | this repository's GitHub releases | Where `release fetch` finds a published release: `<url>/<tag>/SHA256SUMS` and `<url>/<tag>/freightdock-{worker,manager}-linux-{amd64,arm64}` |
 | `RUST_LOG` | `freightdock_manager=info,warn` | How much it logs |
 
 ### The cluster's settings
@@ -242,6 +243,11 @@ a client trusts that CA alone and checks that name. `GET /v1/health` and `GET /v
 | `GET /v1/recoveries?stack=` | the recovery history, newest first |
 | `GET /v1/nodes/{id}/docker?action=&target=` | a look at the node's Docker through its worker, now: `info`, `containers`, `container` (inspect), `logs` (`tail`, `timestamps`), `images`, `volumes`, `networks`. Not in the log; asked through the manager that holds the node's stream |
 | `GET /v1/nodes/{id}/shell?container=&cols=&rows=` | a shell as a WebSocket, the admin token only: a login shell as root on the node, or with `container` bash (else sh) in that container. Output as binary messages and the end as text `{"end":{"exit_code","error"}}`; typed input as binary, a resize as text `{"resize":{"cols","rows"}}`. `check=1` only says whether it may be opened (204). Refused while the cluster's `shells` setting is off, or for the host when the node's owner set `FREIGHTDOCK_WORKER_HOST_SHELL=off`. Nothing typed is kept; the opening is an event |
+| `GET /v1/release` | the cluster's release (version, architecture, each binary's `sha256` and `size`, where it came from), `here` (whether this manager has each binary yet), the running or last `upgrade` with its steps, and every manager's and worker's version (`managers`, `nodes`) |
+| `PUT /v1/release/{worker,manager}?version=&arch=` | a binary of the release, the body as it is (a Linux binary, up to 256 MB; the admin token only): kept here under its checksum, and the release made (or completed, for the same version and architecture) with it. The other managers copy it within seconds |
+| `POST /v1/release/fetch` | `{tag}`: a published release (`FREIGHTDOCK_RELEASES_URL`), both binaries for this manager's architecture, each checked against the release's SHA256SUMS before it is kept (the admin token only) |
+| `POST /v1/upgrade` | `{by?}`: the upgrade to the release starts (202, `{steps}`); 409 without a release, or with every node on it already. The admin token only |
+| `POST /v1/upgrade/stop` | `{by?}`: the running upgrade stops; the step under way finishes on its node, no other starts |
 | `POST /v1/nodes/{id}/docker` | `{action, target, params}`: a change to it: `container.start`, `.stop`, `.restart`, `.remove` (`force`), `image.remove`, `image.pull` (`image`), `images.prune`, `volume.remove`, `network.remove`. The worker refuses the cluster's own (labelled `io.freightdock.managed`): they belong to their stack |
 | `GET /v1/registries` | the private registries the cluster has a login for (`host`, `username`), never a password |
 | `PUT /v1/registries/{host}`, `DELETE /v1/registries/{host}` | `{username, password}`: a registry's login (the password kept when left out), or taken away. `host` as images name it: `ghcr.io`, `registry.example:5000`, `docker.io` |
@@ -489,6 +495,34 @@ ceph auth rotate client.freightdock --key_type aes
 cargo test                 # unit tests, and tests/cluster.rs: real managers in one process
 cargo clippy --all-targets -- -D warnings
 ```
+
+## Upgrades
+
+The cluster upgrades itself: give it a release, then start an upgrade, from the UI's Upgrades page or here.
+
+```sh
+freightdock-manager release upload worker ./freightdock-worker 1.1.0     # or: release fetch v1.1.0
+freightdock-manager release upload manager ./freightdock-manager 1.1.0
+freightdock-manager upgrade start
+freightdock-manager release                                             # the steps as they go, every version
+```
+
+The release (its version and each binary's SHA-256 and size) is in the replicated state; the binaries are files in
+each manager's data folder (`releases/<sha256>`), copied from one manager to the others and checked again. The leader
+takes one node at a time: every worker not on the version, by name, then every manager, itself last. A worker is sent
+the Upgrade command, fetches the binary from its own manager over its session (no way out to the internet needed),
+checks it, puts it in place of its own whole (written beside it and renamed) and restarts on it; its containers keep
+running. A manager is asked by the leader, and the leader stages its own and goes last, the next leader carrying on.
+A step is done when the node is back on the version and healthy (a manager: heard and the cluster quorate), within
+three minutes; the first that is not ends the upgrade and leaves the nodes after it as they are. A node that cannot
+take it is skipped and said why: a worker older than upgrades (once by hand: `install.sh upgrade`), another
+architecture, or one not healthy now.
+
+A manager's unit keeps it from writing `/usr/local/bin` (`ProtectSystem=strict`), so it stages its new binary in its
+data folder and the unit's `ExecStartPre=+/usr/local/bin/freightdock-manager upgrade-apply` (run as root) puts it in
+place, checked, before it starts. A unit without that line (installed before upgrades) comes back on the old binary
+and the step fails, saying so: reinstall the unit once (`install.sh upgrade`). Both binaries restart themselves only
+under systemd, which starts them again.
 
 ## Failure tests
 

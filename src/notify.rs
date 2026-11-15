@@ -16,7 +16,7 @@ use crate::settings::Secret;
 use crate::state::{FenceState, Ms, Recovery};
 
 /// What the cluster tells about, and how the UI says it.
-pub const EVENTS: [(&str, &str); 14] = [
+pub const EVENTS: [(&str, &str); 16] = [
     ("node.down", "A node stops answering the managers"),
     ("node.back", "A node that was down answers again"),
     ("node.fenced", "A node was fenced, so its workloads may run elsewhere"),
@@ -31,6 +31,8 @@ pub const EVENTS: [(&str, &str); 14] = [
     ("manager.down", "A manager stops answering the others"),
     ("manager.back", "A manager that was down answers again"),
     ("backup.failed", "A manager's scheduled backup could not be written"),
+    ("upgrade.done", "An upgrade of the cluster finished"),
+    ("upgrade.failed", "An upgrade of the cluster stopped at a node that did not come back on the new version"),
 ];
 
 pub const KINDS: [&str; 4] = ["webhook", "email", "ntfy", "gotify"];

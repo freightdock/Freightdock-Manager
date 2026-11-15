@@ -14,6 +14,7 @@ pub mod proxmox;
 pub mod redfish;
 pub mod raft;
 pub mod recovery;
+pub mod release;
 pub mod registry;
 pub mod sessions;
 pub mod settings;
@@ -166,6 +167,8 @@ pub struct Manager {
     /// Docker requests sent to the workers here, waiting for their replies (`docker.rs`).
     docker_waits: docker::Waits,
     shell_waits: shell::Waits,
+    /// Each other manager's version as it last answered Heard, and when (`release`).
+    pub peer_versions: std::sync::Mutex<std::collections::HashMap<String, (String, std::time::Instant)>>,
     /// The leader's watch over the cluster and the quiet window of what was told (`notify.rs`).
     pub notifier: notify::Notifier,
 }
@@ -287,7 +290,7 @@ impl Manager {
         let manager_id = kept(&config.data_dir.join("manager.id"), || uuid::Uuid::new_v4().to_string())?;
         let admin_token = kept(&config.data_dir.join("admin.token"), || hex::encode(rand::random::<[u8; 32]>()))?;
         let commands = store.commands();
-        let m = Arc::new(Manager { store, events: Default::default(), sessions: Sessions::new(config.thresholds), ca, manager_id, advertise: config.advertise.clone(), admin_token, peer_tls, peer_channels: Default::default(), local_worker_token: config.local_worker_token.clone(), paced: Default::default(), own: settings::Settings::of(&config.thresholds, &config.fencing), local: config.local(), timers_sent: Default::default(), started: std::time::Instant::now(), cut_off_since: Default::default(), fence_tasks: Default::default(), evictions: Default::default(), data_dir: config.data_dir.clone(), docker_waits: Default::default(), shell_waits: Default::default(), notifier: Default::default() });
+        let m = Arc::new(Manager { store, events: Default::default(), sessions: Sessions::new(config.thresholds), ca, manager_id, advertise: config.advertise.clone(), admin_token, peer_tls, peer_channels: Default::default(), local_worker_token: config.local_worker_token.clone(), paced: Default::default(), own: settings::Settings::of(&config.thresholds, &config.fencing), local: config.local(), timers_sent: Default::default(), started: std::time::Instant::now(), cut_off_since: Default::default(), fence_tasks: Default::default(), evictions: Default::default(), data_dir: config.data_dir.clone(), docker_waits: Default::default(), shell_waits: Default::default(), peer_versions: Default::default(), notifier: Default::default() });
         tokio::spawn(deliver_applied(Arc::downgrade(&m), commands));
         Ok(m)
     }
@@ -379,7 +382,13 @@ impl Manager {
         });
         for (addr, r) in futures_util::future::join_all(asks).await {
             match r {
-                Ok(Ok(reply)) => self.sessions.reports(&addr, reply.into_inner().nodes),
+                Ok(Ok(reply)) => {
+                    let reply = reply.into_inner();
+                    if !reply.version.is_empty() {
+                        self.peer_versions.lock().expect("peer versions lock").insert(addr.clone(), (reply.version, std::time::Instant::now()));
+                    }
+                    self.sessions.reports(&addr, reply.nodes)
+                }
                 Ok(Err(s)) => tracing::debug!(manager = %addr, "no liveness report: {}", s.message()),
                 Err(_) => tracing::debug!(manager = %addr, "no liveness report within a second"),
             }
@@ -629,6 +638,10 @@ pub async fn housekeeping(m: Arc<Manager>) {
         m.fence_local().await;
         m.fence_round().await;
         m.setup_round().await;
+        m.upgrade_round().await;
+        if ticks.is_multiple_of(5) {
+            m.sync_release().await;
+        }
         m.recover_round().await;
         m.float_round().await;
         m.reconcile().await;

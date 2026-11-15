@@ -150,6 +150,14 @@ pub enum Entry {
     CephSetupRetried { at: Ms },
     /// The setup forgotten (what it made stays).
     CephSetupCleared { at: Ms },
+    /// The cluster's release (`release::Release`): what an upgrade rolls out. Refused while an upgrade runs.
+    ReleaseSet { release: crate::release::Release },
+    /// An upgrade to the release begins, its steps made (`release::steps`). Refused while another runs.
+    UpgradeStarted { run: crate::release::Upgrade },
+    /// A step of the running upgrade went on: started (its command), done, skipped or failed.
+    UpgradeStep { index: usize, state: crate::release::StepState, message: String, command_id: Option<String>, started_at: Option<Ms>, at: Ms },
+    /// The running upgrade ends: done, failed, or stopped by a person (the nodes after it are left as they are).
+    UpgradeEnded { state: crate::release::RunState, message: String, at: Ms },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -217,6 +225,12 @@ pub enum Rejected {
     CephSetupBusy,
     /// No Ceph setup, or none in the state the step needs.
     CephSetupUnknown,
+    /// A release that cannot be (`Release::valid`), or an upgrade to another version than the release's.
+    BadRelease,
+    /// An upgrade runs: the release stays, and another waits.
+    UpgradeBusy,
+    /// No upgrade runs, or no such step.
+    UpgradeUnknown,
 }
 
 impl std::fmt::Display for Rejected {
@@ -258,6 +272,9 @@ impl std::fmt::Display for Rejected {
             Rejected::BadCephSetup => "a Ceph setup names its storage (1 to 40 of a-z, 0-9 and -, not taken) and filesystem, and each node once, known, with its disks as /dev/ paths",
             Rejected::CephSetupBusy => "Ceph is being set up already: wait for it, or clear it",
             Rejected::CephSetupUnknown => "no Ceph setup in that state",
+            Rejected::BadRelease => "a release has a version (x.y.z), an architecture and at least one binary by its SHA-256 and size; an upgrade is to the release's version",
+            Rejected::UpgradeBusy => "an upgrade is running: wait for it, or stop it",
+            Rejected::UpgradeUnknown => "no upgrade is running",
             Rejected::BadChannel => "a channel is named 1 to 64 of a-z, 0-9, - and _, is a webhook, email, ntfy or gotify, and tells only of events the cluster knows",
             Rejected::ChannelUnknown => "the cluster has no notification channel of that name",
             Rejected::BadSettings => "a setting is out of its range or order, or the Proxmox provider's settings do not hold",
@@ -292,6 +309,9 @@ pub struct NodeReport {
     pub shells: bool,
     #[serde(default)]
     pub host_shell: bool,
+    /// The worker takes the Upgrade command.
+    #[serde(default)]
+    pub upgrade: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -441,6 +461,8 @@ pub enum Op {
         #[serde(default)]
         timeout_s: u32,
     },
+    /// The worker's binary replaced with the release's (fetched from its manager), and the worker restarted on it.
+    Upgrade { version: String, sha256: String, size: u64 },
     /// A step of Ceph made from the UI (G12.6, `ceph::CephSetup`), run on the node's host by its worker.
     Cephadm {
         action: String,
@@ -457,7 +479,7 @@ impl Op {
     pub fn workload_id(&self) -> Option<&str> {
         match self {
             Op::RunContainer { workload_id, .. } | Op::StopContainer { workload_id, .. } | Op::RemoveContainer { workload_id } => Some(workload_id),
-            Op::Ping | Op::DockerInfo | Op::CephCommand { .. } | Op::Cephadm { .. } => None,
+            Op::Ping | Op::DockerInfo | Op::CephCommand { .. } | Op::Cephadm { .. } | Op::Upgrade { .. } => None,
         }
     }
 }
@@ -1087,6 +1109,12 @@ pub struct ClusterState {
     /// Ceph made from the UI (G12.6): the one being made, or the last.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ceph_setup: Option<crate::ceph::CephSetup>,
+    /// The cluster's release, if one was given.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release: Option<crate::release::Release>,
+    /// The running upgrade, or the last.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upgrade: Option<crate::release::Upgrade>,
 }
 
 /// A floating address: on its holder's LAN, answering the published ports as the nodes' own addresses do.
@@ -1732,6 +1760,47 @@ impl ClusterState {
             Entry::CephSetupRetried { at } => {
                 let c = self.ceph_setup.as_mut().filter(|c| c.state == crate::ceph::SetupState::Failed).ok_or(Rejected::CephSetupUnknown)?;
                 c.retry(*at);
+            }
+            Entry::ReleaseSet { release } => {
+                if self.upgrade.as_ref().is_some_and(|u| u.state == crate::release::RunState::Running) {
+                    return Err(Rejected::UpgradeBusy);
+                }
+                if !release.valid() {
+                    return Err(Rejected::BadRelease);
+                }
+                self.release = Some(release.clone());
+            }
+            Entry::UpgradeStarted { run } => {
+                if self.upgrade.as_ref().is_some_and(|u| u.state == crate::release::RunState::Running) {
+                    return Err(Rejected::UpgradeBusy);
+                }
+                if self.release.as_ref().is_none_or(|r| r.version != run.version) || run.state != crate::release::RunState::Running {
+                    return Err(Rejected::BadRelease);
+                }
+                self.upgrade = Some(run.clone());
+            }
+            Entry::UpgradeStep { index, state, message, command_id, started_at, at } => {
+                let u = self.upgrade.as_mut().filter(|u| u.state == crate::release::RunState::Running).ok_or(Rejected::UpgradeUnknown)?;
+                let st = u.steps.get_mut(*index).ok_or(Rejected::UpgradeUnknown)?;
+                st.state = *state;
+                st.message = message.clone();
+                if command_id.is_some() {
+                    st.command_id = command_id.clone();
+                }
+                if started_at.is_some() {
+                    st.started_at = *started_at;
+                }
+                st.at = *at;
+                u.at = *at;
+            }
+            Entry::UpgradeEnded { state, message, at } => {
+                let u = self.upgrade.as_mut().filter(|u| u.state == crate::release::RunState::Running).ok_or(Rejected::UpgradeUnknown)?;
+                if *state == crate::release::RunState::Running {
+                    return Err(Rejected::UpgradeUnknown);
+                }
+                u.state = *state;
+                u.message = message.clone();
+                u.at = *at;
             }
             Entry::CephSetupCleared { .. } => {
                 if self.ceph_setup.take().is_none() {

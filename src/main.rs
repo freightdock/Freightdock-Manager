@@ -72,6 +72,11 @@ freightdock-manager notify test|rm <name>   send a test through it, or take it a
 freightdock-manager ca                      the cluster CA's certificate (PEM), for a client of the API over TLS
 freightdock-manager ui <image> [address]|off|status   run the Freightdock UI on the cluster, at https://<address>, an
                                        address of the pool (by default the one it has, else the first free one)
+freightdock-manager release                 the cluster's release, the upgrade and every node's and manager's version
+freightdock-manager release upload worker|manager <file> <version>   a binary of the release, from a file
+freightdock-manager release fetch <tag>     a published release (vX.Y.Z), checked against its SHA256SUMS
+freightdock-manager upgrade start|stop      roll the release out a node at a time (workers, then managers), or stop
+freightdock-manager upgrade-apply           put a binary staged by an upgrade in place (the unit's ExecStartPre)
 freightdock-manager --version | --help      its version, or this
 
 A manager joins a cluster on its first start with FREIGHTDOCK_MANAGER_JOIN=<a manager's host:port> and
@@ -105,6 +110,16 @@ async fn main() -> Result<()> {
     let config = Config::from_env()?;
     match args.first().map(String::as_str) {
         None | Some("serve") => serve(config).await,
+        // The unit's ExecStartPre (as root, past its sandbox): a binary the manager staged for its upgrade goes in
+        // place before it starts. Never a reason not to start: a bad one is thrown away and said.
+        Some("upgrade-apply") => {
+            match freightdock_manager::release::running_exe().and_then(|exe| freightdock_manager::release::apply_staged(&config.data_dir, &exe)) {
+                Ok(Some(sum)) => eprintln!("freightdock-manager: the staged binary ({}) is in place", &sum[..12]),
+                Ok(None) => {}
+                Err(e) => eprintln!("freightdock-manager: {e:#}"),
+            }
+            Ok(())
+        }
         Some("join-token") => {
             let body = serde_json::json!({ "ttl_s": args.get(1).map(|s| s.parse::<i64>()).transpose().context("ttl_s")? });
             let v = call(&config, reqwest::Method::POST, "/v1/join-tokens", Some(body)).await?;
@@ -117,6 +132,38 @@ async fn main() -> Result<()> {
             let v = call(&config, reqwest::Method::POST, "/v1/manager-tokens", Some(body)).await?;
             println!("{}", v["token"].as_str().unwrap_or_default());
             eprintln!("good until {} (unix ms); the new manager joins through {}", v["expires_at"], v["join"]);
+            Ok(())
+        }
+        Some("release") => {
+            use reqwest::Method;
+            match (args.get(1).map(String::as_str), args.get(2), args.get(3), args.get(4)) {
+                (None, ..) => print_release(&call(&config, Method::GET, "/v1/release", None).await?),
+                (Some("upload"), Some(part), Some(file), Some(version)) => {
+                    let bytes = std::fs::read(file).with_context(|| format!("reading {file}"))?;
+                    call_raw(&config, Method::PUT, &format!("/v1/release/{part}?version={version}"), Some(Body::Raw(bytes))).await?;
+                    println!("the {part} binary of {version} is the cluster's (the other managers copy it)");
+                }
+                (Some("fetch"), Some(tag), ..) => {
+                    let v = call(&config, Method::POST, "/v1/release/fetch", Some(serde_json::json!({ "tag": tag }))).await?;
+                    println!("release {} fetched from {}", v["release"]["version"].as_str().unwrap_or(""), v["release"]["source"].as_str().unwrap_or(""));
+                }
+                _ => bail!("{USAGE}"),
+            }
+            Ok(())
+        }
+        Some("upgrade") => {
+            use reqwest::Method;
+            match args.get(1).map(String::as_str) {
+                Some("start") => {
+                    let v = call(&config, Method::POST, "/v1/upgrade", Some(serde_json::json!({ "by": "the command line" }))).await?;
+                    println!("upgrade started: {} steps (freightdock-manager release, to follow it)", v["steps"]);
+                }
+                Some("stop") => {
+                    call(&config, Method::POST, "/v1/upgrade/stop", Some(serde_json::json!({ "by": "the command line" }))).await?;
+                    println!("stopped: the node being upgraded finishes, no other starts");
+                }
+                _ => bail!("{USAGE}"),
+            }
             Ok(())
         }
         Some("nodes") => {
@@ -874,12 +921,23 @@ async fn call(config: &Config, method: reqwest::Method, path: &str, body: Option
 }
 
 async fn call_bytes(config: &Config, method: reqwest::Method, path: &str, body: Option<Value>) -> Result<Vec<u8>> {
+    call_raw(config, method, path, body.map(Body::Json)).await
+}
+
+enum Body {
+    Json(Value),
+    Raw(Vec<u8>),
+}
+
+async fn call_raw(config: &Config, method: reqwest::Method, path: &str, body: Option<Body>) -> Result<Vec<u8>> {
     let addr = config.api_bind.context("the admin API is off (FREIGHTDOCK_MANAGER_API_BIND=off)")?;
     let host = if addr.ip().is_unspecified() { format!("127.0.0.1:{}", addr.port()) } else { addr.to_string() };
     let token = std::fs::read_to_string(config.data_dir.join("admin.token")).with_context(|| format!("reading the admin token in {}", config.data_dir.display()))?;
     let mut req = reqwest::Client::new().request(method, format!("http://{host}{path}")).bearer_auth(token.trim());
-    if let Some(b) = body {
-        req = req.json(&b);
+    match body {
+        Some(Body::Json(b)) => req = req.json(&b),
+        Some(Body::Raw(b)) => req = req.header("content-type", "application/octet-stream").body(b),
+        None => {}
     }
     let r = req.send().await.with_context(|| format!("is the manager running? (http://{host})"))?;
     let status = r.status();
@@ -890,6 +948,30 @@ async fn call_bytes(config: &Config, method: reqwest::Method, path: &str, body: 
         bail!("{status}: {}", v["error"].as_str().unwrap_or(&text));
     }
     Ok(bytes)
+}
+
+/// The release, the upgrade and every version.
+fn print_release(v: &Value) {
+    let r = &v["release"];
+    if r.is_null() {
+        println!("no release: freightdock-manager release upload|fetch");
+    } else {
+        let has = |p: &str| if r[p].is_null() { "-" } else if v["here"][p] == true { "here" } else { "copying" };
+        println!("release  {} ({}), worker {}, manager {}, from {}", r["version"].as_str().unwrap_or(""), r["arch"].as_str().unwrap_or(""), has("worker"), has("manager"), r["source"].as_str().unwrap_or(""));
+    }
+    for x in v["managers"].as_array().into_iter().flatten() {
+        println!("manager  {:<24} {:<10}{}", x["addr"].as_str().unwrap_or(""), x["version"].as_str().unwrap_or("?"), if x["leader"] == true { " leader" } else { "" });
+    }
+    for x in v["nodes"].as_array().into_iter().flatten() {
+        println!("worker   {:<24} {:<10}{}", x["name"].as_str().unwrap_or(""), x["version"].as_str().unwrap_or(""), if x["upgrade"] == true { "" } else { " (upgraded by hand only)" });
+    }
+    let u = &v["upgrade"];
+    if !u.is_null() {
+        println!("\nupgrade to {}: {}{}", u["version"].as_str().unwrap_or(""), u["state"].as_str().unwrap_or(""), u["message"].as_str().filter(|m| !m.is_empty()).map(|m| format!(", {m}")).unwrap_or_default());
+        for st in u["steps"].as_array().into_iter().flatten() {
+            println!("  {:<8} {:<24} {:<10} {}", st["part"].as_str().unwrap_or(""), st["name"].as_str().unwrap_or(""), st["state"].as_str().unwrap_or(""), st["message"].as_str().unwrap_or(""));
+        }
+    }
 }
 
 /// How each service of a stack is reached from outside the cluster: on its pool addresses, on every node's address

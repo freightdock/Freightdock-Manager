@@ -8,6 +8,9 @@ Wants=network-online.target
 #   FREIGHTDOCK_MANAGER_ADVERTISE=192.0.2.11:7450
 EnvironmentFile=-/etc/freightdock/manager.env
 Environment=FREIGHTDOCK_MANAGER_DATA=/var/lib/freightdock-manager
+# An upgrade from the managers stages the new binary in the data folder (ProtectSystem keeps the manager from
+# writing here); "+" runs this as root, past the sandbox, to put it in place before the manager starts.
+ExecStartPre=+/usr/local/bin/freightdock-manager upgrade-apply
 ExecStart=/usr/local/bin/freightdock-manager serve
 Restart=always
 RestartSec=2

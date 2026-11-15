@@ -29,8 +29,8 @@ impl IntoResponse for ApiError {
 impl From<ProposeError> for ApiError {
     fn from(e: ProposeError) -> Self {
         match e {
-            ProposeError::Rejected(r @ (Rejected::NodeUnknown | Rejected::CommandUnknown | Rejected::StackUnknown | Rejected::FloatingUnknown | Rejected::StorageUnknown | Rejected::RegistryUnknown | Rejected::ChannelUnknown | Rejected::CephSetupUnknown)) => ApiError(StatusCode::NOT_FOUND, r.to_string()),
-            ProposeError::Rejected(r @ (Rejected::BadAddress | Rejected::BadExposure | Rejected::BadStorage | Rejected::VolumeShared | Rejected::BadSettings | Rejected::BadRegistry | Rejected::BadChannel | Rejected::BadCephSetup)) => ApiError(StatusCode::BAD_REQUEST, r.to_string()),
+            ProposeError::Rejected(r @ (Rejected::NodeUnknown | Rejected::CommandUnknown | Rejected::StackUnknown | Rejected::FloatingUnknown | Rejected::StorageUnknown | Rejected::RegistryUnknown | Rejected::ChannelUnknown | Rejected::CephSetupUnknown | Rejected::UpgradeUnknown)) => ApiError(StatusCode::NOT_FOUND, r.to_string()),
+            ProposeError::Rejected(r @ (Rejected::BadAddress | Rejected::BadExposure | Rejected::BadStorage | Rejected::VolumeShared | Rejected::BadSettings | Rejected::BadRegistry | Rejected::BadChannel | Rejected::BadCephSetup | Rejected::BadRelease)) => ApiError(StatusCode::BAD_REQUEST, r.to_string()),
             ProposeError::Rejected(r) => ApiError(StatusCode::CONFLICT, r.to_string()),
             e @ (ProposeError::Unavailable(_) | ProposeError::NotLeader(_)) => ApiError(StatusCode::SERVICE_UNAVAILABLE, e.to_string()),
             ProposeError::Io(e) => {
@@ -98,6 +98,12 @@ pub fn router(m: Arc<Manager>) -> Router {
         .route("/v1/storage/{name}/keys", axum::routing::put(set_storage_keys))
         .route("/v1/ceph/setup", get(ceph_setup).post(start_ceph_setup).delete(clear_ceph_setup))
         .route("/v1/ceph/setup/retry", post(retry_ceph_setup))
+        .route("/v1/release", get(release))
+        .route("/v1/release/fetch", post(fetch_release))
+        // A binary is larger than any other body.
+        .route("/v1/release/{part}", axum::routing::put(upload_release).layer(axum::extract::DefaultBodyLimit::max(crate::release::MAX_BINARY as usize)))
+        .route("/v1/upgrade", post(start_upgrade))
+        .route("/v1/upgrade/stop", post(stop_upgrade))
         .route("/v1/settings", get(settings).put(set_settings))
         .route("/v1/settings/proxmox/fingerprint", post(proxmox_fingerprint))
         .route("/v1/settings/proxmox/test", post(proxmox_test))
@@ -166,13 +172,20 @@ async fn cluster(State(m): State<Arc<Manager>>, h: HeaderMap) -> R<Json<Value>> 
     })))
 }
 
+/// A version as x.y.z, by number.
+fn version_of(s: &str) -> Option<Vec<u64>> {
+    let p: Vec<u64> = s.split('.').map(|x| x.parse().ok()).collect::<Option<_>>()?;
+    (p.len() == 3).then_some(p)
+}
+
+/// Whether `s` is a version (x.y.z, by number), as a release has one.
+pub fn version_ok(s: &str) -> bool {
+    s.len() <= 32 && version_of(s).is_some()
+}
+
 /// Whether version `a` (a worker's) is older than `b` (this manager's): x.y.z by number; anything else is unknown.
 pub fn older(a: &str, b: &str) -> bool {
-    let v = |s: &str| -> Option<Vec<u64>> {
-        let p: Vec<u64> = s.split('.').map(|x| x.parse().ok()).collect::<Option<_>>()?;
-        (p.len() == 3).then_some(p)
-    };
-    matches!((v(a), v(b)), (Some(a), Some(b)) if a < b)
+    matches!((version_of(a), version_of(b)), (Some(a), Some(b)) if a < b)
 }
 
 fn node_json(m: &Manager, n: &crate::state::Node) -> Value {
@@ -721,6 +734,151 @@ struct CephHostBody {
 
 /// Starts Ceph on the nodes and disks given (the first node bootstraps). Each node must be heard, at rest, with
 /// Docker, and each disk free as the node itself says (`disks`): nothing on a disk in use is touched.
+/// The release, the running (or last) upgrade, and every node's and manager's version now.
+async fn release(State(m): State<Arc<Manager>>, h: HeaderMap) -> R<Json<Value>> {
+    authed(&m, &h)?;
+    let (release, upgrade) = m.store.read(|s| (s.release.clone(), s.upgrade.clone()));
+    let here = release.as_ref().map(|r| json!({
+        "worker": r.worker.as_ref().is_some_and(|b| crate::release::get_blob(&m.data_dir, b).is_some()),
+        "manager": r.manager.as_ref().is_some_and(|b| crate::release::get_blob(&m.data_dir, b).is_some()),
+    }));
+    let f = m.upgrade_facts();
+    let nodes: Vec<Value> = f.workers.iter().map(|(id, w)| json!({ "id": id, "name": w.name, "version": w.version, "healthy": w.healthy, "upgrade": w.upgrade, "arch": w.arch })).collect();
+    let managers: Vec<Value> = f.managers.iter().map(|(id, x)| json!({ "id": id, "addr": x.addr, "version": x.version, "leader": x.leader })).collect();
+    Ok(Json(json!({
+        "release": release, "here": here, "upgrade": upgrade, "nodes": nodes, "managers": managers,
+        "version": env!("CARGO_PKG_VERSION"), "arch": crate::release::arch_name(std::env::consts::ARCH),
+        "releases_url": releases_url(),
+    })))
+}
+
+/// Where published releases are fetched from: `<url>/<tag>/<asset>`, GitHub's layout.
+fn releases_url() -> String {
+    std::env::var("FREIGHTDOCK_RELEASES_URL").ok().filter(|u| !u.trim().is_empty()).unwrap_or_else(|| "https://github.com/freightdock/Freightdock-Manager/releases/download".into())
+}
+
+#[derive(Deserialize)]
+struct UploadAsk {
+    version: String,
+    #[serde(default)]
+    arch: String,
+}
+
+/// A binary of the release, uploaded: kept here (the others copy it), and the release made or completed with it.
+async fn upload_release(State(m): State<Arc<Manager>>, h: HeaderMap, Path(part): Path<String>, Query(q): Query<UploadAsk>, body: axum::body::Bytes) -> R<Json<Value>> {
+    // Upgrades replace the binaries every node runs as root: an admin token only.
+    admin_only(authed(&m, &h)?)?;
+    let part = match part.as_str() {
+        "worker" => crate::release::Part::Worker,
+        "manager" => crate::release::Part::Manager,
+        _ => return Err(ApiError(StatusCode::NOT_FOUND, "a release has a worker and a manager binary".into())),
+    };
+    if !version_ok(q.version.trim()) {
+        return Err(ApiError(StatusCode::BAD_REQUEST, "the version is x.y.z".into()));
+    }
+    if !body.starts_with(b"\x7fELF") {
+        return Err(ApiError(StatusCode::BAD_REQUEST, "that is not a Linux binary".into()));
+    }
+    let arch = crate::release::arch_name(if q.arch.trim().is_empty() { std::env::consts::ARCH } else { q.arch.trim() });
+    let sha256 = crate::release::put_blob(&m.data_dir, &body).map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    let b = crate::release::Binary { sha256: sha256.clone(), size: body.len() as u64 };
+    let mut r = m.store.read(|s| s.release.clone()).filter(|r| r.version == q.version.trim() && r.arch == arch).unwrap_or(crate::release::Release { version: q.version.trim().into(), arch, worker: None, manager: None, source: "upload".into(), at: now_ms() });
+    match part {
+        crate::release::Part::Worker => r.worker = Some(b),
+        crate::release::Part::Manager => r.manager = Some(b),
+    }
+    r.at = now_ms();
+    m.store.propose(Entry::ReleaseSet { release: r.clone() }).await?;
+    m.events.push("upgrade", None, format!("the {} binary of {} uploaded ({})", part.word(), r.version, &sha256[..12]));
+    Ok(Json(json!({ "release": r })))
+}
+
+#[derive(Deserialize)]
+struct FetchAsk {
+    /// A release's tag, such as v1.1.0.
+    tag: String,
+}
+
+/// A published release fetched: both binaries for this manager's architecture, checked against its SHA256SUMS.
+async fn fetch_release(State(m): State<Arc<Manager>>, h: HeaderMap, Json(b): Json<FetchAsk>) -> R<Json<Value>> {
+    // Upgrades replace the binaries every node runs as root: an admin token only.
+    admin_only(authed(&m, &h)?)?;
+    let tag = b.tag.trim();
+    let version = tag.strip_prefix('v').unwrap_or(tag);
+    if !version_ok(version) {
+        return Err(ApiError(StatusCode::BAD_REQUEST, "a release's tag is vX.Y.Z".into()));
+    }
+    let base = format!("{}/v{version}", releases_url().trim_end_matches('/'));
+    let arch = crate::release::arch_name(std::env::consts::ARCH);
+    let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(300)).build().map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let get = |url: String| {
+        let client = client.clone();
+        async move {
+            let r = client.get(&url).send().await.and_then(|r| r.error_for_status()).map_err(|e| ApiError(StatusCode::BAD_GATEWAY, format!("{url}: {e}")))?;
+            r.bytes().await.map_err(|e| ApiError(StatusCode::BAD_GATEWAY, format!("{url}: {e}")))
+        }
+    };
+    let sums = String::from_utf8_lossy(&get(format!("{base}/SHA256SUMS")).await?).to_string();
+    let mut r = crate::release::Release { version: version.into(), arch: arch.clone(), worker: None, manager: None, source: base.clone(), at: now_ms() };
+    for part in [crate::release::Part::Worker, crate::release::Part::Manager] {
+        let asset = format!("freightdock-{}-linux-{arch}", part.word());
+        let want = sums.lines().find_map(|l| l.split_once("  ").filter(|(_, n)| n.trim() == asset).map(|(h, _)| h.trim().to_ascii_lowercase()));
+        let want = want.ok_or_else(|| ApiError(StatusCode::BAD_GATEWAY, format!("the release's SHA256SUMS has no {asset}")))?;
+        let bytes = get(format!("{base}/{asset}")).await?;
+        if freightdock_proto::sha256_hex(&bytes) != want {
+            return Err(ApiError(StatusCode::BAD_GATEWAY, format!("{asset} does not match its checksum")));
+        }
+        let sha256 = crate::release::put_blob(&m.data_dir, &bytes).map_err(|e| ApiError(StatusCode::BAD_GATEWAY, format!("{e:#}")))?;
+        let bin = Some(crate::release::Binary { sha256, size: bytes.len() as u64 });
+        match part {
+            crate::release::Part::Worker => r.worker = bin,
+            crate::release::Part::Manager => r.manager = bin,
+        }
+    }
+    m.store.propose(Entry::ReleaseSet { release: r.clone() }).await?;
+    m.events.push("upgrade", None, format!("release {version} fetched from {base}"));
+    Ok(Json(json!({ "release": r })))
+}
+
+#[derive(Deserialize, Default)]
+struct UpgradeAsk {
+    #[serde(default)]
+    by: String,
+}
+
+/// An upgrade to the release begins (the leader takes it a node at a time).
+async fn start_upgrade(State(m): State<Arc<Manager>>, h: HeaderMap, body: Option<Json<UpgradeAsk>>) -> R<(StatusCode, Json<Value>)> {
+    // Upgrades replace the binaries every node runs as root: an admin token only.
+    admin_only(authed(&m, &h)?)?;
+    let release = m.store.read(|s| s.release.clone()).ok_or_else(|| ApiError(StatusCode::CONFLICT, "the cluster has no release yet: upload or fetch one".into()))?;
+    for b in [&release.worker, &release.manager].into_iter().flatten() {
+        if crate::release::get_blob(&m.data_dir, b).is_none() {
+            m.ensure_binary(b).await.map_err(|e| ApiError(StatusCode::CONFLICT, format!("{e:#}")))?;
+        }
+    }
+    let now = now_ms();
+    let steps = crate::release::steps(&release, &m.upgrade_facts(), now);
+    if steps.is_empty() {
+        return Err(ApiError(StatusCode::CONFLICT, format!("every node and manager runs {} already", release.version)));
+    }
+    let by = started_by(&body.map(|b| b.0).unwrap_or_default().by).to_string();
+    let n = steps.len();
+    let run = crate::release::Upgrade { version: release.version.clone(), by: by.clone(), started_at: now, state: crate::release::RunState::Running, steps, message: String::new(), at: now };
+    m.store.propose(Entry::UpgradeStarted { run }).await?;
+    m.events.push("upgrade", None, format!("{by} started an upgrade to {} ({n} steps)", release.version));
+    Ok((StatusCode::ACCEPTED, Json(json!({ "steps": n }))))
+}
+
+/// The running upgrade stops: the step under way finishes on its node, nothing after it starts.
+async fn stop_upgrade(State(m): State<Arc<Manager>>, h: HeaderMap, body: Option<Json<UpgradeAsk>>) -> R<StatusCode> {
+    // Upgrades replace the binaries every node runs as root: an admin token only.
+    admin_only(authed(&m, &h)?)?;
+    let by = started_by(&body.map(|b| b.0).unwrap_or_default().by).to_string();
+    m.store.propose(Entry::UpgradeEnded { state: crate::release::RunState::Stopped, message: format!("stopped by {by}"), at: now_ms() }).await?;
+    m.events.push("upgrade", None, format!("{by} stopped the upgrade"));
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn start_ceph_setup(State(m): State<Arc<Manager>>, h: HeaderMap, Json(b): Json<CephSetupBody>) -> R<(StatusCode, Json<Value>)> {
     authed(&m, &h)?;
     for host in &b.hosts {
