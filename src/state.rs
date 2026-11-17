@@ -314,6 +314,24 @@ pub struct NodeReport {
     /// The worker takes the Upgrade command.
     #[serde(default)]
     pub upgrade: bool,
+    /// The storage drivers the node can mount itself (nfs, cephfs, smb); None from a worker that does not say.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mounts: Option<Vec<String>>,
+    /// Why it can mount none, when it can mount none.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub mounts_why: String,
+}
+
+impl NodeReport {
+    /// Whether the node can mount storage of `driver`: a path storage is never mounted, and a worker that does not
+    /// say is tried. Else why not.
+    pub fn can_mount(&self, driver: StorageDriver) -> Result<(), String> {
+        let Some(m) = &self.mounts else { return Ok(()) };
+        if driver == StorageDriver::Path || m.iter().any(|d| d == driver.word()) {
+            return Ok(());
+        }
+        Err(if m.is_empty() && !self.mounts_why.is_empty() { self.mounts_why.clone() } else { format!("its kernel has no {} client", driver.word()) })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

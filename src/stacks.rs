@@ -154,6 +154,22 @@ pub fn sound_for<'a>(eligible: &[String], storages: impl IntoIterator<Item = &'a
     eligible.iter().filter(|n| !sick.iter().any(|(sn, st)| sn == *n && uses.contains(st.as_str()))).cloned().collect()
 }
 
+/// Each node and storage it cannot mount (an unprivileged container mounts nothing; a kernel without the client mounts
+/// none of that kind): left out for that storage as a failing one is, so a workload with volumes there never goes to
+/// a node that would only fail to run it.
+pub fn unmountable(s: &ClusterState) -> Vec<(String, String)> {
+    let mut out = vec![];
+    for n in s.nodes.values() {
+        let Some(r) = &n.report else { continue };
+        for st in s.storage.values() {
+            if r.can_mount(st.driver).is_err() {
+                out.push((n.id.clone(), st.name.clone()));
+            }
+        }
+    }
+    out
+}
+
 /// `place` on the nodes `sound_for` leaves, the stack keeping volumes on `storages`; when nothing fits, the error says
 /// which nodes were left out for their storage, else "none meets" would hide it.
 pub fn place_minding<'a>(s: &ClusterState, stack: &str, services: &BTreeMap<String, ServiceSpec>, eligible: &[String], only: &[String], storages: impl IntoIterator<Item = &'a str> + Clone, sick: &[(String, String)]) -> Result<BTreeMap<String, String>, String> {
@@ -163,7 +179,15 @@ pub fn place_minding<'a>(s: &ClusterState, stack: &str, services: &BTreeMap<Stri
         let out: Vec<String> = sick
             .iter()
             .filter(|(n, st)| eligible.contains(n) && uses.contains(st.as_str()))
-            .map(|(n, st)| format!("storage {st} fails on {}", s.nodes.get(n).map_or_else(|| n.clone(), |x| x.display_name())))
+            .map(|(n, st)| {
+                let node = s.nodes.get(n);
+                let name = node.map_or_else(|| n.clone(), |x| x.display_name());
+                let cannot = node.and_then(|x| x.report.as_ref()).zip(s.storage.get(st)).and_then(|(r, sto)| r.can_mount(sto.driver).err().map(|why| (sto.driver, why)));
+                match cannot {
+                    Some((driver, why)) => format!("{name} cannot mount storage {st} ({}): {why}", driver.word()),
+                    None => format!("storage {st} fails on {name}"),
+                }
+            })
             .collect();
         if out.is_empty() { e } else { format!("{e}; left out: {}", out.join(", ")) }
     })
@@ -497,6 +521,32 @@ mod tests {
         let e = place_minding(&s, "web", &svc(&[("x", spec("nginx", 1))]), &eligible(&["a"]), &[], ["nas"], &[("a".to_string(), "nas".to_string())]).unwrap_err();
         assert!(e.ends_with("; left out: storage nas fails on a"), "{e}");
         assert!(place_minding(&s, "web", &svc(&[("x", spec("nginx", 1))]), &eligible(&["a"]), &[], ["other"], &[("a".to_string(), "nas".to_string())]).is_ok());
+    }
+
+    /// Nodes a (a host that mounts everything), w1 (an unprivileged LXC) and old (a worker that says nothing), and a
+    /// CephFS `ceph` and a shared directory `shared`.
+    fn mounting() -> ClusterState {
+        use crate::state::{NodeReport, Storage, StorageDriver};
+        let mut s = state_with(&["a", "w1", "old"]);
+        s.nodes.get_mut("a").unwrap().report = Some(NodeReport { mounts: Some(vec!["nfs".into(), "cephfs".into(), "smb".into()]), ..Default::default() });
+        s.nodes.get_mut("w1").unwrap().report = Some(NodeReport { mounts: Some(vec![]), mounts_why: "it runs in a user namespace (an unprivileged container)".into(), ..Default::default() });
+        s.nodes.get_mut("w1").unwrap().labels.insert("name".into(), "w1".into());
+        s.nodes.get_mut("old").unwrap().report = Some(NodeReport::default());
+        for (name, driver, source) in [("ceph", StorageDriver::Cephfs, "192.0.2.1:/"), ("shared", StorageDriver::Path, "/mnt/shared")] {
+            s.storage.insert(name.into(), Storage { name: name.into(), driver, source: source.into(), options: String::new(), added_at: 0, ceph: None, password: None });
+        }
+        s
+    }
+
+    #[test]
+    fn a_node_that_cannot_mount_a_storage_is_left_out_for_it_and_says_why() {
+        let s = mounting();
+        assert_eq!(unmountable(&s), vec![("w1".to_string(), "ceph".to_string())], "a path storage is never mounted; a worker that says nothing is tried");
+        let e = place_minding(&s, "ntfy", &svc(&[("ntfy", spec("ntfy", 1))]), &eligible(&["w1"]), &[], ["ceph"], &unmountable(&s)).unwrap_err();
+        assert!(e.contains("w1 cannot mount storage ceph (cephfs): it runs in a user namespace (an unprivileged container)"), "{e}");
+        let p = place_minding(&s, "ntfy", &svc(&[("ntfy", spec("ntfy", 1))]), &eligible(&["a", "w1"]), &[], ["ceph"], &unmountable(&s)).unwrap();
+        assert_eq!(p.values().collect::<Vec<_>>(), ["a"]);
+        assert!(place_minding(&s, "ntfy", &svc(&[("ntfy", spec("ntfy", 1))]), &eligible(&["w1"]), &[], ["shared"], &unmountable(&s)).is_ok());
     }
 
     #[test]

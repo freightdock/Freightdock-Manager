@@ -106,6 +106,8 @@ fn report_of(h: &v1::Hello) -> NodeReport {
         shells: caps.shells,
         host_shell: caps.host_shell,
         upgrade: caps.upgrade,
+        mounts: caps.mounts_known.then(|| caps.mounts.clone()),
+        mounts_why: caps.mounts_why.clone(),
     }
 }
 

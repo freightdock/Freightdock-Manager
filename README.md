@@ -419,6 +419,12 @@ a process still holding a file could otherwise go on writing; a `path` storage i
 take away, so with one a provider such as Proxmox is what makes a fenced node let go of it. A plain named volume
 stays local to each node, as before.
 
+Each worker also says which storage it can mount at all: nothing inside an unprivileged container (a user namespace,
+where the kernel lets nothing be mounted), and otherwise the NFS, CephFS and SMB clients its kernel has (`mount.nfs`
+too, for NFS). A stack with volumes on storage a node cannot mount is never placed there, and a deploy limited to such
+nodes is refused with the reason ("w1 cannot mount storage ceph (cephfs): it runs in a user namespace (an
+unprivileged container)"), shown by the deployer before anything runs. A worker too old to say is tried.
+
 Each worker probes the storage it has made ready every 15 seconds: an `nfs` export must still be mounted at its root
 (else a write would land on the node's own disk), its free space is read, and a small file is written, synced, read
 back and removed. A probe that hangs (an NFS server gone) is reported after 10 seconds and no second one is started

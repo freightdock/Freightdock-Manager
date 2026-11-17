@@ -93,8 +93,11 @@ impl Manager {
     }
 
     /// Each node's shared storage that says it fails there (G11.8): (node, storage).
+    /// And each node's storage it cannot mount at all (`stacks::unmountable`), left out the same way.
     pub fn sick_storage(&self, s: &ClusterState) -> Vec<(String, String)> {
-        s.nodes.keys().flat_map(|id| self.sessions.storage(id).map(|r| r.storages).unwrap_or_default().into_iter().filter(|h| !h.ok).map(move |h| (id.clone(), h.name))).collect()
+        let mut out: Vec<(String, String)> = s.nodes.keys().flat_map(|id| self.sessions.storage(id).map(|r| r.storages).unwrap_or_default().into_iter().filter(|h| !h.ok).map(move |h| (id.clone(), h.name))).collect();
+        out.extend(crate::stacks::unmountable(s));
+        out
     }
 
     /// The leader's recovery round (see the module), each second after fencing's.
