@@ -502,7 +502,7 @@ pub fn parse_exposure(s: &str) -> Option<crate::state::Exposure> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -517,7 +517,7 @@ mod tests {
     use crate::state::Port;
     use crate::state::tests::{cluster, spec};
 
-    fn state_with(nodes: &[&str]) -> ClusterState {
+    pub(crate) fn state_with(nodes: &[&str]) -> ClusterState {
         let mut s = cluster();
         for n in nodes {
             s.nodes.insert(n.to_string(), crate::state::Node { id: n.to_string(), hostname: n.to_string(), cert_sha256: String::new(), prev_cert_sha256: None, enrolled_at: 0, report: None, reported_at: None, labels: Default::default(), fencing: Default::default(), recovered: false, overlay: None });

@@ -242,6 +242,7 @@ impl WorkerSession for SessionSvc {
                         m.sessions.heard_network(&node_id, generation, hb.network);
                         m.sessions.heard_traffic(&node_id, generation, hb.traffic);
                         m.sessions.heard_storage(&node_id, generation, hb.storage);
+                        m.sessions.heard_usage(&node_id, generation, hb.usage);
                         m.sessions.heard(&node_id, generation, hb.resources, hb.workloads);
                         let ack = v1::ManagerMessage { body: Some(manager_message::Body::HeartbeatAck(v1::HeartbeatAck { seq: hb.seq })) };
                         if tx.send(Ok(ack)).await.is_err() {

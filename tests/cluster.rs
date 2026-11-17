@@ -615,7 +615,7 @@ async fn storage_is_given_to_the_cluster_and_a_stack_keeps_its_volumes_on_it() {
     let (s, b) = https_with(&a.m, &addr, "DELETE", "/v1/storage/nas", admin, "").await;
     assert!(s == 409 && b.contains("remove the stack first"), "in use: {s} {b}");
     let (_, b) = https_with(&a.m, &addr, "GET", "/v1/stacks/app", admin, "").await;
-    assert!(b.contains(r#""pg":{"access":"one","holder":null,"storage":"nas"}"#), "{b}");
+    assert!(b.contains(r#""pg":{"access":"one","dir":"app/pg","holder":null,"storage":"nas"}"#), "{b}");
     a.m.store.propose(Entry::StackRemoved { name: "app".into(), at: now_ms() }).await.unwrap();
     assert_eq!(https_with(&a.m, &addr, "DELETE", "/v1/storage/nas", admin, "").await.0, 204);
     assert_eq!(https_with(&a.m, &addr, "DELETE", "/v1/storage/nas", admin, "").await.0, 404);

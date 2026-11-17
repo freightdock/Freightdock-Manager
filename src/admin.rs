@@ -94,6 +94,7 @@ pub fn router(m: Arc<Manager>) -> Router {
         .route("/v1/traffic", get(traffic))
         .route("/v1/floating/{address}", axum::routing::delete(remove_floating))
         .route("/v1/storage", get(storage).post(add_storage))
+        .route("/v1/usage", get(usage))
         .route("/v1/storage/{name}", axum::routing::delete(remove_storage))
         .route("/v1/storage/{name}/keys", axum::routing::put(set_storage_keys))
         .route("/v1/storage/{name}/password", axum::routing::put(set_storage_password))
@@ -603,6 +604,22 @@ fn storage_health(s: &crate::state::ClusterState, reports: &[(String, freightdoc
             Some(json!({ "node_id": node, "node": name, "ok": h.ok, "error": h.error, "total_bytes": h.total_bytes, "free_bytes": h.free_bytes, "probe_ms": h.probe_ms, "at": h.at_ms }))
         })
         .collect()
+}
+
+/// The Storage page's numbers (`usage::view`): each node's disk by stack, each shared storage's size and its stacks'
+/// folders, as the workers last measured them.
+async fn usage(State(m): State<Arc<Manager>>, h: HeaderMap) -> R<Json<Value>> {
+    authed(&m, &h)?;
+    let ids: Vec<String> = m.store.read(|s| s.nodes.keys().cloned().collect());
+    let seen: Vec<crate::usage::Seen> = ids
+        .into_iter()
+        .map(|id| {
+            let l = m.sessions.liveness(&id);
+            let health = serde_json::to_value(l.health).ok().and_then(|v| v.as_str().map(str::to_string)).unwrap_or_default();
+            crate::usage::Seen { usage: m.sessions.usage(&id), storage: m.sessions.storage(&id), disk_total: l.disk_total_bytes, disk_used: l.disk_used_bytes, health, id }
+        })
+        .collect();
+    Ok(Json(m.store.read(|s| crate::usage::view(s, &seen))))
 }
 
 async fn storage(State(m): State<Arc<Manager>>, h: HeaderMap) -> R<Json<Value>> {

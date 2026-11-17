@@ -29,6 +29,7 @@ pub mod network;
 pub mod notify;
 pub mod traffic;
 pub mod ui;
+pub mod usage;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;

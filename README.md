@@ -273,6 +273,7 @@ a client trusts that CA alone and checks that name. `GET /v1/health` and `GET /v
 | `POST /v1/stack-check` | the same body, changing nothing: the services with the ports the file asks for, the warnings, the nodes resolved, and where the new workloads would go (`placements`) or why not (`unplaced`) |
 | `POST /v1/stacks/{name}/start`, `/stop`, `/restart`; `DELETE /v1/stacks/{name}` | run, stop, restart (stop, and the reconcile starts it) or remove |
 | `GET /v1/storage` | the cluster's shared storage (G11): each with its driver's capabilities and the volumes on it, with the node holding each volume for one writer, and `health`: each node that made it ready, by name, with `ok`, `error`, `free_bytes`, `total_bytes`, `probe_ms` and `at` |
+| `GET /v1/usage` | what the disks hold, by stack (the UI's Storage page): each node's disk (`total_bytes`, `used_bytes`, `free_bytes`), its stacks largest first (`containers_bytes`, `volumes_bytes`), images, volumes no stack mounts, build cache and the rest; each shared storage's size from its newest probe and each stack's folders on it with their size, from the newest measure (`null` when nobody measured). Workers measure every 5 minutes: Docker's own numbers, and a walk of each shared folder their containers bind |
 | `POST /v1/storage`, `DELETE /v1/storage/{name}` | `{"name", "driver": "nfs"\|"path", "source", "options"?}`: add storage; take it away (refused while a stack keeps a volume on it) |
 
 ### Stacks
