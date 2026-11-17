@@ -407,7 +407,10 @@ volumes:
     x-freightdock: {storage: nas}                # access: one (the default) or many
 ```
 
-The volume is the directory `<stack>/<volume>` on the storage. An `nfs` storage is mounted by the worker at
+The volume is the directory `<stack>/<volume>` on the storage, or the folder its `x-freightdock` names
+(`{storage: nas, path: apps/ntfy/data}`: up to 8 parts of letters, digits and `. _ -`, none starting with a dot). Two
+volumes never share a folder on one storage or have one inside the other: a deploy that would is refused, naming the
+other. The folder is made by the worker the first time a workload with the volume starts there, never before. An `nfs` storage is mounted by the worker at
 `<data>/storage/<name>` the first time a workload needs it; a `path` storage is only looked for (a mount the host
 has, or a bind mount into a container that cannot mount NFS itself, such as an unprivileged LXC). A volume for one
 writer (`access: one`, a database's files) is used by one workload, and the managers lease it to one node at a time:

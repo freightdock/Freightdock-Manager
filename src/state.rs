@@ -737,6 +737,16 @@ pub struct StackVolume {
     pub storage: String,
     #[serde(default)]
     pub access: Access,
+    /// Its folder on the storage, as the Compose file names it (`x-freightdock.path`); else `<stack>/<volume>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+}
+
+impl StackVolume {
+    /// Its folder on the storage: the one named, else `<stack>/<volume>`.
+    pub fn dir(&self, stack: &str, volume: &str) -> String {
+        self.path.clone().unwrap_or_else(|| format!("{stack}/{volume}"))
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1411,7 +1421,7 @@ impl ClusterState {
             .filter_map(|v| self.shared_volume(&w.stack, v))
             .filter_map(|(name, v)| {
                 let st = self.storage.get(&v.storage)?;
-                Some(StorageMount { volume: name.to_string(), storage: st.name.clone(), driver: st.driver, source: st.source.clone(), options: st.options.clone(), dir: format!("{}/{name}", w.stack) })
+                Some(StorageMount { volume: name.to_string(), storage: st.name.clone(), driver: st.driver, source: st.source.clone(), options: st.options.clone(), dir: v.dir(&w.stack, name) })
             })
             .collect()
     }
@@ -2710,7 +2720,7 @@ pub(crate) mod tests {
     fn on_storage(name: &str, services: &[(&str, ServiceSpec)], placements: &[(&str, &str)], volumes: &[(&str, &str, Access)]) -> Entry {
         match deploy(name, services, placements) {
             Entry::StackDeployed { name, compose, services, placements, at, nodes, exposures, .. } => {
-                let volumes = volumes.iter().map(|(v, st, a)| (v.to_string(), StackVolume { storage: st.to_string(), access: *a })).collect();
+                let volumes = volumes.iter().map(|(v, st, a)| (v.to_string(), StackVolume { storage: st.to_string(), access: *a, path: None })).collect();
                 Entry::StackDeployed { name, compose, services, placements, at, nodes, exposures, volumes, options: Default::default(), stopped: false }
             }
             _ => unreachable!(),

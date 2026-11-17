@@ -618,7 +618,7 @@ async fn storage(State(m): State<Arc<Manager>>, h: HeaderMap) -> R<Json<Value>> 
                         .stacks
                         .values()
                         .flat_map(|stack| stack.volumes.iter().filter(|(_, v)| v.storage == st.name).map(move |(name, v)| (stack, name, v)))
-                        .map(|(stack, name, v)| json!({ "stack": stack.name, "volume": name, "access": v.access, "holder": s.leases.get(&format!("{}/{name}", stack.name)).map(|l| &l.node_id) }))
+                        .map(|(stack, name, v)| json!({ "stack": stack.name, "volume": name, "dir": v.dir(&stack.name, name), "access": v.access, "holder": s.leases.get(&format!("{}/{name}", stack.name)).map(|l| &l.node_id) }))
                         .collect();
                     let mut v = json!({ "name": st.name, "driver": st.driver, "source": st.source, "options": st.options, "added_at": st.added_at, "capabilities": st.driver.capabilities(), "volumes": volumes, "health": storage_health(s, &reports, &st.name) });
                     if st.driver == crate::state::StorageDriver::Smb {
@@ -1406,7 +1406,7 @@ fn stack_json(m: &Manager, s: &crate::state::ClusterState, st: &crate::state::St
         })
         .collect();
     let services: serde_json::Map<String, Value> = st.services.iter().map(|(k, v)| (k.clone(), json!({ "image": v.image, "replicas": v.replicas, "ports": v.ports, "ha": v.ha, "name": v.name, "restart": v.restart, "limits": v.limits, "placement": { "constraints": v.placement.constraints.iter().map(ToString::to_string).collect::<Vec<_>>(), "prefer": v.placement.prefer.iter().map(ToString::to_string).collect::<Vec<_>>(), "spread": v.placement.spread, "reserve": v.placement.reserve } }))).collect();
-    let mut v = json!({ "name": st.name, "subnet": s.subnet(&st.name), "stopped": st.stopped, "created_at": st.created_at, "updated_at": st.updated_at, "services": services, "workloads": workloads, "options": options_json(&st.options, false), "description": st.options.description, "exposures": st.exposures, "nodes": st.nodes, "volumes": st.volumes.iter().map(|(k, v)| (k.clone(), json!({ "storage": v.storage, "access": v.access, "holder": s.leases.get(&format!("{}/{k}", st.name)).map(|l| &l.node_id) }))).collect::<serde_json::Map<String, Value>>() });
+    let mut v = json!({ "name": st.name, "subnet": s.subnet(&st.name), "stopped": st.stopped, "created_at": st.created_at, "updated_at": st.updated_at, "services": services, "workloads": workloads, "options": options_json(&st.options, false), "description": st.options.description, "exposures": st.exposures, "nodes": st.nodes, "volumes": st.volumes.iter().map(|(k, v)| (k.clone(), json!({ "storage": v.storage, "dir": v.dir(&st.name, k), "access": v.access, "holder": s.leases.get(&format!("{}/{k}", st.name)).map(|l| &l.node_id) }))).collect::<serde_json::Map<String, Value>>() });
     if with_compose {
         v["compose"] = json!(st.compose);
         v["options"] = options_json(&st.options, true);
@@ -1585,6 +1585,9 @@ fn ready(m: &Manager, b: &DeployBody) -> R<(String, Ready)> {
             if !s.storage.contains_key(&v.storage) {
                 return Err(ApiError(StatusCode::BAD_REQUEST, format!("volume {vol}: the cluster has no storage named {:?} (storage add)", v.storage)));
             }
+        }
+        if let Some(e) = crate::stacks::folder_clash(s, &name, &parsed.volumes) {
+            return Err(ApiError(StatusCode::BAD_REQUEST, e));
         }
         let nodes = match &b.nodes {
             None => s.stacks.get(&name).map(|st| st.nodes.clone()).unwrap_or_default(),

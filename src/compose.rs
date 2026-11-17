@@ -232,7 +232,7 @@ pub fn apply_options(p: &mut Parsed, o: &crate::state::StackOptions) -> Result<(
                 for v in &spec.volumes {
                     let src = v.split(':').next().unwrap_or("");
                     if v.contains(':') && !src.starts_with('/') && !p.volumes.contains_key(src) {
-                        p.volumes.insert(src.to_string(), StackVolume { storage: storage.clone(), access: Access::One });
+                        p.volumes.insert(src.to_string(), StackVolume { storage: storage.clone(), access: Access::One, path: None });
                     }
                 }
             }
@@ -242,11 +242,24 @@ pub fn apply_options(p: &mut Parsed, o: &crate::state::StackOptions) -> Result<(
     Ok(())
 }
 
-/// A volume's `x-freightdock`: `storage` (a name) and `access` (`one`, the default, or `many`).
+/// A folder on a storage as a Compose file may name one: relative, of 1 to 8 parts of letters, digits and `. _ -`,
+/// none empty or starting with a dot (so never `..`).
+pub fn storage_path(p: &str) -> Result<String, String> {
+    let parts: Vec<&str> = p.split('/').collect();
+    let fine = |x: &str| !x.is_empty() && !x.starts_with('.') && x.len() <= 64 && x.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b));
+    if p.is_empty() || parts.len() > 8 || !parts.iter().all(|x| fine(x)) {
+        return Err(format!("path {p:?} is a folder on the storage: up to 8 parts of letters, digits and . _ -, separated by /, none starting with a dot"));
+    }
+    Ok(p.to_string())
+}
+
+/// A volume's `x-freightdock`: `storage` (a name), `access` (`one`, the default, or `many`) and `path`, its folder on
+/// the storage (`<stack>/<volume>` when not given).
 fn on_storage(x: &Value) -> Result<StackVolume, String> {
     let m = x.as_mapping().ok_or("x-freightdock is a mapping")?;
     let mut storage = None;
     let mut access = Access::One;
+    let mut path = None;
     for (k, v) in m {
         match key(k)?.as_str() {
             "storage" => storage = Some(v.as_str().filter(|s| !s.is_empty()).ok_or("storage is a name")?.to_string()),
@@ -257,10 +270,11 @@ fn on_storage(x: &Value) -> Result<StackVolume, String> {
                     _ => return Err("access is one or many".into()),
                 }
             }
-            k => return Err(format!("x-freightdock.{k} is not supported (storage, access)")),
+            "path" => path = Some(storage_path(v.as_str().ok_or("path is a folder on the storage")?)?),
+            k => return Err(format!("x-freightdock.{k} is not supported (storage, access, path)")),
         }
     }
-    Ok(StackVolume { storage: storage.ok_or("x-freightdock needs the storage it is on")?, access })
+    Ok(StackVolume { storage: storage.ok_or("x-freightdock needs the storage it is on")?, access, path })
 }
 
 fn key(v: &Value) -> Result<String, String> {
@@ -828,7 +842,7 @@ volumes:
         apply_options(&mut p, &o).unwrap();
         assert_eq!((p.services["db"].name.as_str(), p.services["web"].name.as_str()), ("main-db", "site"), "an empty name keeps the file's");
         assert!(p.services.values().all(|s| s.placement.constraints.contains(&constraint("node.labels.zone==a").unwrap()) && s.ha));
-        assert_eq!(p.volumes["data"], StackVolume { storage: "nas".into(), access: Access::One }, "named volumes on the storage, a bind mount left");
+        assert_eq!(p.volumes["data"], StackVolume { storage: "nas".into(), access: Access::One, path: None }, "named volumes on the storage, a bind mount left");
         assert_eq!(p.volumes.len(), 1);
         let mut p = parse(y).unwrap();
         apply_options(&mut p, &StackOptions { mode: Some(Mode::Pinned), ..Default::default() }).unwrap();
@@ -884,7 +898,7 @@ volumes:
 "#,
         )
         .unwrap();
-        assert_eq!(p.volumes["pg"], StackVolume { storage: "nas".into(), access: Access::One }, "one writer unless it says");
+        assert_eq!(p.volumes["pg"], StackVolume { storage: "nas".into(), access: Access::One, path: None }, "one writer unless it says");
         assert_eq!(p.volumes["site"].access, Access::Many);
         assert!(!p.volumes.contains_key("cache"), "a plain volume stays local to each node");
         assert!(p.warnings.iter().any(|w| w.contains("site") && w.contains("driver")), "{:?}", p.warnings);
@@ -973,5 +987,18 @@ services:
         assert_eq!(split_words("  a   b ").unwrap(), vec!["a", "b"]);
         assert_eq!(split_words("''").unwrap(), vec![""]);
         assert!(split_words("'open").is_err());
+    }
+
+    #[test]
+    fn a_volume_may_name_its_folder_on_the_storage() {
+        let p = parse("services:\n  a:\n    image: x\n    volumes: [d:/d]\nvolumes:\n  d:\n    x-freightdock: {storage: ceph, path: apps/ntfy/data}\n").unwrap();
+        assert_eq!(p.volumes["d"].path.as_deref(), Some("apps/ntfy/data"));
+        assert_eq!(p.volumes["d"].dir("ntfy", "d"), "apps/ntfy/data");
+        let plain = parse("services:\n  a:\n    image: x\n    volumes: [d:/d]\nvolumes:\n  d:\n    x-freightdock: {storage: ceph}\n").unwrap();
+        assert_eq!(plain.volumes["d"].dir("ntfy", "d"), "ntfy/d", "none said: <stack>/<volume>, as before");
+        for bad in ["/abs", "a/../b", "../up", "a//b", ".hidden", "a/.git", "sp ace", "a/", ""] {
+            let y = format!("services:\n  a:\n    image: x\nvolumes:\n  d:\n    x-freightdock: {{storage: ceph, path: {bad:?}}}\n");
+            assert!(parse(&y).unwrap_err().contains("path"), "{bad:?} let through");
+        }
     }
 }

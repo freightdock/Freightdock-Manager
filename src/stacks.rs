@@ -170,6 +170,29 @@ pub fn unmountable(s: &ClusterState) -> Vec<(String, String)> {
     out
 }
 
+/// Whether a stack's volumes (`volumes`, of `stack`) would share a folder on a storage with another volume, or have one
+/// inside another's: two writers in one folder, which the leases (one per volume) would not keep apart. The stack's
+/// own deployed volumes are not met, as a redeploy replaces them. Says which, else None.
+pub fn folder_clash(s: &ClusterState, stack: &str, volumes: &BTreeMap<String, crate::state::StackVolume>) -> Option<String> {
+    let mine: Vec<(String, &str, String)> = volumes.iter().map(|(n, v)| (format!("volume {n}"), v.storage.as_str(), v.dir(stack, n))).collect();
+    let others: Vec<(String, &str, String)> = s.stacks.values().filter(|st| st.name != stack).flat_map(|st| st.volumes.iter().map(move |(n, v)| (format!("stack {}'s volume {n}", st.name), v.storage.as_str(), v.dir(&st.name, n)))).collect();
+    let inside = |a: &str, b: &str| a.len() > b.len() && a.starts_with(b) && a.as_bytes()[b.len()] == b'/';
+    for (i, (what, st, dir)) in mine.iter().enumerate() {
+        for (who, ost, odir) in mine.iter().skip(i + 1).chain(others.iter()) {
+            if st != ost {
+                continue;
+            }
+            if dir == odir {
+                return Some(format!("{what}: folder {dir} on storage {st} is {who}'s already; give it another path"));
+            }
+            if inside(dir, odir) || inside(odir, dir) {
+                return Some(format!("{what}: folder {dir} on storage {st} and {who}'s folder {odir} are one inside the other; give it another path"));
+            }
+        }
+    }
+    None
+}
+
 /// `place` on the nodes `sound_for` leaves, the stack keeping volumes on `storages`; when nothing fits, the error says
 /// which nodes were left out for their storage, else "none meets" would hide it.
 pub fn place_minding<'a>(s: &ClusterState, stack: &str, services: &BTreeMap<String, ServiceSpec>, eligible: &[String], only: &[String], storages: impl IntoIterator<Item = &'a str> + Clone, sick: &[(String, String)]) -> Result<BTreeMap<String, String>, String> {
@@ -550,6 +573,32 @@ mod tests {
     }
 
     #[test]
+    fn two_volumes_never_share_or_nest_a_folder_on_one_storage() {
+        use crate::state::{Access, StackVolume};
+        let v = |st: &str, path: Option<&str>| StackVolume { storage: st.into(), access: Access::One, path: path.map(str::to_string) };
+        let mut s = mounting();
+        let had = [("data".to_string(), v("ceph", Some("ntfy/data")))].into();
+        deploy_with(&mut s, "ntfy", had);
+        let ok: BTreeMap<String, StackVolume> = [("d".to_string(), v("ceph", Some("ntfy/data2"))), ("e".to_string(), v("shared", Some("ntfy/data")))].into();
+        assert!(folder_clash(&s, "web", &ok).is_none(), "another folder, or another storage");
+        for (path, word) in [("ntfy/data", "ntfy/data"), ("ntfy", "inside"), ("ntfy/data/sub", "inside")] {
+            let e = folder_clash(&s, "web", &[("d".to_string(), v("ceph", Some(path)))].into()).unwrap();
+            assert!(e.contains("ntfy") && e.contains(word), "{path}: {e}");
+        }
+        assert!(folder_clash(&s, "ntfy", &[("data".to_string(), v("ceph", Some("ntfy/data")))].into()).is_none(), "a stack changed meets only itself");
+        let both: BTreeMap<String, StackVolume> = [("a".to_string(), v("ceph", Some("x"))), ("b".to_string(), v("ceph", Some("x/y")))].into();
+        assert!(folder_clash(&s, "web", &both).unwrap().contains("inside"), "two of one stack");
+        let defaults: BTreeMap<String, StackVolume> = [("data".to_string(), v("ceph", None))].into();
+        assert!(folder_clash(&s, "ntfy2", &defaults).is_none());
+        assert!(folder_clash(&s, "x", &[("d".to_string(), v("ceph", Some("ntfy2/data")))].into()).is_none());
+    }
+
+    fn deploy_with(s: &mut ClusterState, stack: &str, volumes: BTreeMap<String, crate::state::StackVolume>) {
+        let i = s.applied + 1;
+        s.apply_at(i, &Entry::StackDeployed { name: stack.into(), compose: String::new(), services: Default::default(), placements: Default::default(), at: 1, nodes: vec![], exposures: None, volumes, options: Default::default(), stopped: false }).unwrap();
+    }
+
+    #[test]
     fn a_node_whose_storage_fails_takes_no_new_workload_with_volumes_on_it() {
         let all = eligible(&["a", "b", "c"]);
         let sick = vec![("b".to_string(), "nas".to_string()), ("c".to_string(), "other".to_string())];
@@ -739,7 +788,7 @@ mod tests {
         s.apply_at(i, &Entry::StorageAdded { storage: Storage { name: "nas".into(), driver: StorageDriver::Nfs, source: "192.0.2.50:/fd".into(), options: "vers=4.2".into(), added_at: 1, ceph: None, password: None } }).unwrap();
         let services = svc(&[("db", ServiceSpec { volumes: vec!["pg:/var/lib/pg".into(), "cache:/cache".into()], ..spec("postgres", 1) })]);
         let i = s.applied + 1;
-        let volumes = [("pg".to_string(), StackVolume { storage: "nas".into(), access: Access::One })].into();
+        let volumes = [("pg".to_string(), StackVolume { storage: "nas".into(), access: Access::One, path: None })].into();
         s.apply_at(i, &Entry::StackDeployed { name: "app".into(), compose: String::new(), services, placements: [("app.db.1".to_string(), "a".to_string())].into(), at: 1, nodes: vec![], exposures: None, volumes, options: Default::default(), stopped: false }).unwrap();
         let ops = reconcile(&s, "a", &[], &BTreeSet::new());
         let Some((_, Op::RunContainer { storage, volumes, .. })) = ops.first() else { panic!("{ops:?}") };
