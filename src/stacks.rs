@@ -43,13 +43,27 @@ fn fits(n: &Node, held: &Resources, need: &Resources) -> bool {
 /// lowest id. `only`, when not empty, is the nodes chosen for the stack: the others are no candidates, and a workload
 /// on one of them is moved. An error names the first workload with nowhere to go, and why.
 pub fn place(s: &ClusterState, stack: &str, services: &BTreeMap<String, ServiceSpec>, eligible: &[String], only: &[String]) -> Result<BTreeMap<String, String>, String> {
+    place_with(s, stack, services, eligible, only, &[])
+}
+
+/// `place`, minding `unpulled` (node, image): a node that could not pull a service's image is no candidate for it,
+/// and a workload placed on one is placed again (it cannot run there; one that runs has its image).
+pub fn place_with(s: &ClusterState, stack: &str, services: &BTreeMap<String, ServiceSpec>, eligible: &[String], only: &[String], unpulled: &[(String, String)]) -> Result<BTreeMap<String, String>, String> {
+    let cannot_pull = |n: &str, image: &str| {
+        let image = crate::prepull::canonical(image);
+        unpulled.iter().any(|(un, ui)| un == n && crate::prepull::canonical(ui) == image)
+    };
     let allowed = |n: &str| only.is_empty() || only.iter().any(|o| o == n);
     let wanted = ClusterState::wanted(stack, services);
     let keep: BTreeSet<&String> = wanted.iter().map(|w| &w.0).collect();
     // A placed workload of this stack stays where it is while its node exists and meets its constraints.
     let stays = |w: &Workload| -> bool {
         let Some(n) = w.node_id.as_ref().and_then(|id| s.nodes.get(id)) else { return false };
-        w.stack != stack || (allowed(&n.id) && services[&w.service].placement.constraints.iter().all(|c| c.holds(n)))
+        if w.stack != stack {
+            return true;
+        }
+        let sp = &services[&w.service];
+        allowed(&n.id) && sp.placement.constraints.iter().all(|c| c.holds(n)) && !cannot_pull(&n.id, &sp.image)
     };
     let spec_of = |w: &Workload| -> Option<&ServiceSpec> { if w.stack == stack { services.get(&w.service) } else { s.stacks.get(&w.stack)?.services.get(&w.service) } };
     let mut held: HashMap<&str, Held> = HashMap::new();
@@ -83,7 +97,8 @@ pub fn place(s: &ClusterState, stack: &str, services: &BTreeMap<String, ServiceS
         let p = &spec.placement;
         let needs = if on_overlay { BTreeSet::new() } else { host_ports(spec) };
         let meets: Vec<&Node> = nodes.iter().copied().filter(|n| p.constraints.iter().all(|c| c.holds(n))).collect();
-        let free: Vec<&Node> = meets.iter().copied().filter(|n| held.get(n.id.as_str()).is_none_or(|h| h.ports.is_disjoint(&needs))).collect();
+        let gets: Vec<&Node> = meets.iter().copied().filter(|n| !cannot_pull(&n.id, &spec.image)).collect();
+        let free: Vec<&Node> = gets.iter().copied().filter(|n| held.get(n.id.as_str()).is_none_or(|h| h.ports.is_disjoint(&needs))).collect();
         let room: Vec<&Node> = free.iter().copied().filter(|n| fits(n, &held.get(n.id.as_str()).map(|h| h.reserved).unwrap_or_default(), &p.reserve)).collect();
         // Kept apart (both ways): from this stack's services as placed so far, and from other stacks' as they are.
         let apart = |other_stack: &str, other: &str, other_spec: Option<&ServiceSpec>| {
@@ -108,6 +123,8 @@ pub fn place(s: &ClusterState, stack: &str, services: &BTreeMap<String, ServiceS
             Some("none is connected with Docker".to_string())
         } else if meets.is_empty() {
             Some(format!("none meets {}", p.constraints.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ")))
+        } else if gets.is_empty() {
+            Some(format!("none can get its image {} (it could not be pulled on {})", spec.image, meets.iter().map(|n| n.display_name()).collect::<Vec<_>>().join(", ")))
         } else if free.is_empty() {
             Some("every node that could already publishes one of its host ports".to_string())
         } else if room.is_empty() {
@@ -145,6 +162,35 @@ pub fn place(s: &ClusterState, stack: &str, services: &BTreeMap<String, ServiceS
         out.insert(id.clone(), node.id.clone());
     }
     Ok(out)
+}
+
+/// What placement leaves out besides unhealthy nodes: (node, storage) that fails or cannot be mounted there, and
+/// (node, image) that could not be pulled there.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Sick {
+    pub storage: Vec<(String, String)>,
+    pub images: Vec<(String, String)>,
+}
+
+impl Sick {
+    pub fn of_storage(storage: Vec<(String, String)>) -> Self {
+        Sick { storage, images: vec![] }
+    }
+}
+
+/// Each node and image whose latest run there failed in its pull (the worker says `pulling <image>: ...`, and only
+/// when it has no copy of its own): a registry that refuses it, or an image built on one node and never pushed. A
+/// later run there that got past the pull clears it; the record goes when the command is pruned.
+pub fn unpullable(s: &ClusterState) -> Vec<(String, String)> {
+    let mut last: BTreeMap<(String, String), (&CommandRecord, &String)> = BTreeMap::new();
+    for c in s.commands.values().filter(|c| c.status.is_terminal()) {
+        let Op::RunContainer { image, .. } = &c.op else { continue };
+        let key = (c.node_id.clone(), crate::prepull::canonical(image));
+        if last.get(&key).is_none_or(|(l, _)| (l.updated_at, &l.id) < (c.updated_at, &c.id)) {
+            last.insert(key, (c, image));
+        }
+    }
+    last.into_iter().filter(|(_, (c, _))| c.status == CommandStatus::Failed && c.message.starts_with("pulling ")).map(|((n, _), (_, image))| (n, image.clone())).collect()
 }
 
 /// The eligible nodes a stack's new placements may go to (G11.8): none that says one of the storages the stack keeps
@@ -195,11 +241,12 @@ pub fn folder_clash(s: &ClusterState, stack: &str, volumes: &BTreeMap<String, cr
 
 /// `place` on the nodes `sound_for` leaves, the stack keeping volumes on `storages`; when nothing fits, the error says
 /// which nodes were left out for their storage, else "none meets" would hide it.
-pub fn place_minding<'a>(s: &ClusterState, stack: &str, services: &BTreeMap<String, ServiceSpec>, eligible: &[String], only: &[String], storages: impl IntoIterator<Item = &'a str> + Clone, sick: &[(String, String)]) -> Result<BTreeMap<String, String>, String> {
-    let sound = sound_for(eligible, storages.clone(), sick);
-    place(s, stack, services, &sound, only).map_err(|e| {
+pub fn place_minding<'a>(s: &ClusterState, stack: &str, services: &BTreeMap<String, ServiceSpec>, eligible: &[String], only: &[String], storages: impl IntoIterator<Item = &'a str> + Clone, sick: &Sick) -> Result<BTreeMap<String, String>, String> {
+    let sound = sound_for(eligible, storages.clone(), &sick.storage);
+    place_with(s, stack, services, &sound, only, &sick.images).map_err(|e| {
         let uses: BTreeSet<&str> = storages.into_iter().collect();
         let out: Vec<String> = sick
+            .storage
             .iter()
             .filter(|(n, st)| eligible.contains(n) && uses.contains(st.as_str()))
             .map(|(n, st)| {
@@ -218,14 +265,14 @@ pub fn place_minding<'a>(s: &ClusterState, stack: &str, services: &BTreeMap<Stri
 
 /// The workloads to put on other nodes: of each stack, those on a node that no longer qualifies (its labels changed,
 /// or it is no longer one chosen for the stack) and that `place` has another for. One with nowhere to go stays.
-pub fn replacements(s: &ClusterState, eligible: &[String], sick: &[(String, String)]) -> Vec<(String, BTreeMap<String, String>)> {
+pub fn replacements(s: &ClusterState, eligible: &[String], sick: &Sick) -> Vec<(String, BTreeMap<String, String>)> {
     let mut out = vec![];
     for st in s.stacks.values() {
-        let eligible = &sound_for(eligible, st.volumes.values().map(|v| v.storage.as_str()), sick);
+        let eligible = &sound_for(eligible, st.volumes.values().map(|v| v.storage.as_str()), &sick.storage);
         // A service with a workload that has nowhere to go is left out (its workloads stay), and the rest tried again.
         let mut services = st.services.clone();
         let p = loop {
-            match place(s, &st.name, &services, eligible, &st.nodes) {
+            match place_with(s, &st.name, &services, eligible, &st.nodes, &sick.images) {
                 Ok(p) => break Some(p),
                 Err(e) => {
                     let stuck = e.strip_prefix("no node can take ").and_then(|r| r.split(':').next()).and_then(|id| s.workloads.get(id)).map(|w| w.service.clone());
@@ -541,9 +588,9 @@ pub(crate) mod tests {
     #[test]
     fn a_placement_refused_for_failing_storage_says_so() {
         let s = state_with(&["a"]);
-        let e = place_minding(&s, "web", &svc(&[("x", spec("nginx", 1))]), &eligible(&["a"]), &[], ["nas"], &[("a".to_string(), "nas".to_string())]).unwrap_err();
+        let e = place_minding(&s, "web", &svc(&[("x", spec("nginx", 1))]), &eligible(&["a"]), &[], ["nas"], &Sick::of_storage(vec![("a".to_string(), "nas".to_string())])).unwrap_err();
         assert!(e.ends_with("; left out: storage nas fails on a"), "{e}");
-        assert!(place_minding(&s, "web", &svc(&[("x", spec("nginx", 1))]), &eligible(&["a"]), &[], ["other"], &[("a".to_string(), "nas".to_string())]).is_ok());
+        assert!(place_minding(&s, "web", &svc(&[("x", spec("nginx", 1))]), &eligible(&["a"]), &[], ["other"], &Sick::of_storage(vec![("a".to_string(), "nas".to_string())])).is_ok());
     }
 
     /// Nodes a (a host that mounts everything), w1 (an unprivileged LXC) and old (a worker that says nothing), and a
@@ -565,11 +612,11 @@ pub(crate) mod tests {
     fn a_node_that_cannot_mount_a_storage_is_left_out_for_it_and_says_why() {
         let s = mounting();
         assert_eq!(unmountable(&s), vec![("w1".to_string(), "ceph".to_string())], "a path storage is never mounted; a worker that says nothing is tried");
-        let e = place_minding(&s, "ntfy", &svc(&[("ntfy", spec("ntfy", 1))]), &eligible(&["w1"]), &[], ["ceph"], &unmountable(&s)).unwrap_err();
+        let e = place_minding(&s, "ntfy", &svc(&[("ntfy", spec("ntfy", 1))]), &eligible(&["w1"]), &[], ["ceph"], &Sick::of_storage(unmountable(&s))).unwrap_err();
         assert!(e.contains("w1 cannot mount storage ceph (cephfs): it runs in a user namespace (an unprivileged container)"), "{e}");
-        let p = place_minding(&s, "ntfy", &svc(&[("ntfy", spec("ntfy", 1))]), &eligible(&["a", "w1"]), &[], ["ceph"], &unmountable(&s)).unwrap();
+        let p = place_minding(&s, "ntfy", &svc(&[("ntfy", spec("ntfy", 1))]), &eligible(&["a", "w1"]), &[], ["ceph"], &Sick::of_storage(unmountable(&s))).unwrap();
         assert_eq!(p.values().collect::<Vec<_>>(), ["a"]);
-        assert!(place_minding(&s, "ntfy", &svc(&[("ntfy", spec("ntfy", 1))]), &eligible(&["w1"]), &[], ["shared"], &unmountable(&s)).is_ok());
+        assert!(place_minding(&s, "ntfy", &svc(&[("ntfy", spec("ntfy", 1))]), &eligible(&["w1"]), &[], ["shared"], &Sick::of_storage(unmountable(&s))).is_ok());
     }
 
     #[test]
@@ -723,12 +770,12 @@ pub(crate) mod tests {
         let one = svc(&[("x", with(spec("x", 1), |x| x.placement.constraints = vec![c("node.labels.zone==1")])), ("y", spec("y", 1))]);
         let p = place(&s, "st", &one, &all, &[]).unwrap();
         deploy(&mut s, "st", &one, p);
-        assert!(replacements(&s, &all, &[]).is_empty(), "every workload where it may be");
+        assert!(replacements(&s, &all, &Sick::default()).is_empty(), "every workload where it may be");
         s.nodes.get_mut("a").unwrap().labels.insert("zone".into(), "2".into());
         s.nodes.get_mut("b").unwrap().labels.insert("zone".into(), "1".into());
-        assert_eq!(replacements(&s, &all, &[]), vec![("st".to_string(), [("st.x.1".to_string(), "b".to_string())].into())], "x follows its label; y stays");
+        assert_eq!(replacements(&s, &all, &Sick::default()), vec![("st".to_string(), [("st.x.1".to_string(), "b".to_string())].into())], "x follows its label; y stays");
         s.nodes.get_mut("b").unwrap().labels.insert("zone".into(), "3".into());
-        assert!(replacements(&s, &all, &[]).is_empty(), "nowhere to go: it stays where it is");
+        assert!(replacements(&s, &all, &Sick::default()).is_empty(), "nowhere to go: it stays where it is");
     }
 
     #[test]
@@ -742,7 +789,7 @@ pub(crate) mod tests {
         deploy(&mut s, "st", &two, p);
         s.nodes.get_mut("a").unwrap().labels.insert("zone".into(), "2".into());
         s.nodes.get_mut("b").unwrap().labels.insert("zone".into(), "1".into());
-        assert_eq!(replacements(&s, &all, &[]), vec![("st".to_string(), [("st.x.1".to_string(), "b".to_string())].into())], "z has no room on b and stays; x moves");
+        assert_eq!(replacements(&s, &all, &Sick::default()), vec![("st".to_string(), [("st.x.1".to_string(), "b".to_string())].into())], "z has no room on b and stays; x moves");
     }
 
     #[test]
@@ -989,5 +1036,50 @@ pub(crate) mod tests {
         assert_eq!(backoff(0, 5000), Duration::from_secs(5));
         assert_eq!(backoff(1, 5000), Duration::from_secs(10));
         assert_eq!(backoff(30, 5000), Duration::from_secs(300));
+    }
+
+    /// A failed or finished run of `image` on `node`, at `at`.
+    fn ran(id: &str, node: &str, image: &str, status: crate::state::CommandStatus, message: &str, at: crate::state::Ms) -> crate::state::CommandRecord {
+        let op = Op::RunContainer { workload_id: "st.x.1".into(), image: image.into(), name: String::new(), command: vec![], env: Default::default(), labels: Default::default(), generation: 1, ports: vec![], volumes: vec![], limits: Default::default(), net: None, storage: vec![] };
+        crate::state::CommandRecord { op, status, message: message.into(), created_at: at, updated_at: at, ..crate::state::tests::command(id, node) }
+    }
+
+    #[test]
+    fn a_node_whose_last_run_of_an_image_could_not_pull_it_cannot_get_it() {
+        use crate::state::CommandStatus::{Failed, Succeeded};
+        let mut s = state_with(&["a", "b", "c"]);
+        for c in [
+            ran("1", "a", "ui:44", Failed, "pulling ui:44: pull access denied for ui", 10),
+            ran("2", "b", "ui:44", Failed, "pulling ui:44: pull access denied for ui", 10),
+            ran("3", "b", "ui:44", Succeeded, "running", 20),
+            ran("4", "c", "nginx", Failed, "the network web is for 10.0.0.0/24, not 10.0.1.0/24", 10),
+        ] {
+            s.commands.insert(c.id.clone(), c);
+        }
+        assert_eq!(unpullable(&s), vec![("a".to_string(), "ui:44".to_string())], "b pulled it after all; c failed for another reason");
+    }
+
+    #[test]
+    fn a_node_that_cannot_get_a_service_s_image_is_no_candidate_for_it() {
+        let s = state_with(&["a", "b"]);
+        let no = vec![("a".to_string(), "docker.io/library/nginx".to_string())];
+        let p = place_with(&s, "web", &svc(&[("x", spec("nginx", 1)), ("y", spec("redis", 2))]), &eligible(&["a", "b"]), &[], &no).unwrap();
+        assert_eq!(p["web.x.1"], "b", "names compare as Docker lists them: {p:?}");
+        assert!(p.values().filter(|n| *n == "a").count() == 1, "another image still goes there: {p:?}");
+        let e = place_with(&s, "web", &svc(&[("x", spec("nginx", 1))]), &eligible(&["a"]), &[], &no).unwrap_err();
+        assert!(e.contains("no node can take web.x.1: none can get its image nginx (it could not be pulled on a)"), "{e}");
+    }
+
+    #[test]
+    fn a_workload_on_a_node_that_cannot_get_its_image_moves_to_one_that_can() {
+        let mut s = state_with(&["a", "b"]);
+        let all = eligible(&["a", "b"]);
+        let one = svc(&[("x", spec("ui:44", 1))]);
+        deploy(&mut s, "st", &one, [("st.x.1".to_string(), "a".to_string())].into());
+        assert!(replacements(&s, &all, &Sick::default()).is_empty());
+        let sick = Sick { images: vec![("a".to_string(), "ui:44".to_string())], ..Default::default() };
+        assert_eq!(replacements(&s, &all, &sick), vec![("st".to_string(), [("st.x.1".to_string(), "b".to_string())].into())]);
+        let worse = Sick { images: vec![("a".to_string(), "ui:44".to_string()), ("b".to_string(), "ui:44".to_string())], ..Default::default() };
+        assert!(replacements(&s, &all, &worse).is_empty(), "no node can get it: it stays");
     }
 }

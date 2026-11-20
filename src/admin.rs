@@ -1473,7 +1473,7 @@ async fn ui_deploy(State(m): State<Arc<Manager>>, h: HeaderMap, Json(b): Json<Ui
     }
     let services: std::collections::BTreeMap<String, crate::state::ServiceSpec> = [(crate::ui::SERVICE.to_string(), crate::ui::spec(&image))].into();
     let compose = format!("# The managers' own stack: the Freightdock UI (PUT /v1/ui).\nservices:\n  {}:\n    image: {image}\n", crate::ui::SERVICE);
-    let placements = m.store.read(|s| crate::stacks::place(s, crate::ui::STACK, &services, &m.eligible(s), &[])).map_err(|e| ApiError(StatusCode::CONFLICT, e))?;
+    let placements = m.store.read(|s| crate::stacks::place_with(s, crate::ui::STACK, &services, &m.eligible(s), &[], &m.sick(s).images)).map_err(|e| ApiError(StatusCode::CONFLICT, e))?;
     let existed = m.store.read(|s| s.stacks.contains_key(crate::ui::STACK));
     let options = crate::state::StackOptions { description: "The Freightdock UI, run by the managers".into(), ..Default::default() };
     m.store.propose(Entry::StackDeployed { name: crate::ui::STACK.into(), compose, services, placements, at: now_ms(), nodes: vec![], exposures: Some(vec![crate::ui::exposure(&address)]), volumes: Default::default(), options, stopped: false }).await?;
@@ -1621,7 +1621,7 @@ fn ready(m: &Manager, b: &DeployBody) -> R<(String, Ready)> {
                 ids
             }
         };
-        let placements = crate::stacks::place_minding(s, &name, &parsed.services, &m.eligible(s), &nodes, parsed.volumes.values().map(|v| v.storage.as_str()), &m.sick_storage(s));
+        let placements = crate::stacks::place_minding(s, &name, &parsed.services, &m.eligible(s), &nodes, parsed.volumes.values().map(|v| v.storage.as_str()), &m.sick(s));
         Ok((name.clone(), Ready { parsed, options, nodes, placements }))
     })
 }

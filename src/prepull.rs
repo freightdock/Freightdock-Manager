@@ -17,7 +17,7 @@ use crate::state::ClusterState;
 pub const EVERY_S: u64 = 300;
 
 /// Node to the images it would need if another node failed now, for the workloads it would take over.
-pub fn wanted(s: &ClusterState, eligible: &[String], sick: &[(String, String)]) -> BTreeMap<String, BTreeSet<String>> {
+pub fn wanted(s: &ClusterState, eligible: &[String], sick: &crate::stacks::Sick) -> BTreeMap<String, BTreeSet<String>> {
     let mut out: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for n in eligible {
         if s.workloads_on(n).next().is_none() {
@@ -30,6 +30,15 @@ pub fn wanted(s: &ClusterState, eligible: &[String], sick: &[(String, String)]) 
         }
     }
     out
+}
+
+/// `want` and each (node, image) a round could not pull, tried again each round: so a node is a candidate for that
+/// image again once it gets it (pushed after all, or loaded by hand).
+pub fn with_retries(mut want: BTreeMap<String, BTreeSet<String>>, failed: impl IntoIterator<Item = (String, String)>) -> BTreeMap<String, BTreeSet<String>> {
+    for (node, image) in failed {
+        want.entry(node).or_default().insert(image);
+    }
+    want
 }
 
 /// An image name as Docker lists its tags: `nginx` and `docker.io/library/nginx` are `nginx:latest`.
@@ -55,7 +64,9 @@ impl Manager {
         if self.prepulling.swap(true, Ordering::SeqCst) {
             return;
         }
-        let want = self.store.read(|s| wanted(s, &self.eligible(s), &self.sick_storage(s)));
+        let want = self.store.read(|s| wanted(s, &self.eligible(s), &self.sick(s)));
+        let failed: Vec<(String, String)> = self.prepull_failed.lock().expect("prepull lock").iter().cloned().collect();
+        let want = with_retries(want, failed);
         let m = self.clone();
         tokio::spawn(async move {
             for (node, images) in want {
@@ -66,7 +77,10 @@ impl Manager {
                         continue;
                     }
                 };
-                for image in missing(&have, &images) {
+                let lacks = missing(&have, &images);
+                // One it has now (loaded by hand) is no longer one it cannot get.
+                m.prepull_failed.lock().expect("prepull lock").retain(|(n, i)| *n != node || lacks.contains(i) || !images.contains(i));
+                for image in lacks {
                     let key = (node.clone(), image.clone());
                     match m.docker(&node, "image.pull", "", HashMap::from([("image".to_string(), image.clone())])).await {
                         Ok(_) => {
@@ -110,14 +124,28 @@ mod tests {
 
     #[test]
     fn a_node_gets_the_images_of_what_it_would_take_over_and_nothing_that_never_moves() {
-        let w = wanted(&healthy(), &all(), &[]);
+        let w = wanted(&healthy(), &all(), &Default::default());
         // a fails: web.1 to c (b has web.2); b fails: web.2 to c. db and cron stay on a whatever happens.
         assert_eq!(w, BTreeMap::from([("c".to_string(), BTreeSet::from(["nginx".to_string()]))]));
     }
 
     #[test]
+    fn a_node_that_could_not_get_an_image_is_passed_over_for_one_that_can() {
+        let sick = crate::stacks::Sick { images: vec![("c".to_string(), "nginx".to_string())], ..Default::default() };
+        let w = wanted(&healthy(), &all(), &sick);
+        assert!(w.get("c").is_none_or(|i| !i.contains("nginx")), "{w:?}");
+        assert!(w.values().any(|i| i.contains("nginx")), "it goes where it can be pulled: {w:?}");
+    }
+
+    #[test]
+    fn what_could_not_be_pulled_is_tried_again() {
+        let want = with_retries(BTreeMap::from([("a".to_string(), BTreeSet::from(["x".to_string()]))]), [("b".to_string(), "y".to_string())]);
+        assert_eq!(want, BTreeMap::from([("a".to_string(), BTreeSet::from(["x".to_string()])), ("b".to_string(), BTreeSet::from(["y".to_string()]))]));
+    }
+
+    #[test]
     fn with_no_other_node_nothing_is_wanted() {
-        assert!(wanted(&healthy(), &["a".to_string()], &[]).is_empty());
+        assert!(wanted(&healthy(), &["a".to_string()], &Default::default()).is_empty());
     }
 
     #[test]

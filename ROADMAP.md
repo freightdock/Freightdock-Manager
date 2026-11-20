@@ -205,6 +205,11 @@ Ranked inside the goal:
        where recovery would put each healthy node's workloads if that node failed now, and has those nodes pull the
        images they lack, so a recovery does not wait on a download. Pinned workloads and ones with local data are
        never pulled elsewhere; a failed pull is an event once, until it works.
+5. [x] No node that cannot get the image (2026-11-20, `stacks::unpullable`, `Sick::images`): a node whose last run
+       of an image failed in its pull, or that a pre-pull could not get it onto, is no candidate for the workloads
+       of that image (deploy, recovery, pre-pull), and a workload placed on one moves to a node that can. Found live:
+       the UI, an image built on the nodes and never pushed, was recovered onto a node without it and stayed there
+       failing its pull, though pre-pull had said so for half an hour. Failed pre-pulls are tried again each round.
 
 ## G8: UI (Freightdock as the cluster's UI only)
 

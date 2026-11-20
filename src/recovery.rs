@@ -23,7 +23,7 @@ pub struct Plan {
     pub left: BTreeMap<String, String>,
 }
 
-pub fn plan(s: &ClusterState, from: Option<&str>, eligible: &[String], sick: &[(String, String)]) -> Plan {
+pub fn plan(s: &ClusterState, from: Option<&str>, eligible: &[String], sick: &crate::stacks::Sick) -> Plan {
     let mut out = Plan::default();
     let mut s = s.clone();
     let mut go: BTreeSet<String> = BTreeSet::new();
@@ -92,12 +92,15 @@ impl Manager {
             .collect()
     }
 
-    /// Each node's shared storage that says it fails there (G11.8): (node, storage).
-    /// And each node's storage it cannot mount at all (`stacks::unmountable`), left out the same way.
-    pub fn sick_storage(&self, s: &ClusterState) -> Vec<(String, String)> {
-        let mut out: Vec<(String, String)> = s.nodes.keys().flat_map(|id| self.sessions.storage(id).map(|r| r.storages).unwrap_or_default().into_iter().filter(|h| !h.ok).map(move |h| (id.clone(), h.name))).collect();
-        out.extend(crate::stacks::unmountable(s));
-        out
+    /// What placement leaves out (`stacks::Sick`). Storage: each node's shared storage that says it fails there
+    /// (G11.8), and each node's storage it cannot mount at all (`stacks::unmountable`). Images: each node whose last
+    /// run of one could not pull it (`stacks::unpullable`), and each a pre-pull could not get (`prepull`).
+    pub fn sick(&self, s: &ClusterState) -> crate::stacks::Sick {
+        let mut storage: Vec<(String, String)> = s.nodes.keys().flat_map(|id| self.sessions.storage(id).map(|r| r.storages).unwrap_or_default().into_iter().filter(|h| !h.ok).map(move |h| (id.clone(), h.name))).collect();
+        storage.extend(crate::stacks::unmountable(s));
+        let mut images = crate::stacks::unpullable(s);
+        images.extend(self.prepull_failed.lock().expect("prepull lock").iter().cloned());
+        crate::stacks::Sick { storage, images }
     }
 
     /// The leader's recovery round (see the module), each second after fencing's.
@@ -109,7 +112,7 @@ impl Manager {
         let now = now_ms();
         let todo: Vec<(Option<String>, Plan)> = self.store.read(|s| {
             let eligible = self.eligible(s);
-            let sick = self.sick_storage(s);
+            let sick = self.sick(s);
             let mut todo = vec![];
             for n in s.nodes.values().filter(|n| due(n, now, delay)) {
                 if s.workloads_on(&n.id).next().is_none() {
@@ -188,7 +191,7 @@ pub(crate) mod tests {
 
     #[test]
     fn stateless_workloads_move_to_where_a_deploy_would_put_them_and_the_rest_stay_with_why() {
-        let p = plan(&cluster(), Some("a"), &eligible(), &[]);
+        let p = plan(&cluster(), Some("a"), &eligible(), &Default::default());
         assert_eq!(p.moves, BTreeMap::from([("app.web.1".to_string(), "c".to_string())]), "away from its other replica on b");
         assert_eq!(p.left.keys().collect::<Vec<_>>(), ["app.cron.1", "app.db.1"]);
         assert!(p.left["app.cron.1"].contains("pinned"));
@@ -197,7 +200,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_workload_with_nowhere_to_go_stays_with_the_reason() {
-        let p = plan(&cluster(), Some("a"), &[], &[]);
+        let p = plan(&cluster(), Some("a"), &[], &Default::default());
         assert!(p.moves.is_empty());
         assert!(p.left["app.web.1"].contains("no node can take it"), "{:?}", p.left);
     }
@@ -207,7 +210,7 @@ pub(crate) mod tests {
         let mut s = cluster();
         let sp = s.stacks["app"].services["web"].for_workload(3);
         s.workloads.insert("app.web.3".into(), Workload { id: "app.web.3".into(), stack: "app".into(), service: "web".into(), slot: 3, node_id: Some("a".into()), spec: sp, generation: 1, host: None, leaving: None, attempts: None });
-        let p = plan(&s, Some("a"), &[], &[]);
+        let p = plan(&s, Some("a"), &[], &Default::default());
         assert!(p.left["app.web.1"].starts_with("no node can take it:"), "{:?}", p.left);
         assert!(p.left["app.web.3"].starts_with("it moves with its stack, and no node can take app.web.1:"), "{:?}", p.left);
     }
@@ -218,7 +221,7 @@ pub(crate) mod tests {
         for w in s.workloads.values_mut().filter(|w| w.node_id.as_deref() == Some("a")) {
             w.node_id = None;
         }
-        let p = plan(&s, None, &eligible(), &[]);
+        let p = plan(&s, None, &eligible(), &Default::default());
         assert_eq!(p.moves.keys().collect::<Vec<_>>(), ["app.cron.1", "app.db.1", "app.web.1"], "the node is gone: nothing to wait for");
         assert!(p.left.is_empty());
     }

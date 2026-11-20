@@ -386,6 +386,10 @@ Once a node is fenced (and `FREIGHTDOCK_RECOVERY_DELAY_S` has passed), or comes 
 stateless workloads, and those whose volumes are all on shared storage, on other nodes as a deploy would. A workload
 with a volume on its node waits for it (its data is there), and so does a pinned one (`x-freightdock: {ha: false}`);
 one with nowhere to go is tried again each second.
+A node that could not pull a workload's image (its last run there failed in the pull, or a pre-pull could not get
+it) is passed over for it, and a workload left on one moves to a node that can: an image built on some nodes and
+never pushed goes only where it is. A failed pre-pull is tried again every round, so loading the image by hand
+makes the node a candidate again; a failed run counts until its command is pruned (an hour).
 When the node runs again, the workloads that moved are removed from it. `freightdock-manager recoveries [stack]`
 shows what moved where and what stayed and why.
 
