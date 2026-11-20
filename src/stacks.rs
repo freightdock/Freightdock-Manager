@@ -1052,7 +1052,7 @@ pub(crate) mod tests {
             ran("1", "a", "ui:44", Failed, "pulling ui:44: pull access denied for ui", 10),
             ran("2", "b", "ui:44", Failed, "pulling ui:44: pull access denied for ui", 10),
             ran("3", "b", "ui:44", Succeeded, "running", 20),
-            ran("4", "c", "nginx", Failed, "the network web is for 10.0.0.0/24, not 10.0.1.0/24", 10),
+            ran("4", "c", "nginx", Failed, "the network web is for 192.0.2.0/24, not 198.51.100.0/24", 10),
         ] {
             s.commands.insert(c.id.clone(), c);
         }
